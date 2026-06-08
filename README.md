@@ -31,12 +31,28 @@ measures whether any of it actually beats a baseline.
 | `np2ptp-node`   | ✅ built     | `.nptp` linker (`pack`, files **and folders**) + client (`get`/`info`/`serve`/`fetch`) CLI |
 | `np2ptp-rep`    | ✅ built     | Ed25519 identity, signed receipts, reputation ledger; wired into net (accounting + choke) |
 | `np2ptp-net`    | 🚧 partial   | libp2p/QUIC: e2e download by content id, DHT discovery, reputation choke, FEC symbols, relay reservation; full relayed transfer + DCUtR need real NATs |
-| `np2ptp-sim`    | ⏳ planned   | Simulation/benchmark harness (the research deliverable)   |
+| `np2ptp-sim`    | ✅ built     | Research harness: measures dedup, permanence, free-riding, FEC cost |
 
-59 unit/integration tests today, all green — including real libp2p nodes downloading a
+62 unit/integration tests today, all green — including real libp2p nodes downloading a
 whole file over QUIC (chunk-by-chunk *and* via RaptorQ symbols), discovering each other
 via the DHT, choking a non-reciprocating peer, and a behind-NAT node obtaining a relay
 reservation.
+
+## Research results (`np2ptp-sim`)
+
+`cargo run -p np2ptp-sim` spins up real nodes and reports (representative run):
+
+| Experiment | Result |
+|---|---|
+| **Dedup** — store a file then a lightly-edited v2 | **~49%** of chunks deduplicated |
+| **Permanence** — seeder leaves after one peer re-shares | survives **only with** re-sharing (with ✓ / without ✗) |
+| **Free-riding** — leech with the reputation choke | choke off → completes; **choke on → cut off** |
+| **FEC cost** — chunk vs RaptorQ-symbol download (1 MB) | chunk ~0.4 s vs FEC ~25 s |
+
+The FEC result is the most instructive: erasure-coded download currently fetches one
+~1.2 KB symbol per request (~875 round-trips/MB), so it trades a lot of latency for its
+any-*k*-of-*n* resilience. Batching symbols per request is the obvious next optimization.
+The scenario assertions run in CI (`cargo test -p np2ptp-sim`).
 
 ### NAT traversal status
 

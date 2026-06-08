@@ -7,6 +7,7 @@ members = [
     "crates/np2ptp-node",
     "crates/np2ptp-rep",
     "crates/np2ptp-net",
+    "crates/np2ptp-sim",
 ]
 
 [workspace.package]

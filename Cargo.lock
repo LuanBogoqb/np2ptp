@@ -2029,6 +2029,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "np2ptp-sim"
+version = "0.1.0"
+dependencies = [
+ "np2ptp-core",
+ "np2ptp-net",
+ "np2ptp-store",
+ "tokio",
+]
+
+[[package]]
 name = "np2ptp-store"
 version = "0.1.0"
 dependencies = [
