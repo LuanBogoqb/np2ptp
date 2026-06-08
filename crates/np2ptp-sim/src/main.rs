@@ -31,6 +31,6 @@ async fn main() {
     let f = fec_cost().await;
     println!("    chunk download : {} ms", f.chunk_ms);
     println!("    FEC   download : {} ms", f.fec_ms);
-    println!("    => FEC trades extra round-trips for any-k-of-n resilience");
-    println!("       (this prototype fetches one small symbol per request; batching would close the gap)");
+    println!("    => with symbol batching, FEC ~matches chunk download while adding");
+    println!("       any-k-of-n resilience (run with --release; RaptorQ is slow in debug)");
 }

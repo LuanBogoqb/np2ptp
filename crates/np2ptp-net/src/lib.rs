@@ -80,6 +80,9 @@ pub enum Request {
     Manifest([u8; 32]),
     Chunk([u8; 32]),
     Symbol { root: [u8; 32], index: u32 },
+    /// A contiguous batch of RaptorQ symbols `[start, start+count)` — far fewer
+    /// round-trips than fetching symbols one at a time.
+    Symbols { root: [u8; 32], start: u32, count: u32 },
 }
 
 /// The matching response. `None` means the peer doesn't hold that item.
@@ -88,11 +91,17 @@ pub enum Response {
     Manifest(Option<Vec<u8>>),
     Chunk(Option<Vec<u8>>),
     Symbol(Option<Vec<u8>>),
+    /// Symbols for the requested range (may be shorter than asked near the end,
+    /// empty once exhausted).
+    Symbols(Vec<Vec<u8>>),
 }
 
 /// How many repair symbols a seeder generates per content, on top of the source
 /// symbols. More = more resilience to symbol loss at the cost of memory.
 const FEC_REPAIR_SYMBOLS: u32 = 64;
+
+/// How many symbols a FEC download requests per round-trip.
+const FEC_BATCH: u32 = 128;
 
 /// The combined libp2p behaviour for an NP2PTP node.
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -293,6 +302,20 @@ impl Network {
         }
     }
 
+    /// Fetch a batch of RaptorQ symbols `[start, start+count)` for `root`.
+    pub async fn fetch_symbols(
+        &self,
+        peer: PeerId,
+        root: Hash,
+        start: u32,
+        count: u32,
+    ) -> Result<Vec<Vec<u8>>, NetError> {
+        match self.request(peer, Request::Symbols { root: *root.as_bytes(), start, count }).await? {
+            Response::Symbols(data) => Ok(data),
+            _ => Err(NetError::RequestFailed),
+        }
+    }
+
     /// Erasure-coded download: pull RaptorQ symbols for `root` from `provider`
     /// until the content can be reconstructed, then verify the reconstruction
     /// against the content id and store it in `into`.
@@ -310,28 +333,25 @@ impl Network {
         let manifest = self.get_manifest(provider, root).await?;
         let config = np2ptp_fec::config_for(manifest.total_size, np2ptp_fec::DEFAULT_SYMBOL_SIZE);
 
+        // Only attempt a decode once we likely have enough symbols (decoding is
+        // the expensive step, so don't retry it after every batch).
+        let symbol_size = np2ptp_fec::DEFAULT_SYMBOL_SIZE as usize;
+        let need = (manifest.total_size as usize).div_ceil(symbol_size).max(1);
+
         let mut symbols: Vec<Vec<u8>> = Vec::new();
-        let mut index = 0u32;
+        let mut start = 0u32;
         let decoded = loop {
-            match self.fetch_symbol(provider, root, index).await? {
-                Some(sym) => {
-                    symbols.push(sym);
-                    index += 1;
-                    // Attempt a decode periodically rather than after every symbol.
-                    if symbols.len() % 8 == 0 {
-                        if let Some(data) =
-                            np2ptp_fec::decode(&config, manifest.total_size, symbols.clone())
-                        {
-                            break data;
-                        }
-                    }
+            let batch = self.fetch_symbols(provider, root, start, FEC_BATCH).await?;
+            let exhausted = batch.is_empty();
+            start += batch.len() as u32;
+            symbols.extend(batch);
+
+            if symbols.len() >= need || exhausted {
+                if let Some(data) = np2ptp_fec::decode(&config, manifest.total_size, symbols.clone()) {
+                    break data;
                 }
-                None => {
-                    // Provider is out of symbols; one last try with all we have.
-                    match np2ptp_fec::decode(&config, manifest.total_size, symbols.clone()) {
-                        Some(data) => break data,
-                        None => return Err(NetError::MissingChunk(root)),
-                    }
+                if exhausted {
+                    return Err(NetError::MissingChunk(root));
                 }
             }
         };
@@ -357,19 +377,41 @@ impl Network {
         provider: PeerId,
         into: &Store,
     ) -> Result<Manifest, NetError> {
+        /// Chunk requests kept in flight at once. Hides per-request latency.
+        const PARALLEL: usize = 16;
+
         let manifest = self.get_manifest(provider, root).await?;
-        for (i, cref) in manifest.chunks.iter().enumerate() {
-            if into.has(&cref.hash) {
-                continue;
-            }
-            let bytes = self
-                .fetch_chunk(provider, cref.hash)
-                .await?
-                .ok_or(NetError::MissingChunk(cref.hash))?;
-            if !manifest.verify_chunk(i, &bytes) {
+
+        // Only fetch chunks we don't already have (resume / cross-download dedup).
+        let missing: Vec<(usize, Hash)> = manifest
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !into.has(&c.hash))
+            .map(|(i, c)| (i, c.hash))
+            .collect();
+
+        // Fetch many chunks concurrently rather than one round-trip at a time.
+        let fetched: Vec<(usize, Vec<u8>)> = futures::stream::iter(missing)
+            .map(|(i, hash)| async move {
+                let bytes = self
+                    .fetch_chunk(provider, hash)
+                    .await?
+                    .ok_or(NetError::MissingChunk(hash))?;
+                Ok::<(usize, Vec<u8>), NetError>((i, bytes))
+            })
+            .buffer_unordered(PARALLEL)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Verify every chunk against the Merkle root before storing it.
+        for (i, bytes) in &fetched {
+            if !manifest.verify_chunk(*i, bytes) {
                 return Err(NetError::BadChunk);
             }
-            into.put(&bytes)?;
+            into.put(bytes)?;
         }
         Ok(manifest)
     }
@@ -534,42 +576,77 @@ impl EventLoop {
                 }
                 Response::Symbol(sym)
             }
+            Request::Symbols { root, start, count } => {
+                let syms = self.symbols_range(Hash(root), start as usize, count as usize);
+                let served: u64 = syms.iter().map(|s| s.len() as u64).sum();
+                if served > 0 {
+                    self.ledger.record_served(peer, served);
+                }
+                Response::Symbols(syms)
+            }
         }
     }
 
-    /// Return the RaptorQ symbol at `index` for `root`, generating and caching
-    /// the full symbol set from our stored copy on first use.
+    /// Ensure the full RaptorQ symbol set for `root` is generated and cached.
+    /// Returns false if we don't have the content to encode.
+    fn ensure_symbols(&mut self, root: Hash) -> bool {
+        if self.symbols.contains_key(&root) {
+            return true;
+        }
+        let Some(manifest_bytes) = self.provided.get(&root).cloned() else {
+            return false;
+        };
+        let Ok(manifest) = Manifest::from_nptp(&manifest_bytes) else {
+            return false;
+        };
+        let store = &self.store;
+        let Ok(full) = manifest.reconstruct(|h| store.get(h).ok().flatten()) else {
+            return false;
+        };
+        let encoded = np2ptp_fec::encode(&full, FEC_REPAIR_SYMBOLS);
+        self.symbols.insert(root, encoded.symbols);
+        true
+    }
+
     fn symbol(&mut self, root: Hash, index: usize) -> Option<Vec<u8>> {
-        if !self.symbols.contains_key(&root) {
-            let manifest_bytes = self.provided.get(&root)?.clone();
-            let manifest = Manifest::from_nptp(&manifest_bytes).ok()?;
-            let store = &self.store;
-            let full = manifest
-                .reconstruct(|h| store.get(h).ok().flatten())
-                .ok()?;
-            let encoded = np2ptp_fec::encode(&full, FEC_REPAIR_SYMBOLS);
-            self.symbols.insert(root, encoded.symbols);
+        if !self.ensure_symbols(root) {
+            return None;
         }
         self.symbols.get(&root)?.get(index).cloned()
     }
 
+    fn symbols_range(&mut self, root: Hash, start: usize, count: usize) -> Vec<Vec<u8>> {
+        if !self.ensure_symbols(root) {
+            return Vec::new();
+        }
+        let all = self.symbols.get(&root).expect("just ensured");
+        if start >= all.len() {
+            return Vec::new();
+        }
+        all[start..(start + count).min(all.len())].to_vec()
+    }
+
     fn on_kad(&mut self, event: kad::Event) {
-        if let kad::Event::OutboundQueryProgressed { id, result, step, .. } = event {
-            if let kad::QueryResult::GetProviders(Ok(ok)) = result {
-                if let Some((acc, _)) = self.pending_providers.get_mut(&id) {
-                    if let kad::GetProvidersOk::FoundProviders { providers, .. } = ok {
-                        for p in providers {
-                            if !acc.contains(&p) {
-                                acc.push(p);
-                            }
+        if let kad::Event::OutboundQueryProgressed {
+            id,
+            result: kad::QueryResult::GetProviders(Ok(ok)),
+            step,
+            ..
+        } = event
+        {
+            if let Some((acc, _)) = self.pending_providers.get_mut(&id) {
+                if let kad::GetProvidersOk::FoundProviders { providers, .. } = ok {
+                    for p in providers {
+                        if !acc.contains(&p) {
+                            acc.push(p);
                         }
                     }
                 }
-                // When the query is exhausted, hand the accumulated peers back.
-                if step.last {
-                    if let Some((acc, reply)) = self.pending_providers.remove(&id) {
-                        let _ = reply.send(acc);
-                    }
+            }
+            // When the query is exhausted, hand the accumulated peers back.
+            if step.last {
+                if let Some((acc, reply)) = self.pending_providers.remove(&id) {
+                    let _ = reply.send(acc);
                 }
             }
         }

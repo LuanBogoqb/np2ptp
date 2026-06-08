@@ -40,6 +40,12 @@ impl TmpDir {
     }
 }
 
+impl Default for TmpDir {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for TmpDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);

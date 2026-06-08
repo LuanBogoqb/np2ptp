@@ -47,12 +47,15 @@ reservation.
 | **Dedup** — store a file then a lightly-edited v2 | **~49%** of chunks deduplicated |
 | **Permanence** — seeder leaves after one peer re-shares | survives **only with** re-sharing (with ✓ / without ✗) |
 | **Free-riding** — leech with the reputation choke | choke off → completes; **choke on → cut off** |
-| **FEC cost** — chunk vs RaptorQ-symbol download (1 MB) | chunk ~0.4 s vs FEC ~25 s |
+| **FEC cost** — chunk vs RaptorQ-symbol download (1 MB, `--release`) | chunk ~107 ms vs FEC ~110 ms |
 
-The FEC result is the most instructive: erasure-coded download currently fetches one
-~1.2 KB symbol per request (~875 round-trips/MB), so it trades a lot of latency for its
-any-*k*-of-*n* resilience. Batching symbols per request is the obvious next optimization.
-The scenario assertions run in CI (`cargo test -p np2ptp-sim`).
+The FEC result tells an optimization story: the first cut fetched one ~1.2 KB symbol per
+request (~875 round-trips/MB) and decoded after every symbol, taking ~25 s. With **symbol
+batching** (128/request) and **decoding once enough symbols arrive**, erasure-coded
+download now ~matches plain chunk download (~110 ms) while adding any-*k*-of-*n* resilience
+— so permanence is essentially free. (Run the harness with `--release`; RaptorQ's GF(256)
+math is much slower in a debug build.) The scenario assertions run in CI
+(`cargo test -p np2ptp-sim`).
 
 ### NAT traversal status
 
