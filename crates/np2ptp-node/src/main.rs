@@ -298,7 +298,7 @@ fn udp_port(addr: &Multiaddr) -> Option<u16> {
 /// Seed content on the network: load a `.nptp`, serve its chunks from the store,
 /// and announce it on the DHT until interrupted.
 fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (pos, flags) = parse(args, &["--store", "--listen", "--tracker"]);
+    let (pos, flags) = parse(args, &["--store", "--listen", "--tracker", "--public"]);
     let file = *pos.first().ok_or("serve: missing <file.nptp>")?;
     let manifest = Manifest::from_nptp(&fs::read(file)?)?;
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
@@ -307,6 +307,9 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
         .get("listen")
         .cloned()
         .unwrap_or_else(|| "/ip4/0.0.0.0/udp/0/quic-v1".to_string());
+    // A reachable public address to advertise (e.g. a router dst-nat / port
+    // forward), for when this node is reachable via a public IP it isn't bound to.
+    let public = flags.get("public").cloned();
     let tracker_url = flags
         .get("tracker")
         .cloned()
@@ -337,6 +340,19 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
             if !no_tracker {
                 println!("or, once announced, just: np2ptp fetch {}   (peers found via the tracker)", manifest.uri());
             }
+        }
+
+        // Manually-advertised public address (e.g. a MikroTik/router port-forward
+        // to a VPN/WireGuard IP) — bypasses CGNAT when the router cooperates.
+        if let Some(p) = &public {
+            let port = addrs.iter().find_map(udp_port).unwrap_or(4001);
+            let ext: Multiaddr = if p.starts_with('/') {
+                p.parse()?
+            } else {
+                format!("/ip4/{p}/udp/{port}/quic-v1").parse()?
+            };
+            net.add_external_address(ext.clone()).await?;
+            println!("public address: {ext}/p2p/{peer}");
         }
 
         // Try NAT-PMP / PCP for a public address (complements net's UPnP/IGD).
@@ -482,7 +498,7 @@ fn print_usage() {
          \x20 np2ptp pack  <input> [--out <file.nptp>] [--store <dir>] [--name <name>]\n\
          \x20 np2ptp info  <file.nptp>\n\
          \x20 np2ptp get   <file.nptp> --source <store-dir> [--store <dir>] [--out <output>]\n\
-         \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--tracker <url>]\n\
+         \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>]\n\
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\n\
          NOTES:\n\
