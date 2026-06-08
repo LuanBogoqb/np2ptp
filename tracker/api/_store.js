@@ -30,14 +30,15 @@ export function backend() {
   return redis ? "upstash" : "memory";
 }
 
-export async function announce(cid, peer, addr) {
+export async function announce(cid, peer, addrs) {
   const now = Date.now();
+  const rec = { addrs, ts: now };
   if (redis) {
-    await redis.hset(`cid:${cid}`, { [peer]: JSON.stringify({ addr, ts: now }) });
+    await redis.hset(`cid:${cid}`, { [peer]: JSON.stringify(rec) });
     await redis.expire(`cid:${cid}`, TTL_SECONDS);
   } else {
     if (!mem.has(cid)) mem.set(cid, new Map());
-    mem.get(cid).set(peer, { addr, ts: now });
+    mem.get(cid).set(peer, rec);
   }
 }
 
@@ -48,12 +49,12 @@ export async function peers(cid) {
     const h = (await redis.hgetall(`cid:${cid}`)) || {};
     for (const [peer, v] of Object.entries(h)) {
       const rec = typeof v === "string" ? JSON.parse(v) : v;
-      if (rec && rec.ts > cutoff) out.push({ peer, addr: rec.addr, ts: rec.ts });
+      if (rec && rec.ts > cutoff) out.push({ peer, addrs: rec.addrs || [], ts: rec.ts });
     }
   } else {
     const m = mem.get(cid) || new Map();
     for (const [peer, rec] of m) {
-      if (rec.ts > cutoff) out.push({ peer, addr: rec.addr, ts: rec.ts });
+      if (rec.ts > cutoff) out.push({ peer, addrs: rec.addrs || [], ts: rec.ts });
     }
   }
   return out;
