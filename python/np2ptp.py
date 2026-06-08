@@ -144,10 +144,14 @@ class Client:
                 out[key.strip()] = value.strip()
         return out
 
-    def fetch(self, target, peer, peer_id=None, out=None, store=None, fec=False) -> int:
-        """Download content from a peer over the network."""
-        addr = _build_multiaddr(peer, peer_id)
-        args = ["fetch", str(target), "--peer", addr]
+    def fetch(self, target, peer=None, peer_id=None, out=None, store=None, fec=False, tracker=None) -> int:
+        """Download content over the network. With `peer` it dials directly;
+        without it, it auto-discovers providers via the tracker."""
+        args = ["fetch", str(target)]
+        if peer:
+            args += ["--peer", _build_multiaddr(peer, peer_id)]
+        if tracker:
+            args += ["--tracker", tracker]
         if out:
             args += ["--out", str(out)]
         if store:
@@ -192,10 +196,11 @@ def main(argv=None) -> int:
     i = sub.add_parser("info", help="inspect a .nptp file")
     i.add_argument("nptp")
 
-    f = sub.add_parser("fetch", help="download content from a peer")
+    f = sub.add_parser("fetch", help="download content (auto-discovers peers if --peer omitted)")
     f.add_argument("target", help="a .nptp file or an np2ptp:<root> link")
-    f.add_argument("--peer", required=True, help="host:port (with --id) or a full multiaddr")
+    f.add_argument("--peer", help="host:port (with --id) or a full multiaddr; omit to auto-discover")
     f.add_argument("--id", dest="peer_id", help="peer id (when --peer is host:port)")
+    f.add_argument("--tracker", help="tracker URL (default https://np2ptp.vercel.app)")
     f.add_argument("--out")
     f.add_argument("--store")
     f.add_argument("--fec", action="store_true", help="reconstruct via RaptorQ symbols")
@@ -217,7 +222,7 @@ def main(argv=None) -> int:
                 print(f"{key:12} {value}")
             return 0
         if args.cmd == "fetch":
-            return client.fetch(args.target, args.peer, peer_id=args.peer_id, out=args.out, store=args.store, fec=args.fec)
+            return client.fetch(args.target, args.peer, peer_id=args.peer_id, out=args.out, store=args.store, fec=args.fec, tracker=args.tracker)
         if args.cmd == "serve":
             return client.serve(args.nptp, port=args.port, store=args.store)
     except Np2ptpError as e:

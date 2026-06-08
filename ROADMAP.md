@@ -135,13 +135,13 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
      DHT → fast path; else convert → verify against piece hashes → publish mapping +
      provide). Stream verification (don't concat 51 GB in RAM).
 2. **Automatic discovery** (so `fetch <link>` needs no `--peer`):
-   - **Bootstrap nodes** — run 1+ stable nodes (persist the Ed25519 key for a fixed
-     peer id); bake their addresses into the client/config. Client: dial bootstrap →
-     join DHT → `find_providers(root)` → download. (`find_providers` already exists.)
+   - ✅ **HTTP tracker on Vercel** — LIVE at `https://np2ptp.vercel.app`
+     (`tracker/`, Upstash KV). `serve` announces; `fetch <link>` with no `--peer`
+     discovers providers and downloads. Validated end-to-end.
    - **mDNS** — libp2p mDNS behaviour for zero-config discovery on the same LAN.
-   - Wire `fetch`/`torrent` to use discovery when no peer is given.
-   - Optional: a tiny **HTTP tracker on Vercel** (announce/discover content-id →
-     peer addresses) as an alternative to the DHT (Vercel plugin is installed).
+   - **Bootstrap DHT nodes** — run 1+ stable nodes (persist the Ed25519 key for a
+     fixed peer id) so `find_providers(root)` works without the tracker too.
+   - Wire the `torrent` command to use discovery as well.
 3. **NAT without a VPN** (the real adoption unlock):
    - **UPnP / NAT-PMP** — libp2p port-mapping behaviour so the node auto-opens a
      router port and becomes publicly reachable (this is *the* big win; how torrents
