@@ -18,9 +18,11 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use np2ptp_core::{Hash, Manifest};
-use np2ptp_net::{peer_id_from_multiaddr, Multiaddr, Network};
+use np2ptp_net::{peer_id_from_multiaddr, Multiaddr, Network, PeerId};
 use np2ptp_node::{download, read_dir_paths, StoreSource};
 use np2ptp_store::Store;
+
+mod tracker;
 
 const DEFAULT_STORE: &str = ".np2ptp-store";
 
@@ -205,7 +207,7 @@ async fn wait_for_listeners(net: &Network) -> Vec<Multiaddr> {
 /// Seed content on the network: load a `.nptp`, serve its chunks from the store,
 /// and announce it on the DHT until interrupted.
 fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (pos, flags) = parse(args, &["--store", "--listen"]);
+    let (pos, flags) = parse(args, &["--store", "--listen", "--tracker"]);
     let file = *pos.first().ok_or("serve: missing <file.nptp>")?;
     let manifest = Manifest::from_nptp(&fs::read(file)?)?;
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
@@ -214,6 +216,11 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
         .get("listen")
         .cloned()
         .unwrap_or_else(|| "/ip4/0.0.0.0/udp/0/quic-v1".to_string());
+    let tracker_url = flags
+        .get("tracker")
+        .cloned()
+        .unwrap_or_else(|| tracker::DEFAULT_TRACKER.to_string());
+    let no_tracker = flags.contains_key("no-tracker");
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -232,70 +239,113 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
         if addrs.is_empty() {
             println!("peer id: {peer} (no listen address yet)");
         } else {
-            println!("fetch from another node with:");
-            for a in addrs {
+            println!("direct fetch:");
+            for a in &addrs {
                 println!("  np2ptp fetch {} --peer {a}/p2p/{peer}", manifest.uri());
             }
+            if !no_tracker {
+                println!("or, once announced, just: np2ptp fetch {}   (peers found via the tracker)", manifest.uri());
+            }
         }
-        println!("\nProviding on the DHT. Press Ctrl-C to stop.");
-        tokio::signal::ctrl_c().await?;
+
+        if no_tracker {
+            println!("\nProviding on the DHT. Press Ctrl-C to stop.");
+            tokio::signal::ctrl_c().await?;
+        } else {
+            println!("\nProviding on the DHT + announcing to {tracker_url}. Press Ctrl-C to stop.");
+            // Re-announce periodically so the listing stays fresh (TTL ~30 min).
+            let mut interval = tokio::time::interval(Duration::from_secs(600));
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    _ = interval.tick() => {
+                        let current = net.listeners().await.unwrap_or_default();
+                        if let Err(e) = tracker::announce(&tracker_url, manifest.root, peer, &current).await {
+                            eprintln!("  (tracker announce failed: {e})");
+                        }
+                    }
+                }
+            }
+        }
         println!("\nstopped.");
         Ok::<(), Box<dyn Error>>(())
     })
 }
 
-/// Download content over the network from a peer, by content id or `.nptp` file.
+/// Download content over the network. With `--peer` it dials that peer directly;
+/// without it, it discovers providers via the tracker (`--tracker`, default
+/// `https://np2ptp.vercel.app`) and tries each.
 fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (pos, flags) = parse(args, &["--peer", "--store", "--out"]);
+    let (pos, flags) = parse(args, &["--peer", "--store", "--out", "--tracker"]);
     let target = *pos.first().ok_or("fetch: missing <np2ptp:ROOT | file.nptp>")?;
     let root = match target.strip_prefix("np2ptp:") {
         Some(hex) => Hash::from_hex(hex)?,
         None => Manifest::from_nptp(&fs::read(target)?)?.root,
     };
-    let peer_str = flags
-        .get("peer")
-        .ok_or("fetch: --peer <multiaddr/p2p/PEERID> is required")?;
-    let addr: Multiaddr = peer_str.parse()?;
-    let peer = peer_id_from_multiaddr(&addr)
-        .ok_or("fetch: --peer must include the peer id, e.g. /ip4/.../quic-v1/p2p/<peer-id>")?;
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
     let out_flag = flags.get("out").cloned();
     let use_fec = flags.contains_key("fec");
+    let tracker_url = flags
+        .get("tracker")
+        .cloned()
+        .unwrap_or_else(|| tracker::DEFAULT_TRACKER.to_string());
+
+    // Explicit peer, if given; otherwise we discover providers via the tracker.
+    let explicit: Option<(PeerId, Multiaddr)> = match flags.get("peer") {
+        Some(s) => {
+            let addr: Multiaddr = s.parse()?;
+            let peer = peer_id_from_multiaddr(&addr)
+                .ok_or("fetch: --peer must include the peer id (.../p2p/<peer-id>)")?;
+            Some((peer, addr))
+        }
+        None => None,
+    };
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let net = Network::spawn(Store::open(&store_dir)?, None)?;
         let into = Store::open(&store_dir)?;
-        net.add_peer(peer, addr.clone()).await?;
-        net.dial(addr).await?;
 
-        // Retry while the QUIC connection establishes; already-stored chunks are
-        // skipped on retry, so this resumes rather than restarts.
-        let mut manifest = None;
-        let mut last_err = None;
-        for _ in 0..100 {
-            let attempt = if use_fec {
-                net.download_fec(root, peer, &into).await
-            } else {
-                net.download(root, peer, &into).await
-            };
-            match attempt {
-                Ok(m) => {
-                    manifest = Some(m);
-                    break;
+        let candidates: Vec<(PeerId, Vec<Multiaddr>)> = match explicit {
+            Some((peer, addr)) => vec![(peer, vec![addr])],
+            None => {
+                println!("discovering peers for {} via {tracker_url} ...", root.to_hex());
+                let found = tracker::get_peers(&tracker_url, root).await?;
+                if found.is_empty() {
+                    return Err("no peers found on the tracker for this content (and no --peer given)".into());
                 }
-                Err(e) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                println!("  found {} peer(s)", found.len());
+                found
+            }
+        };
+
+        // Try each candidate provider until one serves the content.
+        let mut manifest = None;
+        let mut last_err: Option<String> = None;
+        'outer: for (peer, addrs) in &candidates {
+            for addr in addrs {
+                let _ = net.dial(addr.clone()).await;
+            }
+            for _ in 0..60 {
+                let attempt = if use_fec {
+                    net.download_fec(root, *peer, &into).await
+                } else {
+                    net.download(root, *peer, &into).await
+                };
+                match attempt {
+                    Ok(m) => {
+                        manifest = Some(m);
+                        break 'outer;
+                    }
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
             }
         }
-        let manifest = manifest.ok_or_else(|| {
-            format!(
-                "download failed: {}",
-                last_err.map(|e| e.to_string()).unwrap_or_default()
-            )
-        })?;
+        let manifest =
+            manifest.ok_or_else(|| format!("download failed: {}", last_err.unwrap_or_default()))?;
 
         let dest = write_output(&into, &manifest, out_flag)?;
         println!("fetched {} ({} bytes) -> {dest}", manifest.uri(), manifest.total_size);
@@ -310,12 +360,13 @@ fn print_usage() {
          \x20 np2ptp pack  <input> [--out <file.nptp>] [--store <dir>] [--name <name>]\n\
          \x20 np2ptp info  <file.nptp>\n\
          \x20 np2ptp get   <file.nptp> --source <store-dir> [--store <dir>] [--out <output>]\n\
-         \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>]\n\
-         \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> --peer <multiaddr/p2p/ID> [--store <dir>] [--out <output>] [--fec]\n\n\
+         \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--tracker <url>]\n\
+         \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\n\
          NOTES:\n\
          \x20 'pack' is the linker: chunks a file/folder into a store and writes a .nptp file.\n\
          \x20 'get' rebuilds content from a local --source store (offline stand-in for a peer).\n\
-         \x20 'serve' seeds content over the network (QUIC + DHT); 'fetch' downloads it from a\n\
-         \x20 peer over the network, verifying every chunk. Default store dir: {DEFAULT_STORE}"
+         \x20 'serve' seeds over the network and announces to a tracker; 'fetch' without --peer\n\
+         \x20 discovers providers via the tracker and downloads from them, verifying every chunk.\n\
+         \x20 Default store dir: {DEFAULT_STORE}"
     );
 }

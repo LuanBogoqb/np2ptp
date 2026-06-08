@@ -19,3 +19,6 @@ np2ptp-store = { path = "../np2ptp-store" }
 np2ptp-net = { path = "../np2ptp-net" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 thiserror.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = "1"
