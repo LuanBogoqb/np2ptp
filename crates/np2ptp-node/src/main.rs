@@ -22,6 +22,7 @@ use np2ptp_net::{peer_id_from_multiaddr, Multiaddr, Network, PeerId};
 use np2ptp_node::{download, read_dir_paths, StoreSource};
 use np2ptp_store::Store;
 
+mod portmap;
 mod tracker;
 
 const DEFAULT_STORE: &str = ".np2ptp-store";
@@ -204,6 +205,11 @@ async fn wait_for_listeners(net: &Network) -> Vec<Multiaddr> {
     Vec::new()
 }
 
+/// Extract the UDP port from a `/…/udp/<port>/…` multiaddr.
+fn udp_port(addr: &Multiaddr) -> Option<u16> {
+    addr.to_string().split("/udp/").nth(1)?.split('/').next()?.parse().ok()
+}
+
 /// Seed content on the network: load a `.nptp`, serve its chunks from the store,
 /// and announce it on the DHT until interrupted.
 fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -247,6 +253,29 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
                 println!("or, once announced, just: np2ptp fetch {}   (peers found via the tracker)", manifest.uri());
             }
         }
+
+        // Try NAT-PMP / PCP for a public address (complements net's UPnP/IGD).
+        // Kept alive for the session so the router mapping isn't torn down.
+        let _portmap = match addrs.iter().find_map(udp_port) {
+            Some(port) => match portmap::try_map_udp(port).await {
+                Ok(mapped) => {
+                    if let Some(ip) = portmap::public_ip().await {
+                        if let Ok(ext) =
+                            format!("/ip4/{ip}/udp/{}/quic-v1", mapped.external_port).parse::<Multiaddr>()
+                        {
+                            let _ = net.add_external_address(ext.clone()).await;
+                            println!("NAT-PMP/PCP: public address {ext}/p2p/{peer}");
+                        }
+                    }
+                    Some(mapped)
+                }
+                Err(e) => {
+                    eprintln!("NAT-PMP/PCP: not available ({e})");
+                    None
+                }
+            },
+            None => None,
+        };
 
         if no_tracker {
             println!("\nProviding on the DHT. Press Ctrl-C to stop.");
