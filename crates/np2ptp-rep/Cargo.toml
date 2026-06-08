@@ -1,0 +1,14 @@
+[package]
+name = "np2ptp-rep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NP2PTP reputation & incentives: Ed25519 peer identity, signed receipts, contribution ledger"
+
+[dependencies]
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+bincode.workspace = true
+hex.workspace = true
+thiserror.workspace = true

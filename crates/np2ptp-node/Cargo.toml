@@ -1,0 +1,21 @@
+[package]
+name = "np2ptp-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NP2PTP node: the .nptp linker (pack) and the downloading client (get)"
+
+[lib]
+name = "np2ptp_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "np2ptp"
+path = "src/main.rs"
+
+[dependencies]
+np2ptp-core = { path = "../np2ptp-core" }
+np2ptp-store = { path = "../np2ptp-store" }
+np2ptp-net = { path = "../np2ptp-net" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+thiserror.workspace = true

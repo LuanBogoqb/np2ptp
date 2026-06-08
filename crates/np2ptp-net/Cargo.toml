@@ -1,0 +1,35 @@
+[package]
+name = "np2ptp-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NP2PTP networking: libp2p (QUIC, Kademlia, request-response) chunk exchange"
+
+[dependencies]
+np2ptp-core = { path = "../np2ptp-core" }
+np2ptp-store = { path = "../np2ptp-store" }
+np2ptp-rep = { path = "../np2ptp-rep" }
+np2ptp-fec = { path = "../np2ptp-fec" }
+libp2p = { version = "0.55", features = [
+    "tokio",
+    "quic",
+    "kad",
+    "identify",
+    "request-response",
+    "cbor",
+    "macros",
+    "relay",
+    "dcutr",
+    "autonat",
+    "noise",
+    "yamux",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+np2ptp-core = { path = "../np2ptp-core" }
+np2ptp-store = { path = "../np2ptp-store" }

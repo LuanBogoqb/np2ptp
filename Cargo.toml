@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/np2ptp-core",
+    "crates/np2ptp-store",
+    "crates/np2ptp-fec",
+    "crates/np2ptp-node",
+    "crates/np2ptp-rep",
+    "crates/np2ptp-net",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pipitonho/np2ptp"
+
+# Shared dependency versions. Pin majors here so every crate agrees.
+[workspace.dependencies]
+blake3 = "1.5"
+fastcdc = "3.1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+hex = "0.4"
+thiserror = "1"
+raptorq = "2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }

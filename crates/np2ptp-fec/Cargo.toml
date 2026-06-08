@@ -1,0 +1,9 @@
+[package]
+name = "np2ptp-fec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NP2PTP forward error correction: RaptorQ fountain coding for content permanence"
+
+[dependencies]
+raptorq.workspace = true

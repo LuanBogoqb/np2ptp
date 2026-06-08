@@ -1,0 +1,14 @@
+[package]
+name = "np2ptp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NP2PTP content addressing: content-defined chunking, BLAKE3 Merkle trees, manifests"
+
+[dependencies]
+blake3.workspace = true
+fastcdc.workspace = true
+serde.workspace = true
+bincode.workspace = true
+hex.workspace = true
+thiserror.workspace = true

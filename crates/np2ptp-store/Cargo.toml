@@ -1,0 +1,11 @@
+[package]
+name = "np2ptp-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NP2PTP content-addressed chunk store with cross-content dedup"
+
+[dependencies]
+np2ptp-core = { path = "../np2ptp-core" }
+hex.workspace = true
+thiserror.workspace = true

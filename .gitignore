@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+
+# Local node state created by running the CLI (stores, downloaded output)
+.np2ptp-store/
+download/
+*.nptp
+# (Cargo.lock is committed — this workspace ships a binary)
