@@ -1,0 +1,190 @@
+# NP2PTP Roadmap
+
+A guide for whoever (human or AI) continues this project. It captures the vision,
+what exists, the architecture, the non-obvious gotchas, and the concrete next steps.
+
+---
+
+## 1. Vision
+
+NP2PTP ("New Peer-To-Peer Transfer Protocol", a.k.a. "Torrent 2.0") is a research
+prototype that keeps what BitTorrent does well and fixes what it does badly. The
+user's priorities, in order:
+
+1. **NAT / connectivity** — most peers can't accept inbound connections.
+2. **Permanence / incentives** — content dies when seeders leave; seeding is unrewarded.
+3. **Integrity / dedup** — coarse verification, no cross-content deduplication.
+
+It is a **research project**: the deliverables must be *measurable* (see
+`np2ptp-sim`), not a polished product. Out of scope (for now): privacy/anonymity,
+streaming playback, mutable content.
+
+Guiding principle: **don't reinvent the plumbing.** Build on `libp2p` (QUIC,
+Noise, Kademlia, NAT traversal). The novelty is the layers above.
+
+---
+
+## 2. Current state (what works)
+
+8 Rust crates + a Python CLI wrapper. ~80 tests green, clippy clean. Pushed to
+`github.com/LuGB18/np2ptp` (private).
+
+| Crate | Status | Responsibility |
+|---|---|---|
+| `np2ptp-core` | ✅ | FastCDC chunking, BLAKE3 + Merkle, multi-file manifests, `.nptp` format |
+| `np2ptp-store` | ✅ | Content-addressed chunk store + dedup; **streaming** ingest/export |
+| `np2ptp-fec` | ✅ | RaptorQ erasure coding (k-of-n) |
+| `np2ptp-rep` | ✅ | Ed25519 identity, signed receipts, reputation `Ledger<K>` |
+| `np2ptp-net` | ✅ (core) | libp2p/QUIC: download by content id, DHT discovery + infohash mapping, reputation choke, FEC symbols, relay reservation |
+| `np2ptp-node` | ✅ | CLI: `pack` / `info` / `get` / `serve` / `fetch` (files **and** folders, streaming) |
+| `np2ptp-sim` | ✅ | Research harness: measures dedup, permanence, free-riding, FEC cost; writes `reports/` |
+| `np2ptp-bridge` | 🚧 core only | Torrent↔NP2PTP: `TorrentSource` trait, resolve-or-convert flow, piece verification. **librqbit source + CLI not done.** |
+| `python/np2ptp.py` | ✅ | Friendly wrapper over the binary (host:port instead of multiaddr) |
+
+**Validated for real:**
+- Machine-to-machine transfer over QUIC (two laptops, Tailscale/LAN) — file & folder.
+- Download via plain chunks and via RaptorQ symbols (`--fec`).
+- DHT provider discovery + infohash→root mapping (tests).
+- Reputation choke cutting off a leech (test + sim).
+- Streaming pack of a real **3.1 GB** file (no OOM); streaming root == in-memory root.
+
+---
+
+## 3. Architecture
+
+**Content identity.** Content is split by **FastCDC** (content-defined chunking,
+fixed params in `core::chunk`), each chunk hashed with **BLAKE3**. A **Merkle root**
+over the chunk hashes is the **content id**. A share link is `np2ptp:<hex-root>`.
+Files are chunked *independently in file order* (a chunk boundary is forced at each
+file edge), so identical files dedup regardless of directory layout, and the root
+depends only on file contents + order (not paths).
+
+**Manifest (`.nptp`).** `core::Manifest` = `{ root, total_size, chunks: [ChunkRef],
+files: [FileEntry], name }`. `ChunkRef = {hash, offset, length}`. `FileEntry =
+{path, size, chunk_start, chunk_count}`. Serialized with a `NPTP` magic header.
+This is the "torrent file" equivalent.
+
+**Store.** Content-addressed: chunk bytes written to `objects/<aa>/<hex>` (atomic
+temp+rename), so identical chunks are stored once. Streaming variants chunk from /
+write to disk one chunk at a time.
+
+**Network (`net::Network`).** A handle that drives a background tokio task owning a
+libp2p `Swarm`. Transport = **QUIC**. Behaviours: Kademlia (provider records +
+`put/get_record` for the bridge mapping), request-response (manifest / chunk /
+RaptorQ-symbol, CBOR codec), identify, relay (client+server), dcutr, autonat. The
+headline op is `download(root, provider, into_store)`: fetch manifest, validate it
+against the root, then fetch+verify+store every chunk (concurrently, streaming).
+
+**Incentives.** `rep::Ledger<K>` tracks bytes served/received per peer. `net`
+embeds `Ledger<PeerId>` and a choke threshold: a peer that has taken far more than
+it gave is refused chunks.
+
+**Research harness (`sim`).** Spins up real `Network` nodes and runs A/B scenarios,
+writing `reports/REPORT.md` + `results.csv`.
+
+---
+
+## 4. Gotchas (read before you code)
+
+- **Toolchain (Windows):** MSVC. `cargo` via `~\.cargo\bin` (may need PATH prefix
+  mid-session). Build `--release` for anything touching RaptorQ or large content.
+- **Determinism:** streaming and in-memory chunking MUST agree (test enforces it).
+  Don't change FastCDC params casually — it changes every content id.
+- **O(n²) trap:** `Manifest::verify_chunk` rebuilds the whole Merkle tree per call.
+  In loops use `root_is_consistent()` once + `chunk_hash_ok(i, bytes)` per chunk.
+- **Memory:** real content is 10s of GB. Always use the streaming store/download
+  paths. The in-memory `ingest`/`export`/`export_tree` exist for small data & tests.
+- **Kademlia:** server mode is set in `Network::spawn`. `put_record` (Quorum::One)
+  needs a reachable remote peer — a lone node can't publish to itself.
+- **Relay:** a relay node must call `add_external_address(its_listen_addr)` or the
+  reservations it grants are address-less and clients reject them
+  (`NoAddressesInReservation`). Connect to the relay BEFORE listening on the
+  circuit. **Relayed *data transfer* over QUIC is flaky on loopback** — the
+  reservation works, but the relayed stream tears down; needs real NATs to validate
+  (`download_through_a_relay` is `#[ignore]`d).
+- **Tailscale is a TEST crutch, not the answer.** Real NAT story = UPnP/NAT-PMP +
+  DCUtR + a public relay fallback (see Phase 2). Requiring a VPN would kill adoption.
+- **Bridge determinism:** convert torrents by chunking files in the **torrent's
+  file order**, so two converters of the same torrent produce the same root.
+- **PowerShell:** the sandbox blocks `Remove-Item` on `D:\` and on commands
+  containing regex-like literals (`\S+`). Pass git commit bodies via `-F <file>`
+  (quotes get mangled in `-m`). `2>&1` on native commands wraps stderr as errors.
+
+---
+
+## 5. Roadmap
+
+### ✅ Phase 0 — Foundations (done)
+Content addressing, dedup store, FEC, reputation primitives.
+
+### ✅ Phase 1 — Networking core + scale (done)
+QUIC transport, DHT discovery, end-to-end download, `serve`/`fetch` CLI, FEC over
+the wire, reputation choke, research harness, and **streaming** for large content.
+
+### 🚧 Phase 2 — Torrent bridge + automatic peer discovery (next)
+Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
+
+1. **Finish the bridge** (`np2ptp-bridge`):
+   - **`LocalTorrentSource`** — parse a `.torrent` (bencode → infohash, file list,
+     piece hashes) and read already-downloaded files from disk. **Must stream**
+     (the user's real torrent is 51 GB). Bencode parser must extract the raw `info`
+     dict bytes to SHA-1 the infohash.
+   - **`LibrqbitSource`** — download torrents you *don't* have (behind the
+     `librqbit` feature, already in `Cargo.toml`). `.torrent` + magnet.
+   - **`np2ptp torrent <file|magnet>`** CLI: run `resolve_or_convert` (lookup on the
+     DHT → fast path; else convert → verify against piece hashes → publish mapping +
+     provide). Stream verification (don't concat 51 GB in RAM).
+2. **Automatic discovery** (so `fetch <link>` needs no `--peer`):
+   - **Bootstrap nodes** — run 1+ stable nodes (persist the Ed25519 key for a fixed
+     peer id); bake their addresses into the client/config. Client: dial bootstrap →
+     join DHT → `find_providers(root)` → download. (`find_providers` already exists.)
+   - **mDNS** — libp2p mDNS behaviour for zero-config discovery on the same LAN.
+   - Wire `fetch`/`torrent` to use discovery when no peer is given.
+   - Optional: a tiny **HTTP tracker on Vercel** (announce/discover content-id →
+     peer addresses) as an alternative to the DHT (Vercel plugin is installed).
+3. **NAT without a VPN** (the real adoption unlock):
+   - **UPnP / NAT-PMP** — libp2p port-mapping behaviour so the node auto-opens a
+     router port and becomes publicly reachable (this is *the* big win; how torrents
+     "just work").
+   - Finish **DCUtR + relay** (debug the relayed-QUIC teardown on real NATs).
+   - Run a public **relay** as the always-works fallback.
+
+### ⏳ Phase 3 — Hardening & performance
+- **Store performance:** packing 3 GB took ~219 s (~15 MB/s) because every chunk is
+  a separate small file. Consider packfiles / larger avg chunk / batched writes.
+- **No-copy / streaming bridge:** avoid duplicating 51 GB into the store; verify
+  pieces by streaming from disk.
+- **FEC permanence for real:** today only a full holder can mint symbols. Store and
+  forward *partial* symbol sets across peers for true churn resilience.
+- **Resumable / multi-source downloads:** fetch chunks from several providers at once.
+- **Signed-receipt exchange over the wire** (the `rep` primitive exists; circulate it).
+- **Mutable content:** signed pointers (a key "names" a feed) — IPNS/Dat style.
+
+### ⏳ Phase 4 — Product & UX
+Better CLI ergonomics, packaging/distribution of the binary, maybe a GUI, public
+bootstrap/relay infrastructure, docs site.
+
+---
+
+## 6. How to build, test, run
+
+```sh
+cargo test --workspace                     # keep green (~80 tests)
+cargo clippy --workspace --all-targets     # keep at 0 warnings
+cargo run --release -p np2ptp-sim          # research report -> reports/
+
+# CLI (build once: cargo build --release -p np2ptp-node)
+np2ptp pack ./folder --out f.nptp --store seedstore
+np2ptp serve f.nptp --store seedstore --listen /ip4/0.0.0.0/udp/4001/quic-v1
+np2ptp fetch f.nptp --peer /ip4/<host>/udp/4001/quic-v1/p2p/<id> --out got [--fec]
+# or via Python: python python/np2ptp.py fetch f.nptp --peer <host>:4001 --id <id> --out got
+```
+
+## 7. Where to look
+
+- Chunking / Merkle / manifest / `.nptp`: `crates/np2ptp-core/src/{chunk,hash,manifest}.rs`
+- Store + streaming: `crates/np2ptp-store/src/lib.rs`
+- Network protocol, DHT, download, choke, FEC, relay: `crates/np2ptp-net/src/lib.rs`
+- CLI: `crates/np2ptp-node/src/main.rs`; reusable bits in `.../src/lib.rs`
+- Bridge (in progress): `crates/np2ptp-bridge/src/lib.rs`
+- Research scenarios: `crates/np2ptp-sim/src/lib.rs`
