@@ -24,3 +24,4 @@ serde = { workspace = true }
 serde_json = "1"
 crab_nat = "0.7"
 netdev = "0.31"
+getrandom = "0.2"

@@ -2920,6 +2920,7 @@ name = "np2ptp-node"
 version = "0.1.0"
 dependencies = [
  "crab_nat",
+ "getrandom 0.2.17",
  "netdev",
  "np2ptp-core",
  "np2ptp-net",

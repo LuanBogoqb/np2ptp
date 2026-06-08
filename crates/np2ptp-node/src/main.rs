@@ -45,6 +45,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("get") => cmd_get(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
         Some("fetch") => cmd_fetch(&args[1..]),
+        Some("relay") => cmd_relay(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(())
@@ -170,6 +171,70 @@ fn cmd_get(args: &[String]) -> Result<(), Box<dyn Error>> {
         report.fetched, report.deduped
     );
     Ok(())
+}
+
+/// Run as a public relay + DHT bootstrap node — the always-reachable "main node"
+/// that lets peers behind CGNAT connect to each other. Run it on a host with a
+/// public IP and an open UDP port.
+fn cmd_relay(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let (_pos, flags) = parse(args, &["--listen", "--public", "--key", "--store"]);
+    let listen = flags
+        .get("listen")
+        .cloned()
+        .unwrap_or_else(|| "/ip4/0.0.0.0/udp/4001/quic-v1".to_string());
+    let key_path = flags.get("key").cloned().unwrap_or_else(|| "relay.key".to_string());
+    let store_dir = flags.get("store").cloned().unwrap_or_else(|| ".np2ptp-relay".to_string());
+    let public = flags.get("public").cloned();
+
+    // Stable identity so clients can hardcode the relay's address.
+    let seed = load_or_create_seed(&key_path)?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let net = Network::spawn(Store::open(&store_dir)?, Some(seed))?;
+        net.listen(listen.parse()?).await?;
+        let peer = net.local_peer_id();
+
+        if let Some(p) = &public {
+            // Advertise the public address so the reservations this relay grants
+            // carry a dialable address (else clients reject them).
+            let ext: Multiaddr = if p.starts_with('/') {
+                p.parse()?
+            } else {
+                let port = udp_port(&listen.parse::<Multiaddr>()?).unwrap_or(4001);
+                format!("/ip4/{p}/udp/{port}/quic-v1").parse()?
+            };
+            net.add_external_address(ext.clone()).await?;
+            println!("relay peer id: {peer}");
+            println!("clients use:   --relay {ext}/p2p/{peer}");
+        } else {
+            println!("relay peer id: {peer}");
+            for a in wait_for_listeners(&net).await {
+                println!("  listening: {a}/p2p/{peer}");
+            }
+            eprintln!("note: pass --public <public-ip> so reservations carry a reachable address");
+        }
+
+        println!("\nrelay running. Press Ctrl-C to stop.");
+        tokio::signal::ctrl_c().await?;
+        println!("\nstopped.");
+        Ok::<(), Box<dyn Error>>(())
+    })
+}
+
+/// Load a 32-byte identity seed from `path`, creating (and saving) one if absent.
+fn load_or_create_seed(path: &str) -> Result<[u8; 32], Box<dyn Error>> {
+    if let Ok(bytes) = fs::read(path) {
+        if bytes.len() == 32 {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            return Ok(seed);
+        }
+    }
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).map_err(|e| format!("rng error: {e}"))?;
+    fs::write(path, seed)?;
+    Ok(seed)
 }
 
 /// Heuristic: treat as a directory tree if there are multiple files or the single
@@ -398,7 +463,8 @@ fn print_usage() {
          \x20 np2ptp info  <file.nptp>\n\
          \x20 np2ptp get   <file.nptp> --source <store-dir> [--store <dir>] [--out <output>]\n\
          \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--tracker <url>]\n\
-         \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\n\
+         \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
+         \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\n\
          NOTES:\n\
          \x20 'pack' is the linker: chunks a file/folder into a store and writes a .nptp file.\n\
          \x20 'get' rebuilds content from a local --source store (offline stand-in for a peer).\n\
