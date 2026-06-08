@@ -207,6 +207,17 @@ impl Manifest {
         merkle_proof(&hashes, index)
     }
 
+    /// Cheap per-chunk check: the bytes hash to the listed chunk hash.
+    ///
+    /// This does NOT prove inclusion under the Merkle root on its own — use it
+    /// only after the manifest's chunk list has been validated against the root
+    /// once via [`root_is_consistent`](Self::root_is_consistent). That pairing is
+    /// O(n) total, versus [`verify_chunk`](Self::verify_chunk)'s O(n) per call
+    /// (which rebuilds the whole tree each time and is unusable at scale).
+    pub fn chunk_hash_ok(&self, index: usize, bytes: &[u8]) -> bool {
+        self.chunks.get(index).is_some_and(|c| Hash::of(bytes) == c.hash)
+    }
+
     /// Verify a chunk's bytes belong here: content hash matches the ref *and*
     /// the ref is committed to by the root.
     pub fn verify_chunk(&self, index: usize, bytes: &[u8]) -> bool {

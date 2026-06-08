@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use np2ptp_core::{Hash, Manifest};
 use np2ptp_net::{peer_id_from_multiaddr, Multiaddr, Network};
-use np2ptp_node::{download, pack, read_dir_tree, write_tree, StoreSource};
+use np2ptp_node::{download, read_dir_paths, StoreSource};
 use np2ptp_store::Store;
 
 const DEFAULT_STORE: &str = ".np2ptp-store";
@@ -90,15 +90,20 @@ fn cmd_pack(args: &[String]) -> Result<(), Box<dyn Error>> {
         Path::new(input).file_name().map(|s| s.to_string_lossy().into_owned())
     });
 
-    // A directory is packed as a tree of files; a single file as one blob.
+    // A directory is packed as a tree of files; a single file as one blob. Both
+    // stream from disk so packing huge content doesn't load it into memory.
     let manifest = if fs::metadata(input)?.is_dir() {
-        let files = read_dir_tree(Path::new(input))?;
+        let files = read_dir_paths(Path::new(input))?;
         if files.is_empty() {
             return Err(format!("pack: directory {input} contains no files").into());
         }
-        store.ingest_tree(&files, name)?
+        store.ingest_tree_files(&files, name)?
     } else {
-        pack(&fs::read(input)?, name, &store)?
+        let file_name = name
+            .clone()
+            .or_else(|| Path::new(input).file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "data".to_string());
+        store.ingest_tree_files(&[(file_name, Path::new(input).to_path_buf())], name)?
     };
 
     let out = flags
@@ -155,32 +160,8 @@ fn cmd_get(args: &[String]) -> Result<(), Box<dyn Error>> {
     let local = Store::open(store_dir)?;
 
     let report = download(&manifest, &source, &local)?;
-
-    // A single top-level file writes to a file path; a tree writes into a dir.
-    if looks_like_tree(&manifest) {
-        let out_dir = flags
-            .get("out")
-            .cloned()
-            .or_else(|| manifest.name.clone())
-            .unwrap_or_else(|| "download".to_string());
-        let files = local.export_tree(&manifest)?;
-        write_tree(Path::new(&out_dir), &files)?;
-        println!(
-            "downloaded {} ({} bytes, {} files) -> {out_dir}/",
-            manifest.uri(),
-            manifest.total_size,
-            files.len()
-        );
-    } else {
-        let out = flags
-            .get("out")
-            .cloned()
-            .or_else(|| manifest.name.clone())
-            .unwrap_or_else(|| "download.out".to_string());
-        let data = local.export(&manifest)?;
-        fs::write(&out, &data)?;
-        println!("downloaded {} ({} bytes) -> {out}", manifest.uri(), data.len());
-    }
+    let dest = write_output(&local, &manifest, flags.get("out").cloned())?;
+    println!("downloaded {} ({} bytes) -> {dest}", manifest.uri(), manifest.total_size);
     println!(
         "  fetched {} chunks, {} already local (deduped)",
         report.fetched, report.deduped
@@ -192,6 +173,21 @@ fn cmd_get(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// file carries a nested path (so we recreate folders rather than one flat file).
 fn looks_like_tree(manifest: &Manifest) -> bool {
     manifest.files.len() > 1 || manifest.files.first().is_some_and(|f| f.path.contains('/'))
+}
+
+/// Write reconstructed content from `store` to disk, streaming (no whole-file
+/// RAM). A tree goes under a directory; a single file to a file path. Returns a
+/// human-readable destination description.
+fn write_output(store: &Store, manifest: &Manifest, out_flag: Option<String>) -> Result<String, Box<dyn Error>> {
+    if looks_like_tree(manifest) {
+        let out_dir = out_flag.or_else(|| manifest.name.clone()).unwrap_or_else(|| "download".to_string());
+        store.export_tree_to_dir(manifest, Path::new(&out_dir))?;
+        Ok(format!("{out_dir}/ ({} files)", manifest.files.len()))
+    } else {
+        let out = out_flag.or_else(|| manifest.name.clone()).unwrap_or_else(|| "download.out".to_string());
+        store.export_to(manifest, fs::File::create(&out)?)?;
+        Ok(out)
+    }
 }
 
 async fn wait_for_listeners(net: &Network) -> Vec<Multiaddr> {
@@ -301,27 +297,8 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
             )
         })?;
 
-        if looks_like_tree(&manifest) {
-            let out_dir = out_flag
-                .clone()
-                .or_else(|| manifest.name.clone())
-                .unwrap_or_else(|| "download".to_string());
-            let files = into.export_tree(&manifest)?;
-            write_tree(Path::new(&out_dir), &files)?;
-            println!(
-                "fetched {} ({} bytes, {} files) -> {out_dir}/",
-                manifest.uri(),
-                manifest.total_size,
-                files.len()
-            );
-        } else {
-            let out = out_flag
-                .clone()
-                .or_else(|| manifest.name.clone())
-                .unwrap_or_else(|| "download.out".to_string());
-            fs::write(&out, into.export(&manifest)?)?;
-            println!("fetched {} ({} bytes) -> {out}", manifest.uri(), manifest.total_size);
-        }
+        let dest = write_output(&into, &manifest, out_flag)?;
+        println!("fetched {} ({} bytes) -> {dest}", manifest.uri(), manifest.total_size);
         Ok::<(), Box<dyn Error>>(())
     })
 }

@@ -89,6 +89,11 @@ pub fn download<S: ChunkSource>(
     source: &S,
     local: &Store,
 ) -> Result<DownloadReport, NodeError> {
+    // Validate the chunk list against the Merkle root once; then a cheap
+    // per-chunk content-hash check is enough (and stays O(n) at scale).
+    if !manifest.root_is_consistent() {
+        return Err(NodeError::BadChunk { index: 0 });
+    }
     let mut fetched = 0;
     let mut deduped = 0;
     for (i, cref) in manifest.chunks.iter().enumerate() {
@@ -99,7 +104,7 @@ pub fn download<S: ChunkSource>(
         let bytes = source
             .fetch(&cref.hash)?
             .ok_or(NodeError::MissingChunk(cref.hash))?;
-        if !manifest.verify_chunk(i, &bytes) {
+        if !manifest.chunk_hash_ok(i, &bytes) {
             return Err(NodeError::BadChunk { index: i });
         }
         local.put(&bytes)?;
@@ -134,6 +139,34 @@ pub fn read_dir_tree(root: &Path) -> Result<Vec<(String, Vec<u8>)>, NodeError> {
         Ok(())
     }
 
+    let mut out = Vec::new();
+    walk(root, root, &mut out)?;
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// Recursively list a directory as ordered `(relative_path, disk_path)` pairs,
+/// without reading file contents — for streaming ingestion of large trees.
+pub fn read_dir_paths(root: &Path) -> Result<Vec<(String, PathBuf)>, NodeError> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<(), NodeError> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                walk(base, &path, out)?;
+            } else if file_type.is_file() {
+                let rel = path.strip_prefix(base).unwrap_or(&path);
+                let rel_str = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.push((rel_str, path.clone()));
+            }
+        }
+        Ok(())
+    }
     let mut out = Vec::new();
     walk(root, root, &mut out)?;
     out.sort_by(|a, b| a.0.cmp(&b.0));

@@ -416,6 +416,8 @@ impl Network {
         const PARALLEL: usize = 16;
 
         let manifest = self.get_manifest(provider, root).await?;
+        // get_manifest already validated the chunk list against the root, so a
+        // cheap per-chunk content-hash check is sufficient below.
 
         // Only fetch chunks we don't already have (resume / cross-download dedup).
         let missing: Vec<(usize, Hash)> = manifest
@@ -426,8 +428,9 @@ impl Network {
             .map(|(i, c)| (i, c.hash))
             .collect();
 
-        // Fetch many chunks concurrently rather than one round-trip at a time.
-        let fetched: Vec<(usize, Vec<u8>)> = futures::stream::iter(missing)
+        // Fetch concurrently, but store + verify each chunk AS it arrives so we
+        // never hold more than a handful of chunks in memory (large content).
+        let mut stream = futures::stream::iter(missing)
             .map(|(i, hash)| async move {
                 let bytes = self
                     .fetch_chunk(provider, hash)
@@ -435,18 +438,14 @@ impl Network {
                     .ok_or(NetError::MissingChunk(hash))?;
                 Ok::<(usize, Vec<u8>), NetError>((i, bytes))
             })
-            .buffer_unordered(PARALLEL)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+            .buffer_unordered(PARALLEL);
 
-        // Verify every chunk against the Merkle root before storing it.
-        for (i, bytes) in &fetched {
-            if !manifest.verify_chunk(*i, bytes) {
+        while let Some(result) = stream.next().await {
+            let (i, bytes) = result?;
+            if !manifest.chunk_hash_ok(i, &bytes) {
                 return Err(NetError::BadChunk);
             }
-            into.put(bytes)?;
+            into.put(&bytes)?;
         }
         Ok(manifest)
     }

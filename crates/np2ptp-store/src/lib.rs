@@ -10,12 +10,15 @@
 //! a 256-way fan-out that keeps directories small. Writes are atomic
 //! (temp file + rename) so a crash mid-write can't leave a corrupt object.
 
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use fastcdc::v2020::StreamCDC;
+use np2ptp_core::chunk::{AVG_CHUNK, MAX_CHUNK, MIN_CHUNK};
 use np2ptp_core::hash::Hash;
-use np2ptp_core::manifest::{Manifest, ManifestError};
+use np2ptp_core::manifest::{ChunkRef, FileEntry, Manifest, ManifestError};
+use np2ptp_core::merkle_root;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -27,6 +30,8 @@ pub enum StoreError {
     Missing(Hash),
     #[error("stored object {0} failed its hash check (corruption)")]
     Corrupt(Hash),
+    #[error("refusing unsafe path in manifest: {0:?}")]
+    UnsafePath(String),
 }
 
 /// A disk-backed content-addressed store.
@@ -183,6 +188,96 @@ impl Store {
         }
         Ok(result?)
     }
+
+    // --- streaming variants (for content too large to hold in memory) --------
+
+    /// Chunk a single file straight from disk (one chunk in memory at a time),
+    /// storing each chunk. Returns the file's chunk refs (offsets relative to the
+    /// file start) and its size.
+    pub fn ingest_file_streaming(&self, path: &Path) -> Result<(Vec<ChunkRef>, u64), StoreError> {
+        let reader = BufReader::new(File::open(path)?);
+        let mut refs = Vec::new();
+        let mut offset = 0u64;
+        for chunk in StreamCDC::new(reader, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
+            let chunk = chunk.map_err(|e| io::Error::other(e.to_string()))?;
+            let (hash, _) = self.put(&chunk.data)?;
+            refs.push(ChunkRef { hash, offset, length: chunk.data.len() as u32 });
+            offset += chunk.data.len() as u64;
+        }
+        Ok((refs, offset))
+    }
+
+    /// Chunk and store a tree of `(relative_path, disk_path)` files by streaming
+    /// each from disk, building the manifest. Never holds a whole file in memory.
+    pub fn ingest_tree_files(
+        &self,
+        files: &[(String, PathBuf)],
+        name: Option<String>,
+    ) -> Result<Manifest, StoreError> {
+        let mut chunks: Vec<ChunkRef> = Vec::new();
+        let mut entries: Vec<FileEntry> = Vec::new();
+        let mut global: u64 = 0;
+        for (rel, disk) in files {
+            let (refs, size) = self.ingest_file_streaming(disk)?;
+            let chunk_start = chunks.len();
+            for r in &refs {
+                chunks.push(ChunkRef { hash: r.hash, offset: global + r.offset, length: r.length });
+            }
+            entries.push(FileEntry { path: rel.clone(), size, chunk_start, chunk_count: refs.len() });
+            global += size;
+        }
+        let hashes: Vec<Hash> = chunks.iter().map(|c| c.hash).collect();
+        Ok(Manifest { root: merkle_root(&hashes), total_size: global, chunks, files: entries, name })
+    }
+
+    /// Stream the whole content (all files concatenated) to a writer, verifying
+    /// each chunk's content hash. For single-file content this is the file.
+    pub fn export_to<W: Write>(&self, manifest: &Manifest, writer: W) -> Result<(), StoreError> {
+        if !manifest.root_is_consistent() {
+            return Err(StoreError::Corrupt(manifest.root));
+        }
+        let mut w = BufWriter::new(writer);
+        for (i, cref) in manifest.chunks.iter().enumerate() {
+            let bytes = self.get(&cref.hash)?.ok_or(StoreError::Missing(cref.hash))?;
+            if !manifest.chunk_hash_ok(i, &bytes) {
+                return Err(StoreError::Corrupt(cref.hash));
+            }
+            w.write_all(&bytes)?;
+        }
+        w.flush()?;
+        Ok(())
+    }
+
+    /// Write every file of `manifest` into `out_dir`, streaming each file
+    /// chunk-by-chunk. Verifies chunk hashes and rejects unsafe paths.
+    pub fn export_tree_to_dir(&self, manifest: &Manifest, out_dir: &Path) -> Result<(), StoreError> {
+        if !manifest.root_is_consistent() {
+            return Err(StoreError::Corrupt(manifest.root));
+        }
+        for entry in &manifest.files {
+            let mut dest = out_dir.to_path_buf();
+            for comp in entry.path.split('/') {
+                if comp.is_empty() || comp == "." || comp == ".." {
+                    return Err(StoreError::UnsafePath(entry.path.clone()));
+                }
+                dest.push(comp);
+            }
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut w = BufWriter::new(File::create(&dest)?);
+            for ci in entry.chunk_start..entry.chunk_start + entry.chunk_count {
+                let cref = &manifest.chunks[ci];
+                let bytes = self.get(&cref.hash)?.ok_or(StoreError::Missing(cref.hash))?;
+                if !manifest.chunk_hash_ok(ci, &bytes) {
+                    return Err(StoreError::Corrupt(cref.hash));
+                }
+                w.write_all(&bytes)?;
+            }
+            w.flush()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -328,5 +423,50 @@ mod tests {
         // Two files in the manifest, but the shared chunks are stored only once.
         assert_eq!(store.object_count().unwrap(), per_file);
         assert_eq!(store.export_tree(&m).unwrap(), files);
+    }
+
+    #[test]
+    fn streaming_ingest_matches_in_memory_root() {
+        let data = sample(2_000_000, 42);
+
+        let d1 = TmpDir::new();
+        let in_mem = Store::open(d1.path()).unwrap().ingest(&data, Some("f.bin".into())).unwrap();
+
+        let fdir = TmpDir::new();
+        let fpath = fdir.path().join("f.bin");
+        std::fs::write(&fpath, &data).unwrap();
+        let d2 = TmpDir::new();
+        let streamed = Store::open(d2.path())
+            .unwrap()
+            .ingest_tree_files(&[("f.bin".to_string(), fpath)], Some("f.bin".into()))
+            .unwrap();
+
+        // Critical: both chunking paths must produce the same content id.
+        assert_eq!(in_mem.root, streamed.root);
+        assert_eq!(in_mem.chunks.len(), streamed.chunks.len());
+    }
+
+    #[test]
+    fn streaming_export_round_trips_a_tree() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+
+        let fdir = TmpDir::new();
+        std::fs::create_dir_all(fdir.path().join("sub")).unwrap();
+        let a = fdir.path().join("a.bin");
+        let b = fdir.path().join("sub").join("b.bin");
+        std::fs::write(&a, sample(300_000, 1)).unwrap();
+        std::fs::write(&b, sample(200_000, 2)).unwrap();
+
+        let files = vec![("a.bin".to_string(), a.clone()), ("sub/b.bin".to_string(), b.clone())];
+        let m = store.ingest_tree_files(&files, Some("tree".into())).unwrap();
+
+        let out = TmpDir::new();
+        store.export_tree_to_dir(&m, out.path()).unwrap();
+        assert_eq!(std::fs::read(out.path().join("a.bin")).unwrap(), std::fs::read(&a).unwrap());
+        assert_eq!(
+            std::fs::read(out.path().join("sub").join("b.bin")).unwrap(),
+            std::fs::read(&b).unwrap()
+        );
     }
 }

@@ -2839,6 +2839,7 @@ dependencies = [
 name = "np2ptp-store"
 version = "0.1.0"
 dependencies = [
+ "fastcdc",
  "hex 0.4.3",
  "np2ptp-core",
  "thiserror 1.0.69",
