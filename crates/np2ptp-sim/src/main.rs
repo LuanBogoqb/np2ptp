@@ -1,36 +1,125 @@
-//! Runs every research scenario and prints a report.
+//! Runs every research scenario, prints a summary, and writes report files
+//! (`<out>/REPORT.md` + `<out>/results.csv`, default `out` = `reports`).
+//!
+//! Usage: `cargo run --release -p np2ptp-sim -- [output-dir]`
 
-use np2ptp_sim::{dedup, fec_cost, freeride, permanence};
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use np2ptp_sim::{
+    dedup, fec_cost, freeride, permanence, DedupResult, FecCostResult, FreerideResult,
+    PermanenceResult,
+};
+
+struct Results {
+    dedup: DedupResult,
+    perm_with: PermanenceResult,
+    perm_without: PermanenceResult,
+    freeride_off: FreerideResult,
+    freeride_on: FreerideResult,
+    fec: FecCostResult,
+}
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
+    let out_dir = std::env::args().nth(1).unwrap_or_else(|| "reports".to_string());
+
+    let r = Results {
+        dedup: dedup(),
+        perm_with: permanence(true).await,
+        perm_without: permanence(false).await,
+        freeride_off: freeride(false).await,
+        freeride_on: freeride(true).await,
+        fec: fec_cost().await,
+    };
+
+    print_console(&r);
+
+    fs::create_dir_all(&out_dir).expect("create report dir");
+    fs::write(format!("{out_dir}/results.csv"), build_csv(&r)).expect("write csv");
+    fs::write(format!("{out_dir}/REPORT.md"), build_markdown(&r)).expect("write report");
+    println!("\nwrote {out_dir}/REPORT.md and {out_dir}/results.csv");
+}
+
+fn b(v: bool) -> &'static str {
+    if v {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn print_console(r: &Results) {
     println!("NP2PTP research harness");
     println!("=======================\n");
+    println!("[1] Dedup: {} of {} chunks unique => {:.1}% deduplicated",
+        r.dedup.unique_chunks_stored, r.dedup.total_chunks, r.dedup.dedup_pct);
+    println!("[2] Permanence after seeder leaves: with re-share = {}, without = {}",
+        b(r.perm_with.completed_after_seed_left), b(r.perm_without.completed_after_seed_left));
+    println!("[3] Free-riding: leech completes with choke off = {}, choke on = {}",
+        b(r.freeride_off.leech_completed), b(r.freeride_on.leech_completed));
+    println!("[4] FEC cost ({} bytes): chunk {} ms vs FEC {} ms",
+        r.fec.size, r.fec.chunk_ms, r.fec.fec_ms);
+}
 
-    println!("[1] Dedup — store a file, then a lightly-edited v2");
-    let d = dedup();
-    println!("    chunks across both versions : {}", d.total_chunks);
-    println!("    unique chunks stored        : {}", d.unique_chunks_stored);
-    println!("    => dedup                    : {:.1}%\n", d.dedup_pct);
+fn build_csv(r: &Results) -> String {
+    let mut s = String::from("experiment,metric,value\n");
+    s.push_str(&format!("dedup,total_chunks,{}\n", r.dedup.total_chunks));
+    s.push_str(&format!("dedup,unique_chunks,{}\n", r.dedup.unique_chunks_stored));
+    s.push_str(&format!("dedup,dedup_pct,{:.2}\n", r.dedup.dedup_pct));
+    s.push_str(&format!("permanence,reshare_completes,{}\n", r.perm_with.completed_after_seed_left as u8));
+    s.push_str(&format!("permanence,noreshare_completes,{}\n", r.perm_without.completed_after_seed_left as u8));
+    s.push_str(&format!("freeride,choke_off_completes,{}\n", r.freeride_off.leech_completed as u8));
+    s.push_str(&format!("freeride,choke_on_completes,{}\n", r.freeride_on.leech_completed as u8));
+    s.push_str(&format!("fec,size_bytes,{}\n", r.fec.size));
+    s.push_str(&format!("fec,chunk_ms,{}\n", r.fec.chunk_ms));
+    s.push_str(&format!("fec,fec_ms,{}\n", r.fec.fec_ms));
+    s
+}
 
-    println!("[2] Permanence — does content survive the seeder leaving?");
-    let with = permanence(true).await;
-    let without = permanence(false).await;
-    println!("    with re-sharing : new peer completes after seed left = {}", with.completed_after_seed_left);
-    println!("    no  re-sharing : new peer completes after seed left = {}", without.completed_after_seed_left);
-    println!("    => content persists iff at least one peer re-shared it\n");
+fn build_markdown(r: &Results) -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
 
-    println!("[3] Free-riding — does the reputation choke stop a leech?");
-    let off = freeride(false).await;
-    let on = freeride(true).await;
-    println!("    choke OFF : leech completes = {}", off.leech_completed);
-    println!("    choke ON  : leech completes = {}", on.leech_completed);
-    println!("    => choke cuts the non-reciprocating peer off\n");
-
-    println!("[4] FEC cost — chunk vs RaptorQ-symbol download (1 MB)");
-    let f = fec_cost().await;
-    println!("    chunk download : {} ms", f.chunk_ms);
-    println!("    FEC   download : {} ms", f.fec_ms);
-    println!("    => with symbol batching, FEC ~matches chunk download while adding");
-    println!("       any-k-of-n resilience (run with --release; RaptorQ is slow in debug)");
+    format!(
+        "# NP2PTP research report\n\n\
+         _Generated by `np2ptp-sim` (build profile: **{profile}**, unix time {ts}). \
+         Re-run with `cargo run --release -p np2ptp-sim`._\n\n\
+         All scenarios spin up real `np2ptp-net` nodes over QUIC on loopback.\n\n\
+         ## Summary\n\n\
+         | Experiment | Metric | Result |\n\
+         |---|---|---|\n\
+         | Dedup (file + lightly-edited v2) | chunks unique / total | {} / {} (**{:.1}%** deduplicated) |\n\
+         | Permanence (seeder leaves) | new peer completes - with re-share | **{}** |\n\
+         | Permanence (seeder leaves) | new peer completes - without re-share | **{}** |\n\
+         | Free-riding | leech completes - choke OFF | **{}** |\n\
+         | Free-riding | leech completes - choke ON | **{}** |\n\
+         | FEC cost ({} bytes) | chunk download | **{} ms** |\n\
+         | FEC cost ({} bytes) | FEC (RaptorQ) download | **{} ms** |\n\n\
+         ## Interpretation\n\n\
+         - **Dedup** - content-defined chunking lets a re-shared, lightly-edited copy reuse\n  \
+           most of its chunks, so storage/bandwidth scale with the *change*, not the file size.\n\
+         - **Permanence** - content survives the original seeder leaving **iff** at least one\n  \
+           peer re-shared it. This is the swarm property that keeps files alive after seeders go.\n\
+         - **Incentives** - the reputation choke cuts off a peer that takes without giving back,\n  \
+           while honest peers are unaffected (BitTorrent's tit-for-tat, but with memory).\n\
+         - **FEC cost** - with symbol batching and decode-once, erasure-coded download\n  \
+           ~matches plain chunk download while adding any-*k*-of-*n* resilience. (Build in\n  \
+           `release`; RaptorQ's GF(256) math is far slower in debug.)\n\n\
+         Raw values are in `results.csv` next to this file.\n",
+        r.dedup.unique_chunks_stored,
+        r.dedup.total_chunks,
+        r.dedup.dedup_pct,
+        b(r.perm_with.completed_after_seed_left),
+        b(r.perm_without.completed_after_seed_left),
+        b(r.freeride_off.leech_completed),
+        b(r.freeride_on.leech_completed),
+        r.fec.size,
+        r.fec.chunk_ms,
+        r.fec.size,
+        r.fec.fec_ms,
+    )
 }

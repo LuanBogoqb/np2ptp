@@ -5,4 +5,7 @@
 .np2ptp-store/
 download/
 *.nptp
+
+# Generated research reports (regenerate with `cargo run -p np2ptp-sim`)
+/reports/
 # (Cargo.lock is committed — this workspace ships a binary)
