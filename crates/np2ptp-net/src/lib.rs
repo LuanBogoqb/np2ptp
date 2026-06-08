@@ -129,6 +129,16 @@ enum Command {
     Request { peer: PeerId, request: Request, reply: oneshot::Sender<Result<Response, NetError>> },
     SetChokeThreshold { threshold: i64 },
     Reputation { peer: PeerId, reply: oneshot::Sender<i64> },
+    PutRecord { key: Vec<u8>, value: Vec<u8>, reply: oneshot::Sender<bool> },
+    GetRecord { key: Vec<u8>, reply: oneshot::Sender<Option<Vec<u8>>> },
+}
+
+/// DHT record key for a torrent-infohash -> nptp-root mapping.
+fn mapping_key(infohash: &[u8]) -> Vec<u8> {
+    let mut tagged = Vec::with_capacity(18 + infohash.len());
+    tagged.extend_from_slice(b"np2ptp-bridge:v1:");
+    tagged.extend_from_slice(infohash);
+    Hash::of(&tagged).as_bytes().to_vec()
 }
 
 /// A cloneable handle to a running NP2PTP network node.
@@ -249,6 +259,31 @@ impl Network {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Reputation { peer, reply }).await?;
         rx.await.map_err(|_| NetError::Shutdown)
+    }
+
+    /// Store an arbitrary key/value in the DHT (used for the torrent mapping).
+    pub async fn put_record(&self, key: Vec<u8>, value: Vec<u8>) -> Result<bool, NetError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::PutRecord { key, value, reply }).await?;
+        rx.await.map_err(|_| NetError::Shutdown)
+    }
+
+    /// Look up a key in the DHT.
+    pub async fn get_record(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, NetError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::GetRecord { key, reply }).await?;
+        rx.await.map_err(|_| NetError::Shutdown)
+    }
+
+    /// Publish a torrent-infohash -> nptp-content-id mapping (bridge registry).
+    pub async fn put_mapping(&self, infohash: &[u8], root: Hash) -> Result<bool, NetError> {
+        self.put_record(mapping_key(infohash), root.as_bytes().to_vec()).await
+    }
+
+    /// Resolve a torrent infohash to an nptp content id via the DHT, if bridged.
+    pub async fn get_mapping(&self, infohash: &[u8]) -> Result<Option<Hash>, NetError> {
+        let value = self.get_record(mapping_key(infohash)).await?;
+        Ok(value.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok().map(Hash)))
     }
 
     /// Discover peers that provide `root` via the DHT.
@@ -428,6 +463,9 @@ struct EventLoop {
     pending_req: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<Response, NetError>>>,
     /// In-flight provider lookups: accumulated peers + the waiting caller.
     pending_providers: HashMap<kad::QueryId, (Vec<PeerId>, oneshot::Sender<Vec<PeerId>>)>,
+    /// In-flight DHT record put/get queries.
+    pending_put: HashMap<kad::QueryId, oneshot::Sender<bool>>,
+    pending_get: HashMap<kad::QueryId, oneshot::Sender<Option<Vec<u8>>>>,
     /// Per-peer contribution accounting (incentives).
     ledger: Ledger<PeerId>,
     /// Refuse serving a peer once its reputation falls below `-choke_threshold`.
@@ -445,6 +483,8 @@ impl EventLoop {
             provided: HashMap::new(),
             pending_req: HashMap::new(),
             pending_providers: HashMap::new(),
+            pending_put: HashMap::new(),
+            pending_get: HashMap::new(),
             ledger: Ledger::new(),
             choke_threshold: i64::MAX, // no choking until configured
             symbols: HashMap::new(),
@@ -501,6 +541,21 @@ impl EventLoop {
             }
             Command::Reputation { peer, reply } => {
                 let _ = reply.send(self.ledger.reputation(&peer));
+            }
+            Command::PutRecord { key, value, reply } => {
+                let record = kad::Record::new(kad::RecordKey::new(&key), value);
+                match self.swarm.behaviour_mut().kad.put_record(record, kad::Quorum::One) {
+                    Ok(qid) => {
+                        self.pending_put.insert(qid, reply);
+                    }
+                    Err(_) => {
+                        let _ = reply.send(false);
+                    }
+                }
+            }
+            Command::GetRecord { key, reply } => {
+                let qid = self.swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&key));
+                self.pending_get.insert(qid, reply);
             }
         }
     }
@@ -627,28 +682,48 @@ impl EventLoop {
     }
 
     fn on_kad(&mut self, event: kad::Event) {
-        if let kad::Event::OutboundQueryProgressed {
-            id,
-            result: kad::QueryResult::GetProviders(Ok(ok)),
-            step,
-            ..
-        } = event
-        {
-            if let Some((acc, _)) = self.pending_providers.get_mut(&id) {
-                if let kad::GetProvidersOk::FoundProviders { providers, .. } = ok {
-                    for p in providers {
-                        if !acc.contains(&p) {
-                            acc.push(p);
+        let kad::Event::OutboundQueryProgressed { id, result, step, .. } = event else {
+            return;
+        };
+        match result {
+            kad::QueryResult::GetProviders(Ok(ok)) => {
+                if let Some((acc, _)) = self.pending_providers.get_mut(&id) {
+                    if let kad::GetProvidersOk::FoundProviders { providers, .. } = ok {
+                        for p in providers {
+                            if !acc.contains(&p) {
+                                acc.push(p);
+                            }
                         }
                     }
                 }
-            }
-            // When the query is exhausted, hand the accumulated peers back.
-            if step.last {
-                if let Some((acc, reply)) = self.pending_providers.remove(&id) {
-                    let _ = reply.send(acc);
+                if step.last {
+                    if let Some((acc, reply)) = self.pending_providers.remove(&id) {
+                        let _ = reply.send(acc);
+                    }
                 }
             }
+            kad::QueryResult::GetRecord(Ok(ok)) => {
+                if let kad::GetRecordOk::FoundRecord(rec) = ok {
+                    if let Some(reply) = self.pending_get.remove(&id) {
+                        let _ = reply.send(Some(rec.record.value));
+                    }
+                } else if step.last {
+                    if let Some(reply) = self.pending_get.remove(&id) {
+                        let _ = reply.send(None);
+                    }
+                }
+            }
+            kad::QueryResult::GetRecord(Err(_)) => {
+                if let Some(reply) = self.pending_get.remove(&id) {
+                    let _ = reply.send(None);
+                }
+            }
+            kad::QueryResult::PutRecord(res) => {
+                if let Some(reply) = self.pending_put.remove(&id) {
+                    let _ = reply.send(res.is_ok());
+                }
+            }
+            _ => {}
         }
     }
 }

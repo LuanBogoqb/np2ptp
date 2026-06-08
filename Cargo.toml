@@ -8,6 +8,7 @@ members = [
     "crates/np2ptp-rep",
     "crates/np2ptp-net",
     "crates/np2ptp-sim",
+    "crates/np2ptp-bridge",
 ]
 
 [workspace.package]

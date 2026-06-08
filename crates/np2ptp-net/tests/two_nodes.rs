@@ -200,6 +200,49 @@ async fn fec_download_reconstructs_over_quic() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dht_mapping_infohash_to_root_round_trips() {
+    // Node A publishes a torrent-infohash -> nptp-root mapping.
+    let a_dir = TmpDir::new();
+    let a = Network::spawn(Store::open(a_dir.path()).unwrap(), Some([80u8; 32])).unwrap();
+    a.listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .await
+        .unwrap();
+    let a_addr = first_listen_addr(&a).await;
+    let a_peer = a.local_peer_id();
+
+    let infohash = [0xABu8; 20]; // stand-in for a BitTorrent v1 infohash
+    let root = Hash::of(b"nptp content bridged from that torrent");
+
+    // Node B also listens, so the record can be replicated to it (put_record with
+    // Quorum::One needs at least one reachable remote peer).
+    let b_dir = TmpDir::new();
+    let b = Network::spawn(Store::open(b_dir.path()).unwrap(), Some([81u8; 32])).unwrap();
+    b.listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .await
+        .unwrap();
+    let b_addr = first_listen_addr(&b).await;
+    let b_peer = b.local_peer_id();
+
+    a.add_peer(b_peer, b_addr.clone()).await.unwrap();
+    b.add_peer(a_peer, a_addr.clone()).await.unwrap();
+    a.dial(b_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(a.put_mapping(&infohash, root).await.unwrap(), "put_mapping should succeed");
+
+    // B resolves the infohash to the nptp root via the DHT.
+    let mut got = None;
+    for _ in 0..100 {
+        if let Some(r) = b.get_mapping(&infohash).await.unwrap() {
+            got = Some(r);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(got, Some(root), "B should resolve the bridged mapping");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovers_provider_via_dht() {
     let seed_dir = TmpDir::new();
     let seed_store = Store::open(seed_dir.path()).unwrap();

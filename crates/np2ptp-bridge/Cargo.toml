@@ -1,0 +1,23 @@
+[package]
+name = "np2ptp-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NP2PTP <-> BitTorrent bridge: resolve a torrent from the NP2PTP network or convert it"
+
+[dependencies]
+np2ptp-core = { path = "../np2ptp-core" }
+np2ptp-store = { path = "../np2ptp-store" }
+np2ptp-net = { path = "../np2ptp-net" }
+sha1 = "0.10"
+thiserror.workspace = true
+# Real BitTorrent source, behind a feature so the core stays light.
+librqbit = { version = "8", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "time", "fs"] }
+
+[features]
+librqbit = ["dep:librqbit", "dep:tokio"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+sha1 = "0.10"
