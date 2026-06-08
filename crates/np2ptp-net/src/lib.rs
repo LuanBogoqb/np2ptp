@@ -22,7 +22,7 @@ use libp2p::{
     autonat, dcutr, identify, identity, kad, noise, relay,
     request_response::{self, ProtocolSupport},
     swarm::SwarmEvent,
-    yamux, StreamProtocol, Swarm,
+    upnp, yamux, StreamProtocol, Swarm,
 };
 use np2ptp_core::{Hash, Manifest};
 use np2ptp_rep::Ledger;
@@ -115,6 +115,9 @@ struct Behaviour {
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
     autonat: autonat::Behaviour,
+    // Auto-open a port on the home router (IGD) so the node is reachable from the
+    // open internet without a VPN — the single biggest NAT win for home users.
+    upnp: upnp::tokio::Behaviour,
 }
 
 /// Commands sent from a [`Network`] handle to the swarm task.
@@ -122,6 +125,7 @@ enum Command {
     Listen { addr: Multiaddr, reply: oneshot::Sender<Result<(), NetError>> },
     Dial { addr: Multiaddr, reply: oneshot::Sender<Result<(), NetError>> },
     Listeners { reply: oneshot::Sender<Vec<Multiaddr>> },
+    ExternalAddresses { reply: oneshot::Sender<Vec<Multiaddr>> },
     AddPeer { peer: PeerId, addr: Multiaddr },
     AddExternalAddress { addr: Multiaddr },
     Provide { root: Hash, manifest_bytes: Vec<u8> },
@@ -180,6 +184,7 @@ impl Network {
                     relay_client,
                     dcutr: dcutr::Behaviour::new(peer_id),
                     autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
+                    upnp: upnp::tokio::Behaviour::default(),
                 }
             })
             .map_err(|e| NetError::Build(e.to_string()))?
@@ -221,10 +226,18 @@ impl Network {
         rx.await.map_err(|_| NetError::Shutdown)?
     }
 
-    /// The addresses this node is actually listening on.
+    /// The addresses this node is actually listening on (local interfaces).
     pub async fn listeners(&self) -> Result<Vec<Multiaddr>, NetError> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Listeners { reply }).await?;
+        rx.await.map_err(|_| NetError::Shutdown)
+    }
+
+    /// Confirmed external (publicly-reachable) addresses, e.g. a UPnP-mapped
+    /// router address. These are what remote peers on other networks can dial.
+    pub async fn external_addresses(&self) -> Result<Vec<Multiaddr>, NetError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::ExternalAddresses { reply }).await?;
         rx.await.map_err(|_| NetError::Shutdown)
     }
 
@@ -515,6 +528,9 @@ impl EventLoop {
             Command::Listeners { reply } => {
                 let _ = reply.send(self.swarm.listeners().cloned().collect());
             }
+            Command::ExternalAddresses { reply } => {
+                let _ = reply.send(self.swarm.external_addresses().cloned().collect());
+            }
             Command::AddPeer { peer, addr } => {
                 self.swarm.behaviour_mut().kad.add_address(&peer, addr);
             }
@@ -573,6 +589,20 @@ impl EventLoop {
                     self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Upnp(event)) => match event {
+                upnp::Event::NewExternalAddr(addr) => {
+                    eprintln!("upnp: mapped a public address via the router: {addr}");
+                }
+                upnp::Event::GatewayNotFound => {
+                    eprintln!("upnp: no IGD gateway found (router UPnP off/unsupported)");
+                }
+                upnp::Event::NonRoutableGateway => {
+                    eprintln!("upnp: gateway has no public IP (CGNAT?) — needs relay/hole-punch");
+                }
+                upnp::Event::ExpiredExternalAddr(addr) => {
+                    eprintln!("upnp: external address expired: {addr}");
+                }
+            },
             _ => {}
         }
     }

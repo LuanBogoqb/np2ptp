@@ -253,14 +253,22 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
             tokio::signal::ctrl_c().await?;
         } else {
             println!("\nProviding on the DHT + announcing to {tracker_url}. Press Ctrl-C to stop.");
-            // Re-announce periodically so the listing stays fresh (TTL ~30 min).
-            let mut interval = tokio::time::interval(Duration::from_secs(600));
+            // Re-announce periodically (TTL ~30 min) — frequent enough to pick up
+            // a UPnP-mapped public address once the router responds.
+            let mut interval = tokio::time::interval(Duration::from_secs(120));
             loop {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => break,
                     _ = interval.tick() => {
-                        let current = net.listeners().await.unwrap_or_default();
-                        if let Err(e) = tracker::announce(&tracker_url, manifest.root, peer, &current).await {
+                        // Announce local listen addresses AND any public (UPnP)
+                        // external address so peers on other networks can reach us.
+                        let mut addrs = net.listeners().await.unwrap_or_default();
+                        for ext in net.external_addresses().await.unwrap_or_default() {
+                            if !addrs.contains(&ext) {
+                                addrs.push(ext);
+                            }
+                        }
+                        if let Err(e) = tracker::announce(&tracker_url, manifest.root, peer, &addrs).await {
                             eprintln!("  (tracker announce failed: {e})");
                         }
                     }
