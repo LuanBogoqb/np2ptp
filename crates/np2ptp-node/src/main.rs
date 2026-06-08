@@ -233,8 +233,28 @@ fn load_or_create_seed(path: &str) -> Result<[u8; 32], Box<dyn Error>> {
     }
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed).map_err(|e| format!("rng error: {e}"))?;
-    fs::write(path, seed)?;
+    write_secret(path, &seed)?;
     Ok(seed)
+}
+
+/// Write a private key file with owner-only permissions (0600) on Unix. On
+/// Windows the default ACL already restricts it to the owner.
+#[cfg(unix)]
+fn write_secret(path: &str, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)
+}
+
+#[cfg(not(unix))]
+fn write_secret(path: &str, data: &[u8]) -> std::io::Result<()> {
+    fs::write(path, data)
 }
 
 /// Heuristic: treat as a directory tree if there are multiple files or the single
