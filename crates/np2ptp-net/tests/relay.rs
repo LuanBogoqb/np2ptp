@@ -162,3 +162,66 @@ async fn download_through_a_relay() {
     assert!(ok, "dialer should download from the listener via the relay");
     assert_eq!(d_store.export(&manifest).unwrap(), data);
 }
+
+/// Regression test for a real-world failure: a CGNAT seed serving a
+/// multi-thousand-chunk `.nptp` file through the relay failed every time —
+/// not flaky, every time — because `relay::Config::default()` caps a
+/// circuit at `max_circuit_bytes` = 128 KiB (`1 << 17`), and the manifest
+/// alone (a few thousand chunk hashes) was already ~12x over that. This is
+/// also almost certainly why `download_through_a_relay` above was flaky:
+/// its 120_000-byte payload sits just under that same 128 KiB cap. The fix
+/// (`relay_config()` in `lib.rs`) raises the cap to 512 MiB / 10 min, so
+/// this payload — comfortably past the *old* cap — should now transfer
+/// cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_moves_content_past_the_old_default_byte_cap() {
+    let relay_dir = TmpDir::new();
+    let relay = Network::spawn(Store::open(relay_dir.path()).unwrap(), Some([80u8; 32])).unwrap();
+    relay
+        .listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .await
+        .unwrap();
+    let relay_addr = first_listen_addr(&relay).await;
+    let relay_peer = relay.local_peer_id();
+    relay.add_external_address(relay_addr.clone()).await.unwrap();
+    let relay_base: Multiaddr = format!("{relay_addr}/p2p/{relay_peer}").parse().unwrap();
+
+    let l_dir = TmpDir::new();
+    let l_store = Store::open(l_dir.path()).unwrap();
+    // Comfortably past the *old* 131072-byte default cap (still far under
+    // the new 512 MiB one).
+    let data = sample(500_000, 8);
+    let manifest = l_store.ingest(&data, None).unwrap();
+    let root = manifest.root;
+    let listener = Network::spawn(l_store, Some([81u8; 32])).unwrap();
+    let listener_peer = listener.local_peer_id();
+    listener.dial(relay_base.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    listener
+        .listen(format!("{relay_base}/p2p-circuit").parse().unwrap())
+        .await
+        .unwrap();
+    listener.provide(&manifest).await.unwrap();
+    assert!(has_circuit_listener(&listener).await);
+
+    let d_dir = TmpDir::new();
+    let dialer = Network::spawn(Store::open(d_dir.path()).unwrap(), Some([82u8; 32])).unwrap();
+    let d_store = Store::open(d_dir.path()).unwrap();
+    dialer.dial(relay_base.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    dialer
+        .dial(format!("{relay_base}/p2p-circuit/p2p/{listener_peer}").parse().unwrap())
+        .await
+        .unwrap();
+
+    let mut ok = false;
+    for _ in 0..200 {
+        if dialer.download(root, listener_peer, &d_store).await.is_ok() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ok, "dialer should download 500 KB through the relay under the raised circuit cap");
+    assert_eq!(d_store.export(&manifest).unwrap(), data);
+}

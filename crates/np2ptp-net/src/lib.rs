@@ -16,6 +16,7 @@
 //! local client has, now over the wire.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::{
@@ -109,6 +110,26 @@ const FEC_REPAIR_SYMBOLS: u32 = 64;
 /// How many symbols a FEC download requests per round-trip.
 const FEC_BATCH: u32 = 128;
 
+/// Per-circuit limits for when this node acts as a relay for someone else.
+/// libp2p-relay's own defaults (128 KiB, 2 minutes) are sized for signaling
+/// traffic, not content transfer — a real download blows past them on the
+/// very first request (a multi-thousand-chunk manifest alone can be well
+/// over 1 MB), which is what made relayed transfers fail. 512 MiB / 10 min
+/// comfortably moves real content (game installs, ISOs, media) while still
+/// bounding how much of the relay operator's bandwidth one circuit can take
+/// — chunked/resumable download means a transfer that outgrows one circuit
+/// just reconnects and picks up the remaining chunks.
+const RELAY_MAX_CIRCUIT_BYTES: u64 = 512 * 1024 * 1024;
+const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(10 * 60);
+
+fn relay_config() -> relay::Config {
+    relay::Config {
+        max_circuit_bytes: RELAY_MAX_CIRCUIT_BYTES,
+        max_circuit_duration: RELAY_MAX_CIRCUIT_DURATION,
+        ..relay::Config::default()
+    }
+}
+
 /// The combined libp2p behaviour for an NP2PTP node.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct Behaviour {
@@ -186,7 +207,7 @@ impl Network {
                         IDENTIFY_PROTOCOL.to_string(),
                         key.public(),
                     )),
-                    relay_server: relay::Behaviour::new(peer_id, relay::Config::default()),
+                    relay_server: relay::Behaviour::new(peer_id, relay_config()),
                     relay_client,
                     dcutr: dcutr::Behaviour::new(peer_id),
                     autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
