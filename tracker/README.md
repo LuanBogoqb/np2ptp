@@ -39,10 +39,22 @@ vercel deploy --prod
 # add Upstash via the dashboard or: vercel integration add upstash
 ```
 
-## How the NP2PTP client will use it (Phase 2)
+## How the NP2PTP client uses it
 
 - On `serve`: `POST /announce { cid: <root>, peer: <peer-id>, addr: <public multiaddr> }`.
 - On `fetch <link>` with no `--peer`: `GET /peers?cid=<root>`, then dial those peers.
 
-(The Rust wiring is a Phase-2 task — see ../ROADMAP.md. Reachability across NATs
-still needs UPnP/relay; the tracker only solves *discovery*.)
+Wired in `crates/np2ptp-node/src/tracker.rs`; both `serve` and `fetch` take a
+`--tracker <url>` flag. Reachability across NATs still needs UPnP/relay; the
+tracker only solves *discovery*.
+
+## Live instance
+
+The "principal" tracker is self-hosted (not Vercel) at **https://nptp.bogotec.uk**,
+behind Caddy on the same VPS that fronts the rest of `bogotec.uk`. It runs as
+the `np2ptp-tracker` systemd unit under `/opt/np2ptp-tracker` (plain Node,
+`server.js` adapts the Vercel-style handlers in `api/` to a standalone HTTP
+server — no Upstash/Redis needed since the process stays warm, unlike
+serverless). This is now `tracker::DEFAULT_TRACKER`, so clients hit it
+automatically unless `--tracker` overrides it. The Vercel deploy steps below
+still work if you ever want a second/backup tracker instance.

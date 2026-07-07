@@ -36,10 +36,16 @@ pub use libp2p::{Multiaddr, PeerId};
 
 /// Extract the `PeerId` from a multiaddr that ends in `/p2p/<peer-id>`, if present.
 pub fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter().find_map(|proto| match proto {
-        libp2p::multiaddr::Protocol::P2p(id) => Some(id),
-        _ => None,
-    })
+    // The *last* `/p2p/<id>` is the actual destination. A plain address has
+    // just one, but a relay circuit address carries two — .../p2p/<relay>/
+    // p2p-circuit/p2p/<target> — and the target, not the relay, is who we're
+    // actually talking to once the circuit is established.
+    addr.iter()
+        .filter_map(|proto| match proto {
+            libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+            _ => None,
+        })
+        .last()
 }
 
 /// Protocol id for the content request-response protocol.

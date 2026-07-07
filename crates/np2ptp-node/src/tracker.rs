@@ -1,6 +1,6 @@
 //! Tracker HTTP client: announce/discover peers by content id.
 //!
-//! The tracker (a tiny serverless app, default `https://np2ptp.vercel.app`) is
+//! The tracker (a tiny always-on app, default `https://nptp.bogotec.uk`) is
 //! pure discovery — it only swaps contact info, BitTorrent-tracker style. The
 //! transfer stays peer-to-peer over QUIC.
 
@@ -10,7 +10,7 @@ use np2ptp_core::Hash;
 use np2ptp_net::{Multiaddr, PeerId};
 use serde::Deserialize;
 
-pub const DEFAULT_TRACKER: &str = "https://np2ptp.vercel.app";
+pub const DEFAULT_TRACKER: &str = "https://nptp.bogotec.uk";
 
 #[derive(Deserialize)]
 struct PeersResp {
@@ -34,7 +34,21 @@ pub async fn announce(
     peer: PeerId,
     addrs: &[Multiaddr],
 ) -> Result<(), Box<dyn Error>> {
-    let addr_strs: Vec<String> = addrs.iter().map(|a| format!("{a}/p2p/{peer}")).collect();
+    // Relay circuit listen addresses already end in `/p2p/<peer>` (that's how
+    // libp2p reports them) — don't double it up, or the resulting multiaddr
+    // carries the peer id twice.
+    let suffix = format!("/p2p/{peer}");
+    let addr_strs: Vec<String> = addrs
+        .iter()
+        .map(|a| {
+            let s = a.to_string();
+            if s.ends_with(&suffix) {
+                s
+            } else {
+                format!("{s}{suffix}")
+            }
+        })
+        .collect();
     let body = serde_json::json!({
         "cid": cid.to_hex(),
         "peer": peer.to_string(),

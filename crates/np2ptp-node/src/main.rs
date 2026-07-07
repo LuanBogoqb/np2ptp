@@ -26,6 +26,10 @@ mod portmap;
 mod tracker;
 
 const DEFAULT_STORE: &str = ".np2ptp-store";
+/// The "principal" public relay + DHT bootstrap node — the always-works fallback
+/// when a `serve`r turns out to have no other reachable address (CGNAT, no
+/// UPnP/NAT-PMP). Same box as `tracker::DEFAULT_TRACKER`.
+const DEFAULT_RELAY: &str = "/ip4/194.163.191.81/udp/4001/quic-v1/p2p/12D3KooWSzXtDVLLFf2avw9bpcMCRsE7JvbdQNEcd45MKuRsGmyR";
 
 fn main() -> ExitCode {
     match run() {
@@ -298,11 +302,16 @@ fn udp_port(addr: &Multiaddr) -> Option<u16> {
 /// Seed content on the network: load a `.nptp`, serve its chunks from the store,
 /// and announce it on the DHT until interrupted.
 fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (pos, flags) = parse(args, &["--store", "--listen", "--tracker", "--public"]);
+    let (pos, flags) = parse(args, &["--store", "--listen", "--tracker", "--public", "--relay"]);
     let file = *pos.first().ok_or("serve: missing <file.nptp>")?;
     let manifest = Manifest::from_nptp(&fs::read(file)?)?;
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
     let store = Store::open(&store_dir)?;
+    // Persist identity per store dir: restarting `serve` on the same --store
+    // keeps the same peer id, so providers already found (DHT, tracker, a
+    // peer's cache) don't lose track of us. Mirrors `relay`'s --key, just
+    // automatic — there's no reason to hand out a fresh identity every time.
+    let identity_seed = load_or_create_seed(&format!("{store_dir}/identity.key"))?;
     let listen = flags
         .get("listen")
         .cloned()
@@ -310,6 +319,12 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
     // A reachable public address to advertise (e.g. a router dst-nat / port
     // forward), for when this node is reachable via a public IP it isn't bound to.
     let public = flags.get("public").cloned();
+    // Relay fallback is automatic: if nothing below (manual --public, UPnP,
+    // NAT-PMP/PCP) produces a reachable external address, we dial the public
+    // relay ourselves. `--relay <multiaddr>` forces a specific relay instead of
+    // the default; `--no-relay` disables the fallback entirely.
+    let relay_override = flags.get("relay").cloned();
+    let no_relay = flags.contains_key("no-relay");
     let tracker_url = flags
         .get("tracker")
         .cloned()
@@ -318,7 +333,7 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let net = Network::spawn(store, None)?;
+        let net = Network::spawn(store, Some(identity_seed))?;
         net.listen(listen.parse()?).await?;
         net.provide(&manifest).await?;
         let peer = net.local_peer_id();
@@ -357,7 +372,7 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
 
         // Try NAT-PMP / PCP for a public address (complements net's UPnP/IGD).
         // Kept alive for the session so the router mapping isn't torn down.
-        let _portmap = match addrs.iter().find_map(udp_port) {
+        let portmap_result = match addrs.iter().find_map(udp_port) {
             Some(port) => match portmap::try_map_udp(port).await {
                 Ok(mapped) => {
                     if let Some(ip) = portmap::public_ip().await {
@@ -377,6 +392,67 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
             },
             None => None,
         };
+
+        // Decide, automatically, whether we need the relay fallback: give UPnP a
+        // little longer to report in (it's async and may not have fired yet),
+        // then check whether *anything* so far (--public, UPnP, NAT-PMP/PCP)
+        // produced a real external address.
+        let mut has_external = public.is_some() || portmap_result.is_some();
+        if !has_external {
+            for _ in 0..30 {
+                if !net.external_addresses().await.unwrap_or_default().is_empty() {
+                    has_external = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        let relay_addr_str = if no_relay {
+            None
+        } else if let Some(r) = relay_override {
+            Some(r)
+        } else if !has_external {
+            println!("no direct/UPnP/NAT-PMP public address — falling back to public relay");
+            Some(DEFAULT_RELAY.to_string())
+        } else {
+            None
+        };
+
+        // Reserve a circuit on a public relay — the fallback for CGNAT / no port
+        // forward, where UPnP and NAT-PMP/PCP both have nothing to work with.
+        if let Some(r) = &relay_addr_str {
+            let relay_addr: Multiaddr = r.parse()?;
+            println!("relay: dialing {relay_addr} ...");
+            net.dial(relay_addr.clone()).await?;
+            // The reservation needs an established connection to the relay first.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            net.listen(format!("{relay_addr}/p2p-circuit").parse()?).await?;
+            let mut got_circuit = false;
+            for _ in 0..100 {
+                if net
+                    .listeners()
+                    .await?
+                    .iter()
+                    .any(|a| a.to_string().contains("p2p-circuit"))
+                {
+                    got_circuit = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if got_circuit {
+                println!("relay: reservation ok -> {relay_addr}/p2p-circuit/p2p/{peer}");
+                if !no_tracker {
+                    let addrs = net.listeners().await.unwrap_or_default();
+                    if let Err(e) = tracker::announce(&tracker_url, manifest.root, peer, &addrs).await {
+                        eprintln!("  (tracker announce failed: {e})");
+                    }
+                }
+            } else {
+                eprintln!("relay: no reservation after 10s, continuing without it");
+            }
+        }
 
         if no_tracker {
             println!("\nProviding on the DHT. Press Ctrl-C to stop.");
@@ -498,7 +574,7 @@ fn print_usage() {
          \x20 np2ptp pack  <input> [--out <file.nptp>] [--store <dir>] [--name <name>]\n\
          \x20 np2ptp info  <file.nptp>\n\
          \x20 np2ptp get   <file.nptp> --source <store-dir> [--store <dir>] [--out <output>]\n\
-         \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>]\n\
+         \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay]\n\
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\n\
          NOTES:\n\
@@ -506,6 +582,9 @@ fn print_usage() {
          \x20 'get' rebuilds content from a local --source store (offline stand-in for a peer).\n\
          \x20 'serve' seeds over the network and announces to a tracker; 'fetch' without --peer\n\
          \x20 discovers providers via the tracker and downloads from them, verifying every chunk.\n\
+         \x20 'serve' falls back to the public relay automatically when --public/UPnP/NAT-PMP\n\
+         \x20 all fail to find a reachable address (e.g. CGNAT) — override with --relay, or\n\
+         \x20 disable with --no-relay.\n\
          \x20 Default store dir: {DEFAULT_STORE}"
     );
 }
