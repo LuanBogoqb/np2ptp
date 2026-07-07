@@ -1,8 +1,17 @@
 # NP2PTP — New Peer-To-Peer Transfer Protocol
 
+[![Release](https://github.com/LuanBogoqb/np2ptp/actions/workflows/release.yml/badge.svg)](https://github.com/LuanBogoqb/np2ptp/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/LuanBogoqb/np2ptp)](https://github.com/LuanBogoqb/np2ptp/releases/latest)
+
 A research prototype exploring a "BitTorrent 2.0": fix what torrents do badly and
 improve what they already do well. The goal is **measurable** experiments, not a
 production client.
+
+## Get the CLI
+
+Prebuilt binaries (Linux + Windows) are attached to every
+[release](https://github.com/LuanBogoqb/np2ptp/releases/latest) — no Rust toolchain
+needed. Or build it yourself, see [Build & test](#build--test) below.
 
 ## Pain points being targeted (in priority order)
 
@@ -30,13 +39,18 @@ measures whether any of it actually beats a baseline.
 | `np2ptp-fec`    | ✅ built     | RaptorQ erasure coding (k-of-n recovery); wired into the network download (`--fec`) |
 | `np2ptp-node`   | ✅ built     | `.nptp` linker (`pack`, files **and folders**) + client (`get`/`info`/`serve`/`fetch`) CLI |
 | `np2ptp-rep`    | ✅ built     | Ed25519 identity, signed receipts, reputation ledger; wired into net (accounting + choke) |
-| `np2ptp-net`    | 🚧 partial   | libp2p/QUIC: e2e download by content id, DHT discovery, reputation choke, FEC symbols, relay reservation; full relayed transfer + DCUtR need real NATs |
+| `np2ptp-net`    | ✅ built     | libp2p/QUIC: e2e download by content id, DHT discovery, reputation choke, FEC symbols, relay reservation **and relayed data transfer (validated against a real CGNAT host)** |
 | `np2ptp-sim`    | ✅ built     | Research harness: measures dedup, permanence, free-riding, FEC cost |
 
-62 unit/integration tests today, all green — including real libp2p nodes downloading a
+There's also a small **tracker** — BitTorrent-tracker-style peer discovery over plain
+HTTP, self-hosted (no Vercel/Upstash needed), see [`tracker/README.md`](tracker/README.md).
+
+70 unit/integration tests today, 69 green — including real libp2p nodes downloading a
 whole file over QUIC (chunk-by-chunk *and* via RaptorQ symbols), discovering each other
 via the DHT, choking a non-reciprocating peer, and a behind-NAT node obtaining a relay
-reservation.
+reservation. The 1 remaining test (full relayed *transfer*) is `#[ignore]`d because it's
+flaky on loopback — see [NAT traversal status](#nat-traversal-status), which covers it a
+different way: by hand, against a real NAT.
 
 ## Research results (`np2ptp-sim`)
 
@@ -63,15 +77,31 @@ The relay (v2), DCUtR, and AutoNAT behaviours are wired in. On a single dev mach
 a behind-NAT node successfully reserves a slot on a relay and gets a dialable
 `/…/p2p-circuit/p2p/<peer>` address (covered by a passing test). A *full content
 download through the relay* is flaky on loopback — the relayed QUIC stream tears down and
-DCUtR has no real NAT to punch — so that test is `#[ignore]`d pending validation on real
-NATed hosts (or via the simulation harness). The behaviours themselves are production-shaped.
+DCUtR has no real NAT to punch on `127.0.0.1` — so that test stays `#[ignore]`d.
+
+That path **has since been validated by hand against a real NAT**: a Windows host behind
+CGNAT (Mikrotik router, no UPnP, no port forward) served content that a separate machine
+downloaded end-to-end through a public relay, bytes verified identical. `serve` now
+automates the whole thing:
+
+1. Try `--public` (manual override), then UPnP, then NAT-PMP/PCP.
+2. If none of those produce a reachable external address, dial the public relay
+   (`DEFAULT_RELAY`) on its own, reserve a circuit, and announce that circuit address
+   to the tracker/DHT — no flags needed. `--relay <multiaddr>` forces a specific relay;
+   `--no-relay` disables the fallback.
+3. `serve` also persists its identity per `--store` dir (`identity.key`) instead of
+   generating a new peer id every restart, so a seeder that bounces doesn't strand every
+   reference to it.
+
+A standing public relay + DHT bootstrap node ("the principal node") is on 24/7:
+`np2ptp relay --public <ip>` — see `crates/np2ptp-node/src/main.rs`'s `cmd_relay`.
 
 ## Build & test
 
 Requires the Rust toolchain (https://rustup.rs).
 
 ```sh
-cargo test            # run all unit tests (19 today, all green)
+cargo test --workspace   # run all unit/integration tests (70 today, 69 green, 1 ignored)
 cargo test -p np2ptp-core
 cargo test -p np2ptp-store
 ```
@@ -145,8 +175,8 @@ which is what lets it survive seeder churn. **Incentives:** each node keeps a re
 ledger of bytes served/received per peer and can *choke* a peer that takes far more than
 it gives back (`set_choke_threshold`).
 
-NAT traversal (relay v2 + DCUtR hole punching) is the next milestone; today both peers
-need a reachable address.
+**Behind CGNAT / no port forward?** `serve` handles it on its own — see
+[NAT traversal status](#nat-traversal-status).
 
 ## What `np2ptp-store` gives you today
 
