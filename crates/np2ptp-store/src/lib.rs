@@ -10,15 +10,21 @@
 //! a 256-way fan-out that keeps directories small. Writes are atomic
 //! (temp file + rename) so a crash mid-write can't leave a corrupt object.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use fastcdc::v2020::StreamCDC;
 use np2ptp_core::chunk::{AVG_CHUNK, MAX_CHUNK, MIN_CHUNK};
 use np2ptp_core::hash::Hash;
 use np2ptp_core::manifest::{ChunkRef, FileEntry, Manifest, ManifestError};
 use np2ptp_core::merkle_root;
+
+/// Where an externally-referenced chunk's bytes actually live: a byte range
+/// inside a file we don't own a copy of.
+type RefLoc = (PathBuf, u64, u32);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -37,6 +43,11 @@ pub enum StoreError {
 /// A disk-backed content-addressed store.
 pub struct Store {
     objects: PathBuf,
+    /// Sidecar index for `pack --no-copy`: chunks whose bytes were never
+    /// copied in, only referenced by (path, offset, length) in a source file
+    /// the caller keeps in place. Appended to as `<dir>/refs.tsv`.
+    refs_path: PathBuf,
+    refs: RwLock<HashMap<Hash, RefLoc>>,
 }
 
 impl Store {
@@ -44,7 +55,9 @@ impl Store {
     pub fn open(dir: impl AsRef<Path>) -> Result<Store, StoreError> {
         let objects = dir.as_ref().join("objects");
         fs::create_dir_all(&objects)?;
-        Ok(Store { objects })
+        let refs_path = dir.as_ref().join("refs.tsv");
+        let refs = load_refs(&refs_path)?;
+        Ok(Store { objects, refs_path, refs: RwLock::new(refs) })
     }
 
     fn path_for(&self, h: &Hash) -> PathBuf {
@@ -52,9 +65,51 @@ impl Store {
         self.objects.join(&hex[..2]).join(&hex)
     }
 
-    /// True if this exact content is already stored.
+    /// True if this exact content is already stored (copied in or referenced).
     pub fn has(&self, h: &Hash) -> bool {
-        self.path_for(h).exists()
+        self.path_for(h).exists() || self.refs.read().unwrap().contains_key(h)
+    }
+
+    /// Record that `h`'s bytes live at `data[offset..offset+length]` in
+    /// `source` rather than copying them into `objects/`. `source` should
+    /// already be an absolute path (canonicalized once by the caller) since
+    /// this reference must still resolve after the process (and its cwd)
+    /// changes — e.g. `pack` now, `serve` later.
+    fn add_reference(&self, h: Hash, source: &Path, offset: u64, length: u32) -> io::Result<()> {
+        let mut line = String::new();
+        line.push_str(&h.to_hex());
+        line.push('\t');
+        line.push_str(&offset.to_string());
+        line.push('\t');
+        line.push_str(&length.to_string());
+        line.push('\t');
+        line.push_str(&source.to_string_lossy());
+        line.push('\n');
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(&self.refs_path)?;
+        f.write_all(line.as_bytes())?;
+        self.refs.write().unwrap().insert(h, (source.to_path_buf(), offset, length));
+        Ok(())
+    }
+
+    /// Read a referenced chunk's bytes straight from its source file,
+    /// verifying them against `h` on the way out (a moved/edited source file
+    /// is caught here, same as on-disk corruption).
+    fn get_reference(&self, h: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some((path, offset, length)) = self.refs.read().unwrap().get(h).cloned() else {
+            return Ok(None);
+        };
+        let mut file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0u8; length as usize];
+        file.read_exact(&mut bytes)?;
+        if Hash::of(&bytes) != *h {
+            return Err(StoreError::Corrupt(*h));
+        }
+        Ok(Some(bytes))
     }
 
     /// Store `bytes`, returning their hash. Returns `(hash, newly_written)` so
@@ -87,6 +142,7 @@ impl Store {
     }
 
     /// Fetch content by hash, verifying it still matches on the way out.
+    /// Checks copied-in objects first, then the `--no-copy` reference index.
     pub fn get(&self, h: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
         let path = self.path_for(h);
         match fs::read(&path) {
@@ -96,7 +152,7 @@ impl Store {
                 }
                 Ok(Some(bytes))
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => self.get_reference(h),
             Err(e) => Err(e.into()),
         }
     }
@@ -195,14 +251,42 @@ impl Store {
     /// storing each chunk. Returns the file's chunk refs (offsets relative to the
     /// file start) and its size.
     pub fn ingest_file_streaming(&self, path: &Path) -> Result<(Vec<ChunkRef>, u64), StoreError> {
+        self.ingest_file_streaming_impl(path, false)
+    }
+
+    /// Like [`Store::ingest_file_streaming`], but instead of copying each
+    /// chunk's bytes into `objects/`, records where they live in `path` and
+    /// reads them from there on demand. Halves disk usage for a file you're
+    /// only seeding (not receiving), at the cost of `path` needing to stay
+    /// put and unchanged — see [`Store::get`]'s reference fallback.
+    pub fn ingest_file_streaming_no_copy(&self, path: &Path) -> Result<(Vec<ChunkRef>, u64), StoreError> {
+        self.ingest_file_streaming_impl(path, true)
+    }
+
+    fn ingest_file_streaming_impl(
+        &self,
+        path: &Path,
+        no_copy: bool,
+    ) -> Result<(Vec<ChunkRef>, u64), StoreError> {
+        // Resolved once up front: the reference must still be valid from a
+        // different working directory in a later `serve` process.
+        let source = if no_copy { Some(fs::canonicalize(path)?) } else { None };
         let reader = BufReader::new(File::open(path)?);
         let mut refs = Vec::new();
         let mut offset = 0u64;
         for chunk in StreamCDC::new(reader, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
             let chunk = chunk.map_err(|e| io::Error::other(e.to_string()))?;
-            let (hash, _) = self.put(&chunk.data)?;
-            refs.push(ChunkRef { hash, offset, length: chunk.data.len() as u32 });
-            offset += chunk.data.len() as u64;
+            let length = chunk.data.len() as u32;
+            let hash = match &source {
+                Some(src) => {
+                    let hash = Hash::of(&chunk.data);
+                    self.add_reference(hash, src, offset, length)?;
+                    hash
+                }
+                None => self.put(&chunk.data)?.0,
+            };
+            refs.push(ChunkRef { hash, offset, length });
+            offset += length as u64;
         }
         Ok((refs, offset))
     }
@@ -214,11 +298,30 @@ impl Store {
         files: &[(String, PathBuf)],
         name: Option<String>,
     ) -> Result<Manifest, StoreError> {
+        self.ingest_tree_files_impl(files, name, false)
+    }
+
+    /// Like [`Store::ingest_tree_files`], but every file is referenced
+    /// in place instead of copied — see [`Store::ingest_file_streaming_no_copy`].
+    pub fn ingest_tree_files_no_copy(
+        &self,
+        files: &[(String, PathBuf)],
+        name: Option<String>,
+    ) -> Result<Manifest, StoreError> {
+        self.ingest_tree_files_impl(files, name, true)
+    }
+
+    fn ingest_tree_files_impl(
+        &self,
+        files: &[(String, PathBuf)],
+        name: Option<String>,
+        no_copy: bool,
+    ) -> Result<Manifest, StoreError> {
         let mut chunks: Vec<ChunkRef> = Vec::new();
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut global: u64 = 0;
         for (rel, disk) in files {
-            let (refs, size) = self.ingest_file_streaming(disk)?;
+            let (refs, size) = self.ingest_file_streaming_impl(disk, no_copy)?;
             let chunk_start = chunks.len();
             for r in &refs {
                 chunks.push(ChunkRef { hash: r.hash, offset: global + r.offset, length: r.length });
@@ -278,6 +381,34 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Load `refs.tsv` (`<hash-hex>\t<offset>\t<length>\t<path>` per line), if it
+/// exists. A truncated last line (e.g. process killed mid-append) is skipped
+/// rather than failing the whole store open — every other line still lists
+/// a valid, independently-verified-on-read reference.
+fn load_refs(path: &Path) -> Result<HashMap<Hash, RefLoc>, StoreError> {
+    let mut refs = HashMap::new();
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(refs),
+        Err(e) => return Err(e.into()),
+    };
+    for line in text.lines() {
+        let mut fields = line.splitn(4, '\t');
+        let (Some(hash), Some(offset), Some(length), Some(path)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(hash), Ok(offset), Ok(length)) =
+            (Hash::from_hex(hash), offset.parse::<u64>(), length.parse::<u32>())
+        else {
+            continue;
+        };
+        refs.insert(hash, (PathBuf::from(path), offset, length));
+    }
+    Ok(refs)
 }
 
 #[cfg(test)]
@@ -444,6 +575,70 @@ mod tests {
         // Critical: both chunking paths must produce the same content id.
         assert_eq!(in_mem.root, streamed.root);
         assert_eq!(in_mem.chunks.len(), streamed.chunks.len());
+    }
+
+    #[test]
+    fn no_copy_pack_does_not_duplicate_bytes_on_disk() {
+        let data = sample(2_000_000, 11);
+        let fdir = TmpDir::new();
+        let fpath = fdir.path().join("f.bin");
+        std::fs::write(&fpath, &data).unwrap();
+
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+        let m = store
+            .ingest_tree_files_no_copy(&[("f.bin".to_string(), fpath)], Some("f.bin".into()))
+            .unwrap();
+
+        // No chunk bytes were copied into objects/ ...
+        assert_eq!(store.object_count().unwrap(), 0);
+        // ...yet it still round-trips, reading straight from the source file.
+        assert_eq!(store.export(&m).unwrap(), data);
+
+        // Same bytes, same content id as a normal copying pack (determinism
+        // doesn't depend on --no-copy).
+        let copy_dir = TmpDir::new();
+        let copied = Store::open(copy_dir.path()).unwrap().ingest(&data, None).unwrap();
+        assert_eq!(copied.root, m.root);
+    }
+
+    #[test]
+    fn no_copy_pack_survives_a_reopened_store() {
+        let data = sample(500_000, 12);
+        let fdir = TmpDir::new();
+        let fpath = fdir.path().join("f.bin");
+        std::fs::write(&fpath, &data).unwrap();
+
+        let dir = TmpDir::new();
+        let m = Store::open(dir.path())
+            .unwrap()
+            .ingest_tree_files_no_copy(&[("f.bin".to_string(), fpath)], None)
+            .unwrap();
+
+        // A brand new `Store` handle (as `serve` would open in a later
+        // process) must still resolve the reference from refs.tsv.
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.export(&m).unwrap(), data);
+    }
+
+    #[test]
+    fn no_copy_pack_detects_a_changed_source_file() {
+        let data = sample(500_000, 13);
+        let fdir = TmpDir::new();
+        let fpath = fdir.path().join("f.bin");
+        std::fs::write(&fpath, &data).unwrap();
+
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+        let m = store
+            .ingest_tree_files_no_copy(&[("f.bin".to_string(), fpath.clone())], None)
+            .unwrap();
+
+        // The referenced file changes after packing (e.g. the user moved a
+        // different file to the same path) — export must fail, not silently
+        // hand back the wrong bytes.
+        std::fs::write(&fpath, sample(500_000, 99)).unwrap();
+        assert!(store.export(&m).is_err());
     }
 
     #[test]

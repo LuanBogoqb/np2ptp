@@ -1,7 +1,7 @@
 //! `np2ptp` CLI — drive the linker and client from the command line.
 //!
 //! ```text
-//! np2ptp pack <input> [--out <file.nptp>] [--store <dir>] [--name <name>]
+//! np2ptp pack <input> [--out <file.nptp>] [--store <dir>] [--name <name>] [--no-copy]
 //! np2ptp info <file.nptp>
 //! np2ptp get  <file.nptp> --source <store-dir> [--store <dir>] [--out <output>]
 //! ```
@@ -93,6 +93,11 @@ fn cmd_pack(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE);
     let store = Store::open(store_dir)?;
+    // Default is to copy chunks into the store (safe if `input` moves/changes
+    // afterward). --no-copy references `input` in place instead, so seeding it
+    // doesn't cost a second copy of the file on disk — but `input` must stay
+    // where it is, unchanged, for as long as you serve it.
+    let no_copy = flags.contains_key("no-copy");
 
     let name = flags.get("name").cloned().or_else(|| {
         Path::new(input).file_name().map(|s| s.to_string_lossy().into_owned())
@@ -105,13 +110,22 @@ fn cmd_pack(args: &[String]) -> Result<(), Box<dyn Error>> {
         if files.is_empty() {
             return Err(format!("pack: directory {input} contains no files").into());
         }
-        store.ingest_tree_files(&files, name)?
+        if no_copy {
+            store.ingest_tree_files_no_copy(&files, name)?
+        } else {
+            store.ingest_tree_files(&files, name)?
+        }
     } else {
         let file_name = name
             .clone()
             .or_else(|| Path::new(input).file_name().map(|s| s.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "data".to_string());
-        store.ingest_tree_files(&[(file_name, Path::new(input).to_path_buf())], name)?
+        let entry = [(file_name, Path::new(input).to_path_buf())];
+        if no_copy {
+            store.ingest_tree_files_no_copy(&entry, name)?
+        } else {
+            store.ingest_tree_files(&entry, name)?
+        }
     };
 
     let out = flags
@@ -126,6 +140,9 @@ fn cmd_pack(args: &[String]) -> Result<(), Box<dyn Error>> {
         manifest.files.len(),
         manifest.chunks.len()
     );
+    if no_copy {
+        println!("  (--no-copy: chunks reference {input} in place — keep it there and unchanged)");
+    }
     println!("  link:  {}", manifest.uri());
     Ok(())
 }
@@ -571,7 +588,7 @@ fn print_usage() {
     eprintln!(
         "np2ptp — New Peer-To-Peer Transfer Protocol (prototype)\n\n\
          USAGE:\n\
-         \x20 np2ptp pack  <input> [--out <file.nptp>] [--store <dir>] [--name <name>]\n\
+         \x20 np2ptp pack  <input> [--out <file.nptp>] [--store <dir>] [--name <name>] [--no-copy]\n\
          \x20 np2ptp info  <file.nptp>\n\
          \x20 np2ptp get   <file.nptp> --source <store-dir> [--store <dir>] [--out <output>]\n\
          \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay]\n\
@@ -579,6 +596,8 @@ fn print_usage() {
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\n\
          NOTES:\n\
          \x20 'pack' is the linker: chunks a file/folder into a store and writes a .nptp file.\n\
+         \x20 --no-copy references the input in place instead of copying its chunks into the\n\
+         \x20 store (no doubled disk usage) — keep the input at that path, unchanged, while seeding.\n\
          \x20 'get' rebuilds content from a local --source store (offline stand-in for a peer).\n\
          \x20 'serve' seeds over the network and announces to a tracker; 'fetch' without --peer\n\
          \x20 discovers providers via the tracker and downloads from them, verifying every chunk.\n\
