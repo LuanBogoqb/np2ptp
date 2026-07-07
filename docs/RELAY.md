@@ -25,8 +25,8 @@ sudo apt install -y build-essential pkg-config cmake clang git curl
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
 
-# 3. Build the binary
-git clone https://github.com/LuGB18/np2ptp.git
+# 3. Build the binary (or just grab a prebuilt one from Releases instead)
+git clone https://github.com/LuanBogoqb/np2ptp.git
 cd np2ptp
 cargo build --release -p np2ptp-node
 
@@ -69,7 +69,12 @@ journalctl -u np2ptp-relay -f      # watch logs
 ```
 
 ## Then, on the clients
-Client-side `--relay` wiring (make a reservation when seeding, dial circuit
-addresses when fetching) is the next step — see ../ROADMAP.md Phase 2. Once that's
-in, a CGNAT seed runs `serve --relay <addr>` and a CGNAT fetcher just runs
-`fetch <link>` and reaches it through the relay.
+
+This is done — `serve` finds this relay on its own. A CGNAT seed just runs
+`serve <file.nptp>` with no flags: it tries `--public`/UPnP/NAT-PMP first, and
+if none of those work, it dials the relay (`DEFAULT_RELAY`, or `--relay <addr>`
+to point at a different one) and reserves a circuit automatically. A fetcher just
+runs `fetch <link>` — no `--relay` needed on that side, it dials whatever address
+the tracker/DHT hands back, circuit or not. See the README's
+[NAT traversal status](../README.md#nat-traversal-status) for how this was
+validated against a real CGNAT host.

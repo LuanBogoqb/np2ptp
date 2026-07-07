@@ -13,6 +13,9 @@ Prebuilt binaries (Linux + Windows) are attached to every
 [release](https://github.com/LuanBogoqb/np2ptp/releases/latest) — no Rust toolchain
 needed. Or build it yourself, see [Build & test](#build--test) below.
 
+New here? [`docs/USAGE.md`](docs/USAGE.md) is a short, no-internals guide: pack a
+file/folder, share it, download one.
+
 ## Pain points being targeted (in priority order)
 
 1. **NAT / connectivity** — too many peers can't accept inbound connections.
