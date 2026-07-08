@@ -102,9 +102,17 @@ np2ptp fetch np2ptp:e0cf... --out ./restored --json
 ```
 
 ```jsonc
-{"event":"progress","op":"fetch","chunks_done":1230,"chunks_total":36491,"bytes_done":78643200,"bytes_total":2400000000}
+{"event":"progress","op":"fetch","phase":"downloading","chunks_done":1230,"chunks_total":36491}
+{"event":"progress","op":"fetch","phase":"downloading","chunks_done":36491,"chunks_total":36491}
+{"event":"progress","op":"fetch","phase":"writing","chunks_done":20000,"chunks_total":36491}
 {"event":"result","op":"fetch","root":"np2ptp:e0cf...","path":"./restored","bytes_total":2400000000,"chunks_fetched":36491,"chunks_deduped":0}
 ```
+
+`get` and `fetch` report two distinct progress phases: `"downloading"` (or, for
+`get`, pulling from the local source store) and `"writing"` — rebuilding the
+destination file from the store re-reads and re-verifies every chunk, which
+can take a while on its own for large content and would otherwise look
+indistinguishable from a hung process.
 
 `serve --json` prints a periodic status line (roughly every 2 seconds) instead
 of the interactive "serving …" banner, so a long-running process can be
