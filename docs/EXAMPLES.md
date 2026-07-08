@@ -75,6 +75,30 @@ the content, which is what lets it survive seeder churn.
 back to a public relay — see [Relay Setup](RELAY.md) for how that works and how
 to run your own.
 
+## CLI: Converting a Torrent
+
+Already have a torrent's data on disk (from a real BitTorrent client)? Bridge
+it into NP2PTP instead of re-downloading it as a fresh NP2PTP transfer:
+
+```sh
+np2ptp torrent my-linux-iso.torrent --data ~/Downloads/my-linux-iso --store seedstore
+```
+
+`--data` must point at the directory that directly contains the torrent's
+file tree — the same relationship `pack` already has to a directory input
+(for a multi-file torrent, that's usually the sub-folder a BitTorrent client
+saves it under, named after the torrent itself; for a single-file torrent,
+it's the folder containing that one file). The content is verified against
+the torrent's own piece hashes (streamed from disk — even a 50+ GB torrent is
+never loaded into memory) before being bridged: `resolve_or_convert_local`
+first checks whether another peer already bridged this exact torrent
+(matched by BitTorrent infohash) and, if so, downloads it from NP2PTP instead
+of re-verifying anything.
+
+Only a `.torrent` **file** is supported for now (not a magnet link) — pulling
+a torrent you don't already have, via a real BitTorrent swarm, is a separate,
+later feature.
+
 ## Non-Interactive Usage (`--json`)
 
 `pack`, `get`, `fetch`, and `serve` all accept a `--json` flag that switches their
