@@ -721,6 +721,80 @@ mod tests {
     }
 
     #[test]
+    fn pack_with_progress_accumulates_bytes_across_multiple_files() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+
+        let fdir = TmpDir::new();
+        let a_path = fdir.path().join("a.bin");
+        let b_path = fdir.path().join("b.bin");
+        let a_data = sample(200_000, 30);
+        let b_data = sample(150_000, 31);
+        std::fs::write(&a_path, &a_data).unwrap();
+        std::fs::write(&b_path, &b_data).unwrap();
+
+        let files = vec![
+            ("a.bin".to_string(), a_path),
+            ("b.bin".to_string(), b_path),
+        ];
+        let total_size = (a_data.len() + b_data.len()) as u64;
+
+        let mut calls: Vec<(u64, u64, bool)> = Vec::new();
+        store
+            .ingest_tree_files_with_progress(&files, None, |done, total, is_new| {
+                calls.push((done, total, is_new));
+            })
+            .unwrap();
+
+        assert!(!calls.is_empty());
+        // Every call reports the whole-tree total, not a per-file total.
+        assert!(calls.iter().all(|(_, total, _)| *total == total_size));
+        // done is monotonic and reaches the full cross-file total on the last call
+        // (proves the second file's progress continues from the first file's,
+        // rather than resetting to 0).
+        assert!(calls.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert_eq!(calls.last().unwrap().0, total_size);
+        // At least one call must report done > a_data.len(), proving progress
+        // continued into the second file rather than stopping at the first.
+        assert!(calls.iter().any(|(done, _, _)| *done > a_data.len() as u64));
+    }
+
+    #[test]
+    fn no_copy_pack_with_progress_reports_dedup_correctly() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+
+        let fdir = TmpDir::new();
+        let fpath = fdir.path().join("f.bin");
+        let data = sample(400_000, 32);
+        std::fs::write(&fpath, &data).unwrap();
+
+        let mut calls: Vec<(u64, u64, bool)> = Vec::new();
+        store
+            .ingest_tree_files_no_copy_with_progress(
+                &[("f.bin".to_string(), fpath.clone())],
+                None,
+                |done, total, is_new| calls.push((done, total, is_new)),
+            )
+            .unwrap();
+        assert!(!calls.is_empty());
+        assert!(calls.iter().all(|(_, _, is_new)| *is_new), "first no-copy pack: every chunk is new");
+
+        // Re-pack the identical file (same store, same path) — every chunk must
+        // now report as a dedup hit (chunk_was_new = false), proving the no-copy
+        // path's `is_new = !self.has(&hash)` check works, not just the copy path's.
+        let mut calls2: Vec<(u64, u64, bool)> = Vec::new();
+        store
+            .ingest_tree_files_no_copy_with_progress(
+                &[("f.bin".to_string(), fpath)],
+                None,
+                |done, total, is_new| calls2.push((done, total, is_new)),
+            )
+            .unwrap();
+        assert!(calls2.iter().all(|(_, _, is_new)| !is_new), "re-pack via no-copy: every chunk is a dedup hit");
+    }
+
+    #[test]
     fn streaming_export_round_trips_a_tree() {
         let dir = TmpDir::new();
         let store = Store::open(dir.path()).unwrap();
