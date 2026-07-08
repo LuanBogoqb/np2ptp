@@ -236,14 +236,32 @@ fn cmd_get(args: &[String]) -> Result<(), Box<dyn Error>> {
                 last_emit = now;
                 println!(
                     "{}",
-                    serde_json::json!({"event":"progress","op":"get","chunks_done":done,"chunks_total":total})
+                    serde_json::json!({"event":"progress","op":"get","phase":"downloading","chunks_done":done,"chunks_total":total})
                 );
             }
         }
     };
 
     let report = download_with_progress(&manifest, &source, &local, &mut on_progress)?;
-    let dest = write_output(&local, &manifest, flags.get("out").cloned())?;
+
+    // Rebuilding the output file re-reads and re-verifies every chunk, which
+    // can take a while on its own for large content — report it separately
+    // from download progress so --json never goes silent long enough to look
+    // hung.
+    let mut write_last_emit = std::time::Instant::now();
+    let mut on_write_progress = |done: usize, total: usize| {
+        if json {
+            let now = std::time::Instant::now();
+            if done == total || now.duration_since(write_last_emit) >= Duration::from_millis(100) {
+                write_last_emit = now;
+                println!(
+                    "{}",
+                    serde_json::json!({"event":"progress","op":"get","phase":"writing","chunks_done":done,"chunks_total":total})
+                );
+            }
+        }
+    };
+    let dest = write_output_with_progress(&local, &manifest, flags.get("out").cloned(), &mut on_write_progress)?;
 
     if json {
         println!(
@@ -360,14 +378,25 @@ fn looks_like_tree(manifest: &Manifest) -> bool {
 /// Write reconstructed content from `store` to disk, streaming (no whole-file
 /// RAM). A tree goes under a directory; a single file to a file path. Returns a
 /// human-readable destination description.
-fn write_output(store: &Store, manifest: &Manifest, out_flag: Option<String>) -> Result<String, Box<dyn Error>> {
+/// Reconstructs `manifest`'s content from `store` at the requested output
+/// path, calling `on_progress(chunks_done, chunks_total)` as it goes — this
+/// reconstruction phase re-reads and re-verifies every chunk and can take a
+/// while on its own for large content. Both CLI callers always pass a real
+/// callback (a no-op one in non-`--json` mode), so there is no plain
+/// no-progress variant to keep in sync.
+fn write_output_with_progress(
+    store: &Store,
+    manifest: &Manifest,
+    out_flag: Option<String>,
+    on_progress: impl FnMut(usize, usize),
+) -> Result<String, Box<dyn Error>> {
     if looks_like_tree(manifest) {
         let out_dir = out_flag.or_else(|| manifest.name.clone()).unwrap_or_else(|| "download".to_string());
-        store.export_tree_to_dir(manifest, Path::new(&out_dir))?;
+        store.export_tree_to_dir_with_progress(manifest, Path::new(&out_dir), on_progress)?;
         Ok(format!("{out_dir}/ ({} files)", manifest.files.len()))
     } else {
         let out = out_flag.or_else(|| manifest.name.clone()).unwrap_or_else(|| "download.out".to_string());
-        store.export_to(manifest, fs::File::create(&out)?)?;
+        store.export_to_with_progress(manifest, fs::File::create(&out)?, on_progress)?;
         Ok(out)
     }
 }
@@ -680,7 +709,7 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
                     last_emit = now;
                     println!(
                         "{}",
-                        serde_json::json!({"event":"progress","op":"fetch","chunks_done":done,"chunks_total":total})
+                        serde_json::json!({"event":"progress","op":"fetch","phase":"downloading","chunks_done":done,"chunks_total":total})
                     );
                 }
             }
@@ -714,7 +743,24 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
         let manifest =
             manifest.ok_or_else(|| format!("download failed: {}", last_err.unwrap_or_default()))?;
 
-        let dest = write_output(&into, &manifest, out_flag)?;
+        // Rebuilding the output file re-reads and re-verifies every chunk,
+        // which can take a while on its own for large content — report it
+        // separately from download progress so --json never goes silent long
+        // enough to look hung.
+        let mut write_last_emit = std::time::Instant::now();
+        let mut on_write_progress = |done: usize, total: usize| {
+            if json {
+                let now = std::time::Instant::now();
+                if done == total || now.duration_since(write_last_emit) >= Duration::from_millis(100) {
+                    write_last_emit = now;
+                    println!(
+                        "{}",
+                        serde_json::json!({"event":"progress","op":"fetch","phase":"writing","chunks_done":done,"chunks_total":total})
+                    );
+                }
+            }
+        };
+        let dest = write_output_with_progress(&into, &manifest, out_flag, &mut on_write_progress)?;
         if json {
             let deduped = first_done.unwrap_or(0);
             let fetched = last_total.saturating_sub(deduped);
