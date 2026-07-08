@@ -81,6 +81,10 @@
         <h3>Reachability</h3>
         <p>Built on libp2p/QUIC with DHT discovery. Behind CGNAT or a closed router? NP2PTP tries UPnP, then NAT-PMP, then falls back to a public relay automatically.</p>
       </div>
+      <div class="how-item">
+        <h3>Torrent bridge</h3>
+        <p>Already have a torrent's data on disk? <code>np2ptp torrent</code> converts it in place — piece hashes verified streaming from disk, so even a 50&nbsp;GB torrent never touches RAM. Once bridged, it's discoverable to any NP2PTP peer, permanently — not just whoever had the original torrent.</p>
+      </div>
     </div>
   </section>
 
