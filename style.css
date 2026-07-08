@@ -115,7 +115,7 @@ section h2 { text-align: center; margin-bottom: 12px; }
 .code-block code { color: var(--accent); font-size: 0.9rem; }
 .link-more { display: block; text-align: center; margin-top: 24px; font-weight: 600; text-decoration: none; }
 
-.stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; margin-top: 16px; text-align: center; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 24px; margin-top: 16px; text-align: center; }
 .stat-value { font-family: var(--font-serif); font-size: 1.6rem; font-weight: 700; color: var(--accent); }
 .stat-label { font-size: 0.85rem; margin-top: 6px; }
 
