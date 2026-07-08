@@ -173,3 +173,100 @@ fn download_with_progress_reports_every_chunk_once() {
     assert_eq!(report.fetched, total);
     assert_eq!(report.deduped, 0);
 }
+
+#[test]
+fn pack_json_emits_valid_ndjson_and_a_final_result_event() {
+    let dir = TmpDir::new();
+    let input = dir.path().join("f.bin");
+    std::fs::write(&input, sample(300_000, 50)).unwrap();
+    let store_dir = dir.path().join("store");
+    let out = dir.path().join("f.nptp");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
+        .arg("pack")
+        .arg(&input)
+        .arg("--store")
+        .arg(&store_dir)
+        .arg("--out")
+        .arg(&out)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert!(!lines.is_empty(), "expected at least one NDJSON line");
+
+    let mut saw_result = false;
+    for line in &lines {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("line not valid JSON: {line:?}: {e}"));
+        assert_eq!(v["op"], "pack");
+        if v["event"] == "result" {
+            saw_result = true;
+            assert!(v["root"].as_str().unwrap().starts_with("np2ptp:"));
+            assert_eq!(v["bytes_total"], 300_000);
+        }
+    }
+    assert!(saw_result, "expected a final result event, got: {stdout}");
+}
+
+#[test]
+fn get_json_emits_valid_ndjson_and_a_final_result_event() {
+    let dir = TmpDir::new();
+    let input = dir.path().join("f.bin");
+    std::fs::write(&input, sample(300_000, 51)).unwrap();
+    let store_dir = dir.path().join("store");
+    let out = dir.path().join("f.nptp");
+
+    let pack_output = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
+        .arg("pack")
+        .arg(&input)
+        .arg("--store")
+        .arg(&store_dir)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(pack_output.status.success());
+
+    let client_store = dir.path().join("client-store");
+    let restored = dir.path().join("restored");
+    let get_output = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
+        .arg("get")
+        .arg(&out)
+        .arg("--source")
+        .arg(&store_dir)
+        .arg("--store")
+        .arg(&client_store)
+        .arg("--out")
+        .arg(&restored)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        get_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&get_output.stderr)
+    );
+
+    let stdout = String::from_utf8(get_output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert!(!lines.is_empty());
+    let mut saw_result = false;
+    for line in &lines {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("line not valid JSON: {line:?}: {e}"));
+        assert_eq!(v["op"], "get");
+        if v["event"] == "result" {
+            saw_result = true;
+            assert_eq!(v["chunks_deduped"], 0);
+        }
+    }
+    assert!(saw_result, "expected a final result event, got: {stdout}");
+}
