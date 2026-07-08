@@ -52,6 +52,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("serve") => cmd_serve(&args[1..]),
         Some("fetch") => cmd_fetch(&args[1..]),
         Some("relay") => cmd_relay(&args[1..]),
+        Some("torrent") => cmd_torrent(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(())
@@ -782,6 +783,71 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
     })
 }
 
+/// Convert an already-downloaded `.torrent`'s content into NP2PTP. Only
+/// reads local files (`--data <dir>`, which must contain the torrent's
+/// file tree directly, e.g. what a BitTorrent client's save-path already
+/// looks like for that torrent) — downloading a torrent you don't have yet
+/// is a separate, later feature.
+fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let (pos, flags) = parse(args, &["--data", "--store", "--relay"]);
+    let torrent_file = *pos.first().ok_or("torrent: missing <file.torrent>")?;
+    let data_dir = flags.get("data").cloned().ok_or("torrent: missing --data <dir>")?;
+    let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
+    let no_copy = flags.contains_key("no-copy");
+    let no_relay = flags.contains_key("no-relay");
+    let relay_override = flags.get("relay").cloned();
+    let json = flags.contains_key("json");
+
+    let torrent_bytes = fs::read(torrent_file)?;
+    let meta = np2ptp_bridge::parse_torrent_file(&torrent_bytes)?;
+    // Store::open creates store_dir if it doesn't exist yet — must happen
+    // before load_or_create_seed writes identity.key under it.
+    let store = Store::open(&store_dir)?;
+    let identity_seed = load_or_create_seed(&format!("{store_dir}/identity.key"))?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let net = Network::spawn(store, Some(identity_seed))?;
+        net.listen("/ip4/0.0.0.0/udp/0/quic-v1".parse()?).await?;
+
+        if !no_relay {
+            let relay_addr: Multiaddr = relay_override.unwrap_or_else(|| DEFAULT_RELAY.to_string()).parse()?;
+            if !json {
+                println!("relay: dialing {relay_addr} ...");
+            }
+            net.dial(relay_addr).await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let store = Store::open(&store_dir)?;
+        let outcome =
+            np2ptp_bridge::resolve_or_convert_local(&net, &store, &meta, Path::new(&data_dir), no_copy).await?;
+
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event":"result","op":"torrent",
+                    "root": outcome.manifest.uri(),
+                    "converted": outcome.converted,
+                    "files_total": outcome.manifest.files.len(),
+                    "chunks_total": outcome.manifest.chunks.len(),
+                    "bytes_total": outcome.manifest.total_size,
+                })
+            );
+        } else {
+            println!(
+                "{} ({} files, {} chunks) - {}",
+                outcome.manifest.uri(),
+                outcome.manifest.files.len(),
+                outcome.manifest.chunks.len(),
+                if outcome.converted { "converted from BitTorrent" } else { "already bridged, served from NP2PTP" }
+            );
+        }
+        Ok::<(), Box<dyn Error>>(())
+    })
+}
+
 fn print_usage() {
     eprintln!(
         "np2ptp — New Peer-To-Peer Transfer Protocol (prototype)\n\n\
@@ -791,7 +857,8 @@ fn print_usage() {
          \x20 np2ptp get   <file.nptp> --source <store-dir> [--store <dir>] [--out <output>]\n\
          \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay]\n\
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
-         \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\n\
+         \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\
+         \x20 np2ptp torrent <file.torrent> --data <dir> [--store <dir>] [--no-copy] [--json]\n\n\
          NOTES:\n\
          \x20 'pack' is the linker: chunks a file/folder into a store and writes a .nptp file.\n\
          \x20 --no-copy references the input in place instead of copying its chunks into the\n\

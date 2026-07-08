@@ -139,15 +139,14 @@ the wire, reputation choke, research harness, and **streaming** for large conten
 Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
 
 1. **Finish the bridge** (`np2ptp-bridge`):
-   - **`LocalTorrentSource`** — parse a `.torrent` (bencode → infohash, file list,
-     piece hashes) and read already-downloaded files from disk. **Must stream**
-     (the user's real torrent is 51 GB). Bencode parser must extract the raw `info`
-     dict bytes to SHA-1 the infohash.
+   - ✅ **Local conversion** — `parse_torrent_file` (bencode → infohash, file list,
+     piece hashes) + `resolve_or_convert_local`/`convert_local`, streaming both
+     piece verification and ingestion from disk (never the whole torrent in RAM).
+     `np2ptp torrent <file.torrent> --data <dir>` CLI command.
    - **`LibrqbitSource`** — download torrents you *don't* have (behind the
-     `librqbit` feature, already in `Cargo.toml`). `.torrent` + magnet.
-   - **`np2ptp torrent <file|magnet>`** CLI: run `resolve_or_convert` (lookup on the
-     DHT → fast path; else convert → verify against piece hashes → publish mapping +
-     provide). Stream verification (don't concat 51 GB in RAM).
+     `librqbit` feature, already in `Cargo.toml`). `.torrent` + magnet. Not yet
+     started — a real BitTorrent swarm is harder to test deterministically, so
+     the fully-offline local-conversion half shipped first.
 2. **Automatic discovery** (so `fetch <link>` needs no `--peer`):
    - ✅ **HTTP tracker on Vercel** — LIVE at `https://np2ptp.vercel.app`
      (`tracker/`, Upstash KV). `serve` announces; `fetch <link>` with no `--peer`

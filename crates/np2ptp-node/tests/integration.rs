@@ -343,3 +343,90 @@ fn serve_json_emits_only_valid_ndjson() {
         "expected at least one status event, got: {captured}"
     );
 }
+
+#[test]
+fn torrent_json_converts_local_data_and_emits_a_final_result_event() {
+    // Minimal hand-encoded single-file .torrent: a bencode dict with an
+    // "info" dict (name/piece length/pieces/length). No announce needed —
+    // parse_torrent_file only reads the "info" key.
+    fn bencode_str(s: &str) -> Vec<u8> {
+        let mut out = format!("{}:", s.len()).into_bytes();
+        out.extend_from_slice(s.as_bytes());
+        out
+    }
+    fn bencode_int(n: i64) -> Vec<u8> {
+        format!("i{n}e").into_bytes()
+    }
+    fn bencode_bytes_field(key: &str, raw: &[u8]) -> Vec<u8> {
+        let mut out = bencode_str(key);
+        out.extend(format!("{}:", raw.len()).into_bytes());
+        out.extend_from_slice(raw);
+        out
+    }
+
+    let dir = TmpDir::new();
+    let data = sample(300_000, 70);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join("movie.bin"), &data).unwrap();
+
+    let piece_length: usize = 65_536;
+    let piece_hashes: Vec<u8> = data
+        .chunks(piece_length)
+        .flat_map(|c| {
+            use sha1::{Digest, Sha1};
+            let h: [u8; 20] = Sha1::digest(c).into();
+            h
+        })
+        .collect();
+
+    let mut info = Vec::new();
+    info.push(b'd');
+    info.extend(bencode_str("length"));
+    info.extend(bencode_int(data.len() as i64));
+    info.extend(bencode_str("name"));
+    info.extend(bencode_str("movie.bin"));
+    info.extend(bencode_str("piece length"));
+    info.extend(bencode_int(piece_length as i64));
+    info.extend(bencode_bytes_field("pieces", &piece_hashes));
+    info.push(b'e');
+
+    let mut top = Vec::new();
+    top.push(b'd');
+    top.extend(bencode_str("info"));
+    top.extend(info);
+    top.push(b'e');
+
+    let torrent_path = dir.path().join("movie.torrent");
+    std::fs::write(&torrent_path, &top).unwrap();
+
+    let store_dir = dir.path().join("store");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
+        .arg("torrent")
+        .arg(&torrent_path)
+        .arg("--data")
+        .arg(&data_dir)
+        .arg("--store")
+        .arg(&store_dir)
+        .arg("--no-relay")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert!(!lines.is_empty(), "expected at least one NDJSON line, got: {stdout}");
+
+    let last: serde_json::Value = serde_json::from_str(lines.last().unwrap())
+        .unwrap_or_else(|e| panic!("last line not valid JSON: {:?}: {e}", lines.last()));
+    assert_eq!(last["event"], "result");
+    assert_eq!(last["op"], "torrent");
+    assert!(last["root"].as_str().unwrap().starts_with("np2ptp:"));
+    assert_eq!(last["converted"], true);
+    assert_eq!(last["bytes_total"], 300_000);
+}

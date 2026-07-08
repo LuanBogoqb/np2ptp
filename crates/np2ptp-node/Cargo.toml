@@ -17,6 +17,7 @@ path = "src/main.rs"
 np2ptp-core = { path = "../np2ptp-core" }
 np2ptp-store = { path = "../np2ptp-store" }
 np2ptp-net = { path = "../np2ptp-net" }
+np2ptp-bridge = { path = "../np2ptp-bridge" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 thiserror.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -25,3 +26,6 @@ serde_json = "1"
 crab_nat = "0.7"
 netdev = "0.31"
 getrandom = "0.2"
+
+[dev-dependencies]
+sha1 = "0.10"
