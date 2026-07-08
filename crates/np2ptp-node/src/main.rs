@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use np2ptp_core::{Hash, Manifest};
 use np2ptp_net::{peer_id_from_multiaddr, Multiaddr, Network, PeerId};
-use np2ptp_node::{download, read_dir_paths, StoreSource};
+use np2ptp_node::{download_with_progress, read_dir_paths, StoreSource};
 use np2ptp_store::Store;
 
 mod portmap;
@@ -226,14 +226,42 @@ fn cmd_get(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE);
     let local = Store::open(store_dir)?;
+    let json = flags.contains_key("json");
 
-    let report = download(&manifest, &source, &local)?;
+    let mut last_emit = std::time::Instant::now();
+    let mut on_progress = |done: usize, total: usize| {
+        if json {
+            let now = std::time::Instant::now();
+            if done == total || now.duration_since(last_emit) >= Duration::from_millis(100) {
+                last_emit = now;
+                println!(
+                    "{}",
+                    serde_json::json!({"event":"progress","op":"get","chunks_done":done,"chunks_total":total})
+                );
+            }
+        }
+    };
+
+    let report = download_with_progress(&manifest, &source, &local, &mut on_progress)?;
     let dest = write_output(&local, &manifest, flags.get("out").cloned())?;
-    println!("downloaded {} ({} bytes) -> {dest}", manifest.uri(), manifest.total_size);
-    println!(
-        "  fetched {} chunks, {} already local (deduped)",
-        report.fetched, report.deduped
-    );
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event":"result","op":"get",
+                "path": dest,
+                "chunks_fetched": report.fetched,
+                "chunks_deduped": report.deduped,
+            })
+        );
+    } else {
+        println!("downloaded {} ({} bytes) -> {dest}", manifest.uri(), manifest.total_size);
+        println!(
+            "  fetched {} chunks, {} already local (deduped)",
+            report.fetched, report.deduped
+        );
+    }
     Ok(())
 }
 
