@@ -109,10 +109,29 @@ fn cmd_pack(args: &[String]) -> Result<(), Box<dyn Error>> {
     // doesn't cost a second copy of the file on disk — but `input` must stay
     // where it is, unchanged, for as long as you serve it.
     let no_copy = flags.contains_key("no-copy");
+    let json = flags.contains_key("json");
 
     let name = flags.get("name").cloned().or_else(|| {
         Path::new(input).file_name().map(|s| s.to_string_lossy().into_owned())
     });
+
+    let mut chunks_new = 0usize;
+    let mut last_emit = std::time::Instant::now();
+    let mut on_progress = |done: u64, total: u64, is_new: bool| {
+        if is_new {
+            chunks_new += 1;
+        }
+        if json {
+            let now = std::time::Instant::now();
+            if done == total || now.duration_since(last_emit) >= Duration::from_millis(100) {
+                last_emit = now;
+                println!(
+                    "{}",
+                    serde_json::json!({"event":"progress","op":"pack","bytes_done":done,"bytes_total":total})
+                );
+            }
+        }
+    };
 
     // A directory is packed as a tree of files; a single file as one blob. Both
     // stream from disk so packing huge content doesn't load it into memory.
@@ -122,9 +141,9 @@ fn cmd_pack(args: &[String]) -> Result<(), Box<dyn Error>> {
             return Err(format!("pack: directory {input} contains no files").into());
         }
         if no_copy {
-            store.ingest_tree_files_no_copy(&files, name)?
+            store.ingest_tree_files_no_copy_with_progress(&files, name, &mut on_progress)?
         } else {
-            store.ingest_tree_files(&files, name)?
+            store.ingest_tree_files_with_progress(&files, name, &mut on_progress)?
         }
     } else {
         let file_name = name
@@ -133,9 +152,9 @@ fn cmd_pack(args: &[String]) -> Result<(), Box<dyn Error>> {
             .unwrap_or_else(|| "data".to_string());
         let entry = [(file_name, Path::new(input).to_path_buf())];
         if no_copy {
-            store.ingest_tree_files_no_copy(&entry, name)?
+            store.ingest_tree_files_no_copy_with_progress(&entry, name, &mut on_progress)?
         } else {
-            store.ingest_tree_files(&entry, name)?
+            store.ingest_tree_files_with_progress(&entry, name, &mut on_progress)?
         }
     };
 
@@ -145,16 +164,29 @@ fn cmd_pack(args: &[String]) -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| format!("{input}.nptp"));
     fs::write(&out, manifest.to_nptp()?)?;
 
-    println!("packed {input} ({} bytes) -> {out}", manifest.total_size);
-    println!(
-        "  files: {}   chunks: {}   store: {store_dir}",
-        manifest.files.len(),
-        manifest.chunks.len()
-    );
-    if no_copy {
-        println!("  (--no-copy: chunks reference {input} in place — keep it there and unchanged)");
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event":"result","op":"pack",
+                "root": manifest.uri(),
+                "chunks_total": manifest.chunks.len(),
+                "chunks_new": chunks_new,
+                "bytes_total": manifest.total_size,
+            })
+        );
+    } else {
+        println!("packed {input} ({} bytes) -> {out}", manifest.total_size);
+        println!(
+            "  files: {}   chunks: {}   store: {store_dir}",
+            manifest.files.len(),
+            manifest.chunks.len()
+        );
+        if no_copy {
+            println!("  (--no-copy: chunks reference {input} in place — keep it there and unchanged)");
+        }
+        println!("  link:  {}", manifest.uri());
     }
-    println!("  link:  {}", manifest.uri());
     Ok(())
 }
 
