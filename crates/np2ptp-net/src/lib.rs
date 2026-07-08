@@ -15,6 +15,8 @@
 //! against the Merkle root before storing it — the same integrity guarantee the
 //! local client has, now over the wire.
 
+mod receipts;
+
 use std::collections::HashMap;
 use std::time::Duration;
 

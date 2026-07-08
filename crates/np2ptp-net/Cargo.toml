@@ -10,6 +10,8 @@ np2ptp-core = { path = "../np2ptp-core" }
 np2ptp-store = { path = "../np2ptp-store" }
 np2ptp-rep = { path = "../np2ptp-rep" }
 np2ptp-fec = { path = "../np2ptp-fec" }
+bincode = { workspace = true }
+getrandom = "0.2"
 libp2p = { version = "0.55", features = [
     "tokio",
     "quic",
@@ -24,6 +26,7 @@ libp2p = { version = "0.55", features = [
     "upnp",
     "noise",
     "yamux",
+    "serde",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"
