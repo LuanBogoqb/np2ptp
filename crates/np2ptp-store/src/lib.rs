@@ -251,7 +251,7 @@ impl Store {
     /// storing each chunk. Returns the file's chunk refs (offsets relative to the
     /// file start) and its size.
     pub fn ingest_file_streaming(&self, path: &Path) -> Result<(Vec<ChunkRef>, u64), StoreError> {
-        self.ingest_file_streaming_impl(path, false)
+        self.ingest_file_streaming_impl(path, false, |_, _, _| {})
     }
 
     /// Like [`Store::ingest_file_streaming`], but instead of copying each
@@ -260,33 +260,37 @@ impl Store {
     /// only seeding (not receiving), at the cost of `path` needing to stay
     /// put and unchanged — see [`Store::get`]'s reference fallback.
     pub fn ingest_file_streaming_no_copy(&self, path: &Path) -> Result<(Vec<ChunkRef>, u64), StoreError> {
-        self.ingest_file_streaming_impl(path, true)
+        self.ingest_file_streaming_impl(path, true, |_, _, _| {})
     }
 
     fn ingest_file_streaming_impl(
         &self,
         path: &Path,
         no_copy: bool,
+        mut on_progress: impl FnMut(u64, u64, bool),
     ) -> Result<(Vec<ChunkRef>, u64), StoreError> {
         // Resolved once up front: the reference must still be valid from a
         // different working directory in a later `serve` process.
         let source = if no_copy { Some(fs::canonicalize(path)?) } else { None };
+        let total = fs::metadata(path)?.len();
         let reader = BufReader::new(File::open(path)?);
         let mut refs = Vec::new();
         let mut offset = 0u64;
         for chunk in StreamCDC::new(reader, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
             let chunk = chunk.map_err(|e| io::Error::other(e.to_string()))?;
             let length = chunk.data.len() as u32;
-            let hash = match &source {
+            let (hash, is_new) = match &source {
                 Some(src) => {
                     let hash = Hash::of(&chunk.data);
+                    let is_new = !self.has(&hash);
                     self.add_reference(hash, src, offset, length)?;
-                    hash
+                    (hash, is_new)
                 }
-                None => self.put(&chunk.data)?.0,
+                None => self.put(&chunk.data)?,
             };
             refs.push(ChunkRef { hash, offset, length });
             offset += length as u64;
+            on_progress(offset, total, is_new);
         }
         Ok((refs, offset))
     }
@@ -298,7 +302,7 @@ impl Store {
         files: &[(String, PathBuf)],
         name: Option<String>,
     ) -> Result<Manifest, StoreError> {
-        self.ingest_tree_files_impl(files, name, false)
+        self.ingest_tree_files_impl(files, name, false, |_, _, _| {})
     }
 
     /// Like [`Store::ingest_tree_files`], but every file is referenced
@@ -308,7 +312,31 @@ impl Store {
         files: &[(String, PathBuf)],
         name: Option<String>,
     ) -> Result<Manifest, StoreError> {
-        self.ingest_tree_files_impl(files, name, true)
+        self.ingest_tree_files_impl(files, name, true, |_, _, _| {})
+    }
+
+    /// Like [`Store::ingest_tree_files`], but calls `on_progress(bytes_done,
+    /// bytes_total, chunk_was_new)` as each chunk is processed — `bytes_total`
+    /// is the sum of every file's size, known upfront; `chunk_was_new` is
+    /// false for a chunk that was already in the store (a dedup hit).
+    pub fn ingest_tree_files_with_progress(
+        &self,
+        files: &[(String, PathBuf)],
+        name: Option<String>,
+        on_progress: impl FnMut(u64, u64, bool),
+    ) -> Result<Manifest, StoreError> {
+        self.ingest_tree_files_impl(files, name, false, on_progress)
+    }
+
+    /// Like [`Store::ingest_tree_files_no_copy`], with the same progress
+    /// callback as [`Store::ingest_tree_files_with_progress`].
+    pub fn ingest_tree_files_no_copy_with_progress(
+        &self,
+        files: &[(String, PathBuf)],
+        name: Option<String>,
+        on_progress: impl FnMut(u64, u64, bool),
+    ) -> Result<Manifest, StoreError> {
+        self.ingest_tree_files_impl(files, name, true, on_progress)
     }
 
     fn ingest_tree_files_impl(
@@ -316,12 +344,20 @@ impl Store {
         files: &[(String, PathBuf)],
         name: Option<String>,
         no_copy: bool,
+        mut on_progress: impl FnMut(u64, u64, bool),
     ) -> Result<Manifest, StoreError> {
+        let total: u64 = files
+            .iter()
+            .map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum();
         let mut chunks: Vec<ChunkRef> = Vec::new();
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut global: u64 = 0;
         for (rel, disk) in files {
-            let (refs, size) = self.ingest_file_streaming_impl(disk, no_copy)?;
+            let base = global;
+            let (refs, size) = self.ingest_file_streaming_impl(disk, no_copy, |done, _file_total, is_new| {
+                on_progress(base + done, total, is_new);
+            })?;
             let chunk_start = chunks.len();
             for r in &refs {
                 chunks.push(ChunkRef { hash: r.hash, offset: global + r.offset, length: r.length });
@@ -639,6 +675,49 @@ mod tests {
         // hand back the wrong bytes.
         std::fs::write(&fpath, sample(500_000, 99)).unwrap();
         assert!(store.export(&m).is_err());
+    }
+
+    #[test]
+    fn pack_with_progress_reports_bytes_and_dedup_flag() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+
+        let fdir = TmpDir::new();
+        let fpath = fdir.path().join("f.bin");
+        let data = sample(500_000, 20);
+        std::fs::write(&fpath, &data).unwrap();
+
+        let mut calls: Vec<(u64, u64, bool)> = Vec::new();
+        let manifest = store
+            .ingest_tree_files_with_progress(
+                &[("f.bin".to_string(), fpath.clone())],
+                None,
+                |done, total, is_new| calls.push((done, total, is_new)),
+            )
+            .unwrap();
+
+        assert!(!calls.is_empty());
+        // Every call reports the same (correct) total; done is monotonic and
+        // reaches it on the last call.
+        let total = calls[0].1;
+        assert_eq!(total, data.len() as u64);
+        assert!(calls.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert_eq!(calls.last().unwrap().0, total);
+        // First pack of brand-new content: every chunk is new.
+        assert!(calls.iter().all(|(_, _, is_new)| *is_new));
+
+        // Re-packing the identical file into the SAME store must report every
+        // chunk as a dedup hit (not new).
+        let mut calls2: Vec<(u64, u64, bool)> = Vec::new();
+        store
+            .ingest_tree_files_with_progress(
+                &[("f.bin".to_string(), fpath)],
+                None,
+                |done, total, is_new| calls2.push((done, total, is_new)),
+            )
+            .unwrap();
+        assert!(calls2.iter().all(|(_, _, is_new)| !is_new));
+        assert_eq!(manifest.total_size, data.len() as u64);
     }
 
     #[test]
