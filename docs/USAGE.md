@@ -1,70 +1,81 @@
-# Como usar o NP2PTP
+# Basic Usage
 
-Guia rápido, só o essencial pra compartilhar e baixar arquivos. Pra entender como
-funciona por dentro, veja o [README](../README.md).
+A quick guide to sharing and downloading files with NP2PTP — the essentials
+only. For how it works internally, see the [README](../README.md). For more
+elaborate scenarios (real network transfer, non-interactive usage, the Rust
+API), see [Usage Examples](EXAMPLES.md).
 
-## 1. Pegue o binário
+## 1. Get the Binary
 
-[Releases](https://github.com/LuanBogoqb/np2ptp/releases/latest) — baixe
-`np2ptp-windows-x86_64.exe` (Windows) ou `np2ptp-linux-x86_64` (Linux). Não precisa
-instalar nada, é um binário só.
+Download a prebuilt binary from the
+[latest release](https://github.com/LuanBogoqb/np2ptp/releases/latest) —
+`np2ptp-windows-x86_64.exe` (Windows) or `np2ptp-linux-x86_64` (Linux). No
+installation required; it is a single executable. To build from source instead,
+see [Building from Source](BUILDING.md).
 
-## 2. Criar um `.nptp` (empacotar o que você quer compartilhar)
+## 2. Create a `.nptp` File (Link What You Want to Share)
 
-Funciona com **um arquivo único ou uma pasta inteira** (mantém a estrutura de
-subpastas):
-
-```sh
-np2ptp pack meuarquivo.zip --out meuarquivo.nptp
-
-# ou uma pasta inteira:
-np2ptp pack ./minha-pasta --out minha-pasta.nptp
-```
-
-O `.nptp` gerado é pequeno — só metadados (hashes), não o conteúdo. É esse arquivo
-que você manda pra quem vai baixar (e-mail, Discord, etc.); o conteúdo de verdade
-continua só na sua máquina, guardado numa pasta store (`.np2ptp-store` por padrão).
-
-## 3. Deixar disponível pra rede
-
-O `.nptp` sozinho não basta — alguém também precisa conseguir se conectar em você.
-Roda:
+Works with **a single file or an entire folder** (subfolder structure is
+preserved):
 
 ```sh
-np2ptp serve meuarquivo.nptp
+np2ptp pack myfile.zip --out myfile.nptp
+
+# or an entire folder:
+np2ptp pack ./my-folder --out my-folder.nptp
 ```
 
-e deixa essa janela aberta enquanto quiser compartilhar (igual "seedar" um torrent).
-Funciona mesmo atrás de CGNAT / sem porta aberta no roteador — o programa detecta
-isso sozinho e usa um relay público automaticamente, sem precisar configurar nada.
+The generated `.nptp` file is small — it only holds metadata (hashes), not the
+content itself. This is the file you send to whoever will download it (email,
+Discord, etc.); the actual content stays on your machine, in a store directory
+(`.np2ptp-store` by default).
 
-## 4. Baixar um `.nptp`
+## 3. Make It Available on the Network
+
+The `.nptp` file alone is not enough — someone also needs to be able to connect
+to you. Run:
 
 ```sh
-np2ptp fetch meuarquivo.nptp --out ./baixado
+np2ptp serve myfile.nptp
 ```
 
-Se você só tem o link (`np2ptp:abc123...`), sem o arquivo `.nptp` em mãos, funciona
-igual:
+and leave that running for as long as you want to share (like seeding a
+torrent). This works even behind CGNAT or without an open router port — the
+program detects that on its own and falls back to a public relay automatically,
+with no configuration needed.
+
+## 4. Download a `.nptp` File
 
 ```sh
-np2ptp fetch np2ptp:abc123... --out ./baixado
+np2ptp fetch myfile.nptp --out ./downloaded
 ```
 
-Ele acha sozinho quem está servindo aquele conteúdo, baixa peça por peça, e confere
-a integridade de cada uma antes de gravar — não tem como chegar corrompido ou
-adulterado sem ser detectado.
+If you only have the link (`np2ptp:abc123...`) rather than the `.nptp` file
+itself, this works the same way:
 
-## Pastas vs. arquivo único
+```sh
+np2ptp fetch np2ptp:abc123... --out ./downloaded
+```
 
-- Arquivo único → `--out` é o caminho do arquivo restaurado.
-- Pasta → `--out` é o diretório de destino; a estrutura de subpastas é recriada
-  dentro dele.
-- Arquivos repetidos dentro da pasta (ou entre pacotes diferentes) só são
-  transferidos uma vez — dedup automático.
+NP2PTP finds whoever is serving that content on its own, downloads it piece by
+piece, and verifies the integrity of every piece before writing it — corrupted
+or tampered content cannot arrive undetected.
 
-## Extras rápidos
+## Folders vs. a Single File
 
-- `np2ptp info meuarquivo.nptp` — lista o que tem dentro de um `.nptp` sem baixar nada.
-- `np2ptp fetch ... --fec` — baixa por códigos de correção de erro (RaptorQ) em vez
-  de pedaço-a-pedaço; útil se os seeders forem entrando e saindo.
+- Single file → `--out` is the path of the restored file.
+- Folder → `--out` is the destination directory; the subfolder structure is
+  recreated inside it.
+- Repeated files within a folder (or across different packages) are only
+  transferred once — deduplication is automatic.
+
+## Quick Extras
+
+- `np2ptp info myfile.nptp` — lists what a `.nptp` file contains, without
+  downloading anything.
+- `np2ptp fetch ... --fec` — downloads using erasure coding (RaptorQ) instead of
+  chunk by chunk; useful when seeders come and go.
+
+See [Usage Examples](EXAMPLES.md) for real network transfers between two
+machines, non-interactive (`--json`) usage for scripting or embedding NP2PTP in
+another application, and the Rust API.

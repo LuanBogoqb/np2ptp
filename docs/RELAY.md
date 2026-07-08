@@ -75,6 +75,34 @@ This is done — `serve` finds this relay on its own. A CGNAT seed just runs
 if none of those work, it dials the relay (`DEFAULT_RELAY`, or `--relay <addr>`
 to point at a different one) and reserves a circuit automatically. A fetcher just
 runs `fetch <link>` — no `--relay` needed on that side, it dials whatever address
-the tracker/DHT hands back, circuit or not. See the README's
-[NAT traversal status](../README.md#nat-traversal-status) for how this was
-validated against a real CGNAT host.
+the tracker/DHT hands back, circuit or not. See [Validation Status](#validation-status)
+below for how this was confirmed against a real CGNAT host.
+
+## Validation Status
+
+The relay (v2), DCUtR, and AutoNAT behaviours are wired in. On a single
+development machine, a behind-NAT node successfully reserves a slot on a relay
+and gets a dialable `/…/p2p-circuit/p2p/<peer>` address (covered by a passing
+test). A *full content download through the relay* is flaky on loopback — the
+relayed QUIC stream tears down and DCUtR has no real NAT to punch on
+`127.0.0.1` — so that specific test stays `#[ignore]`d.
+
+That path **has been validated by hand against a real NAT**: a Windows host
+behind CGNAT (a Mikrotik router, no UPnP, no port forward) served content that a
+separate machine downloaded end-to-end through this public relay, with the
+downloaded bytes verified identical to the source. `serve` automates the whole
+sequence:
+
+1. Try `--public` (manual override), then UPnP, then NAT-PMP/PCP.
+2. If none of those produce a reachable external address, dial the public relay
+   (`DEFAULT_RELAY`) on its own, reserve a circuit, and announce that circuit
+   address to the tracker/DHT — no flags needed. `--relay <multiaddr>` forces a
+   specific relay; `--no-relay` disables the fallback.
+3. `serve` also persists its identity per `--store` directory (`identity.key`)
+   instead of generating a new peer id on every restart, so a seeder that
+   restarts does not strand every existing reference to it.
+
+The relay's per-circuit limits (how much data and how long a single relayed
+connection may carry) are configured in `relay_config()` in
+`crates/np2ptp-net/src/lib.rs` — the `libp2p-relay` defaults are sized for
+signaling traffic, not file transfer, and are raised accordingly.
