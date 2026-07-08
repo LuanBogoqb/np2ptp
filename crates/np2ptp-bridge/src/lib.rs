@@ -32,6 +32,9 @@ use np2ptp_net::Network;
 use np2ptp_store::Store;
 use sha1::{Digest, Sha1};
 
+mod bencode;
+pub use bencode::parse_torrent_file;
+
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
     #[error(transparent)]
