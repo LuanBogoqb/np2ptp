@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use np2ptp_core::Hash;
-use np2ptp_node::{download, pack, read_dir_tree, write_tree, ChunkSource, NodeError, StoreSource};
+use np2ptp_node::{download, download_with_progress, pack, read_dir_tree, write_tree, ChunkSource, NodeError, StoreSource};
 use np2ptp_store::Store;
 
 struct TmpDir(std::path::PathBuf);
@@ -147,4 +147,29 @@ fn download_reports_missing_chunks() {
     let client = Store::open(client_dir.path()).unwrap();
     let result = download(&manifest, &source, &client);
     assert!(matches!(result, Err(NodeError::MissingChunk(_))));
+}
+
+#[test]
+fn download_with_progress_reports_every_chunk_once() {
+    let seed_dir = TmpDir::new();
+    let seed_store = Store::open(seed_dir.path()).unwrap();
+    let data = sample(300_000, 77);
+    let manifest = seed_store.ingest(&data, None).unwrap();
+
+    let client_dir = TmpDir::new();
+    let source = StoreSource::open(seed_dir.path()).unwrap();
+    let local = Store::open(client_dir.path()).unwrap();
+
+    let mut calls: Vec<(usize, usize)> = Vec::new();
+    let report = download_with_progress(&manifest, &source, &local, |done, total| {
+        calls.push((done, total));
+    })
+    .unwrap();
+
+    let total = manifest.chunks.len();
+    assert!(total > 1, "want a multi-chunk transfer");
+    assert_eq!(calls.len(), total);
+    assert_eq!(calls.last().unwrap(), &(total, total));
+    assert_eq!(report.fetched, total);
+    assert_eq!(report.deduped, 0);
 }

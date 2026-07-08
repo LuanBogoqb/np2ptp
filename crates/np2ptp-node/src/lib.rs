@@ -89,26 +89,39 @@ pub fn download<S: ChunkSource>(
     source: &S,
     local: &Store,
 ) -> Result<DownloadReport, NodeError> {
+    download_with_progress(manifest, source, local, |_, _| {})
+}
+
+/// Like [`download`], but calls `on_progress(chunks_done, chunks_total)` once
+/// per chunk (fetched or deduped) as it's accounted for.
+pub fn download_with_progress<S: ChunkSource>(
+    manifest: &Manifest,
+    source: &S,
+    local: &Store,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Result<DownloadReport, NodeError> {
     // Validate the chunk list against the Merkle root once; then a cheap
     // per-chunk content-hash check is enough (and stays O(n) at scale).
     if !manifest.root_is_consistent() {
         return Err(NodeError::BadChunk { index: 0 });
     }
+    let total = manifest.chunks.len();
     let mut fetched = 0;
     let mut deduped = 0;
     for (i, cref) in manifest.chunks.iter().enumerate() {
         if local.has(&cref.hash) {
             deduped += 1;
-            continue;
+        } else {
+            let bytes = source
+                .fetch(&cref.hash)?
+                .ok_or(NodeError::MissingChunk(cref.hash))?;
+            if !manifest.chunk_hash_ok(i, &bytes) {
+                return Err(NodeError::BadChunk { index: i });
+            }
+            local.put(&bytes)?;
+            fetched += 1;
         }
-        let bytes = source
-            .fetch(&cref.hash)?
-            .ok_or(NodeError::MissingChunk(cref.hash))?;
-        if !manifest.chunk_hash_ok(i, &bytes) {
-            return Err(NodeError::BadChunk { index: i });
-        }
-        local.put(&bytes)?;
-        fetched += 1;
+        on_progress(i + 1, total);
     }
     Ok(DownloadReport { fetched, deduped })
 }
