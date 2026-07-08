@@ -34,6 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 // Re-export the libp2p types that appear in this crate's public API, so callers
 // (and tests) don't need a direct libp2p dependency.
 pub use libp2p::{Multiaddr, PeerId};
+pub use np2ptp_rep::Counters;
 
 /// Extract the `PeerId` from a multiaddr that ends in `/p2p/<peer-id>`, if present.
 pub fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
@@ -162,6 +163,8 @@ enum Command {
     Reputation { peer: PeerId, reply: oneshot::Sender<i64> },
     PutRecord { key: Vec<u8>, value: Vec<u8>, reply: oneshot::Sender<bool> },
     GetRecord { key: Vec<u8>, reply: oneshot::Sender<Option<Vec<u8>>> },
+    ConnectedPeers { reply: oneshot::Sender<Vec<PeerId>> },
+    LedgerTotals { reply: oneshot::Sender<np2ptp_rep::Counters> },
 }
 
 /// DHT record key for a torrent-infohash -> nptp-root mapping.
@@ -298,6 +301,21 @@ impl Network {
     pub async fn reputation(&self, peer: PeerId) -> Result<i64, NetError> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Reputation { peer, reply }).await?;
+        rx.await.map_err(|_| NetError::Shutdown)
+    }
+
+    /// Peers this node currently has an open connection to.
+    pub async fn connected_peers(&self) -> Result<Vec<PeerId>, NetError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::ConnectedPeers { reply }).await?;
+        rx.await.map_err(|_| NetError::Shutdown)
+    }
+
+    /// Aggregate bytes served/received across every peer this node has
+    /// dealt with (see [`Ledger::totals`]).
+    pub async fn ledger_totals(&self) -> Result<Counters, NetError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::LedgerTotals { reply }).await?;
         rx.await.map_err(|_| NetError::Shutdown)
     }
 
@@ -598,6 +616,12 @@ impl EventLoop {
             Command::GetRecord { key, reply } => {
                 let qid = self.swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&key));
                 self.pending_get.insert(qid, reply);
+            }
+            Command::ConnectedPeers { reply } => {
+                let _ = reply.send(self.swarm.connected_peers().cloned().collect());
+            }
+            Command::LedgerTotals { reply } => {
+                let _ = reply.send(self.ledger.totals());
             }
         }
     }

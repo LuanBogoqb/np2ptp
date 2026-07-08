@@ -275,6 +275,51 @@ async fn discovers_provider_via_dht() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connected_peers_and_ledger_totals_reflect_a_transfer() {
+    let seed_dir = TmpDir::new();
+    let seed_store = Store::open(seed_dir.path()).unwrap();
+    let data = sample(300_000, 6);
+    let manifest = seed_store.ingest(&data, None).unwrap();
+    let root = manifest.root;
+
+    let seed = Network::spawn(seed_store, Some([90u8; 32])).unwrap();
+    seed.listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .await
+        .unwrap();
+    let seed_addr = first_listen_addr(&seed).await;
+    let seed_peer = seed.local_peer_id();
+    seed.provide(&manifest).await.unwrap();
+
+    let client_dir = TmpDir::new();
+    let client = Network::spawn(Store::open(client_dir.path()).unwrap(), Some([91u8; 32])).unwrap();
+    let client_store = Store::open(client_dir.path()).unwrap();
+    let client_peer = client.local_peer_id();
+    client.dial(seed_addr).await.unwrap();
+
+    for _ in 0..100 {
+        if client.download(root, seed_peer, &client_store).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Both sides should see the other in their connected-peer list.
+    let mut seed_sees_client = false;
+    for _ in 0..50 {
+        if seed.connected_peers().await.unwrap().contains(&client_peer) {
+            seed_sees_client = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(seed_sees_client, "seed should list the client as connected");
+
+    // The seed served the whole file to someone; ledger totals must reflect it.
+    let totals = seed.ledger_totals().await.unwrap();
+    assert_eq!(totals.we_served, data.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_content_is_reported_not_hung() {
     // A seed that serves nothing: manifest request returns NoManifest.
     let seed_dir = TmpDir::new();
