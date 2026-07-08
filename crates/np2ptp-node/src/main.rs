@@ -587,6 +587,7 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
     let out_flag = flags.get("out").cloned();
     let use_fec = flags.contains_key("fec");
+    let json = flags.contains_key("json");
     let tracker_url = flags
         .get("tracker")
         .cloned()
@@ -611,13 +612,31 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
         let candidates: Vec<(PeerId, Vec<Multiaddr>)> = match explicit {
             Some((peer, addr)) => vec![(peer, vec![addr])],
             None => {
-                println!("discovering peers for {} via {tracker_url} ...", root.to_hex());
+                if !json {
+                    println!("discovering peers for {} via {tracker_url} ...", root.to_hex());
+                }
                 let found = tracker::get_peers(&tracker_url, root).await?;
                 if found.is_empty() {
                     return Err("no peers found on the tracker for this content (and no --peer given)".into());
                 }
-                println!("  found {} peer(s)", found.len());
+                if !json {
+                    println!("  found {} peer(s)", found.len());
+                }
                 found
+            }
+        };
+
+        let mut last_emit = std::time::Instant::now();
+        let mut on_progress = |done: usize, total: usize| {
+            if json {
+                let now = std::time::Instant::now();
+                if done == total || now.duration_since(last_emit) >= Duration::from_millis(100) {
+                    last_emit = now;
+                    println!(
+                        "{}",
+                        serde_json::json!({"event":"progress","op":"fetch","chunks_done":done,"chunks_total":total})
+                    );
+                }
             }
         };
 
@@ -630,9 +649,9 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
             for _ in 0..60 {
                 let attempt = if use_fec {
-                    net.download_fec(root, *peer, &into).await
+                    net.download_fec_with_progress(root, *peer, &into, &mut on_progress).await
                 } else {
-                    net.download(root, *peer, &into).await
+                    net.download_with_progress(root, *peer, &into, &mut on_progress).await
                 };
                 match attempt {
                     Ok(m) => {
@@ -650,7 +669,19 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
             manifest.ok_or_else(|| format!("download failed: {}", last_err.unwrap_or_default()))?;
 
         let dest = write_output(&into, &manifest, out_flag)?;
-        println!("fetched {} ({} bytes) -> {dest}", manifest.uri(), manifest.total_size);
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event":"result","op":"fetch",
+                    "root": manifest.uri(),
+                    "path": dest,
+                    "bytes_total": manifest.total_size,
+                })
+            );
+        } else {
+            println!("fetched {} ({} bytes) -> {dest}", manifest.uri(), manifest.total_size);
+        }
         Ok::<(), Box<dyn Error>>(())
     })
 }
