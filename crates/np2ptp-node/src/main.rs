@@ -646,7 +646,7 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
 
 /// Download content over the network. With `--peer` it dials that peer directly;
 /// without it, it discovers providers via the tracker (`--tracker`, default
-/// `https://np2ptp.vercel.app`) and tries each.
+/// `https://nptp.bogotec.uk`) and tries each.
 fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
     let (pos, flags) = parse(args, &["--peer", "--store", "--out", "--tracker"]);
     let target = *pos.first().ok_or("fetch: missing <np2ptp:ROOT | file.nptp>")?;

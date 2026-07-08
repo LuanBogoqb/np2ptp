@@ -1,7 +1,8 @@
-// Standalone HTTP server for self-hosting the tracker outside Vercel — adapts
-// the Vercel-style (req, res) handlers in api/ to plain Node `http`. No other
-// deps beyond what api/_store.js already needs. Run with `node server.js`;
-// PORT/HOST default to 127.0.0.1:8787 (put a reverse proxy in front for TLS).
+// Standalone HTTP server for the tracker: adapts the (req, res) handlers in
+// api/ to plain Node `http`, so they don't need a serverless platform to run.
+// No other deps beyond what api/_store.js already needs. Run with
+// `node server.js`; PORT/HOST default to 127.0.0.1:8787 (put a reverse proxy
+// in front for TLS).
 import http from "node:http";
 import { URL } from "node:url";
 
@@ -18,7 +19,7 @@ const routes = {
   "/health": healthHandler,
 };
 
-function withVercelShim(res) {
+function withResponseHelpers(res) {
   res.status = (code) => {
     res.statusCode = code;
     return res;
@@ -44,7 +45,7 @@ async function readBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
-  withVercelShim(res);
+  withResponseHelpers(res);
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const handler = routes[url.pathname];
   if (!handler) {

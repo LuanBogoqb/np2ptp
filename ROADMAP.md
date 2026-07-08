@@ -148,9 +148,9 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
      started — a real BitTorrent swarm is harder to test deterministically, so
      the fully-offline local-conversion half shipped first.
 2. **Automatic discovery** (so `fetch <link>` needs no `--peer`):
-   - ✅ **HTTP tracker on Vercel** — LIVE at `https://np2ptp.vercel.app`
-     (`tracker/`, Upstash KV). `serve` announces; `fetch <link>` with no `--peer`
-     discovers providers and downloads. Validated end-to-end.
+   - ✅ **HTTP discovery tracker** — LIVE at `https://nptp.bogotec.uk`, self-hosted
+     on the VPS (`tracker/`, systemd + Caddy). `serve` announces; `fetch <link>`
+     with no `--peer` discovers providers and downloads. Validated end-to-end.
    - **mDNS** — libp2p mDNS behaviour for zero-config discovery on the same LAN.
    - **Bootstrap DHT nodes** — run 1+ stable nodes (persist the Ed25519 key for a
      fixed peer id) so `find_providers(root)` works without the tracker too.

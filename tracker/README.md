@@ -1,43 +1,69 @@
-# NP2PTP tracker (Vercel)
+# NP2PTP tracker
 
-A tiny serverless **discovery tracker** for NP2PTP. It is **not** a P2P node —
-Vercel can't run libp2p/QUIC (serverless = short-lived HTTP, no persistent UDP).
-It only exchanges contact info, BitTorrent-tracker style; the actual transfer
-stays peer-to-peer.
+A tiny **discovery tracker** for NP2PTP. It is not a P2P node: it only
+exchanges contact info, BitTorrent-tracker style. The actual transfer stays
+peer-to-peer.
 
 ## API
 
-- `POST /announce` — body `{ "cid": "<nptp-root-or-infohash>", "peer": "<peer-id>", "addr": "<multiaddr>" }`
-- `GET  /peers?cid=<content-id>` — `{ cid, count, peers: [{ peer, addr, ts }] }`
-- `GET  /health` — `{ ok, backend: "upstash" | "memory" }`
+- `POST /announce`: body `{ "cid": "<nptp-root-or-infohash>", "peer": "<peer-id>", "addr": "<multiaddr>" }`
+- `GET  /peers?cid=<content-id>`: `{ cid, count, peers: [{ peer, addr, ts }] }`
+- `GET  /health`: `{ ok, backend: "upstash" | "memory" }`
 
 Announcements expire after 30 min (peers must re-announce, like a tracker interval).
 
 ## State
 
-Uses **Upstash Redis** (Vercel KV) when configured, via either
-`UPSTASH_REDIS_REST_URL`/`UPSTASH_REDIS_REST_TOKEN` or `KV_REST_API_URL`/`KV_REST_API_TOKEN`.
-Without it, falls back to an in-memory map (works only within one warm instance —
-fine for a first test, not for production).
+The store falls back automatically depending on what's configured:
 
-## Deploy
+- If `UPSTASH_REDIS_REST_URL`/`UPSTASH_REDIS_REST_TOKEN` (or
+  `KV_REST_API_URL`/`KV_REST_API_TOKEN`) are set, it uses Upstash Redis.
+- Otherwise it uses an in-process `Map`. That's fine for a single always-on
+  instance (which is how the live tracker runs); it just means a service
+  restart clears the current announcements, and peers naturally re-announce
+  within the 30-minute window.
 
-### Easiest — Vercel Git import (no local tooling)
-1. vercel.com → **Add New… → Project** → import `LuGB18/np2ptp`.
-2. Set **Root Directory** to `tracker`.
-3. Deploy. It works immediately on the in-memory fallback.
-4. For real state: project → **Storage → Marketplace → Upstash for Redis** (free
-   tier) → connect. It sets the env vars automatically. **Redeploy.**
-5. Check `https://<your-app>.vercel.app/health` → `"backend":"upstash"`.
+## Deploy (self-hosted, systemd)
 
-### CLI
-```sh
-npm i -g vercel
-cd tracker
-vercel link
-vercel deploy --prod
-# add Upstash via the dashboard or: vercel integration add upstash
-```
+The tracker is plain Node with no framework dependency, so it runs anywhere
+Node runs. `server.js` is a small `http` wrapper around the same handler
+functions in `api/`.
+
+1. Copy this directory to the host, e.g. `/opt/np2ptp-tracker`, and
+   `npm install --omit=dev` there.
+2. Create a systemd unit, e.g. `/etc/systemd/system/np2ptp-tracker.service`:
+
+   ```ini
+   [Unit]
+   Description=NP2PTP discovery tracker
+   After=network.target
+
+   [Service]
+   User=nptptracker
+   Group=nptptracker
+   WorkingDirectory=/opt/np2ptp-tracker
+   Environment=PORT=8787
+   Environment=HOST=127.0.0.1
+   ExecStart=/usr/bin/node server.js
+   Restart=on-failure
+   RestartSec=3
+   NoNewPrivileges=true
+   PrivateTmp=true
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+3. `systemctl enable --now np2ptp-tracker`.
+4. Put a reverse proxy in front of it for TLS. The live instance uses Caddy:
+
+   ```
+   nptp.example.com {
+       reverse_proxy 127.0.0.1:8787
+   }
+   ```
+
+5. Check `https://<your-domain>/health`.
 
 ## How the NP2PTP client uses it
 
@@ -50,7 +76,6 @@ tracker only solves *discovery*.
 
 ## Live instance
 
-The principal tracker is **https://nptp.bogotec.uk** — this is
-`tracker::DEFAULT_TRACKER`, so clients use it automatically unless `--tracker`
-overrides it. The Vercel deploy steps above still work if you ever want a
-second/backup instance.
+The principal tracker is **https://nptp.bogotec.uk**, self-hosted on the same
+VPS as the public relay. This is `tracker::DEFAULT_TRACKER`, so clients use it
+automatically unless `--tracker` overrides it.
