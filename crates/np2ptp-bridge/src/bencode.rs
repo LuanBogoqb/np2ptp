@@ -182,6 +182,10 @@ pub fn parse_torrent_file(bytes: &[u8]) -> Result<TorrentMeta, BridgeError> {
         .and_then(Value::as_int)
         .ok_or_else(|| err("info.piece length missing"))?;
     let piece_length = u32::try_from(piece_length).map_err(|_| err("info.piece length out of range"))?;
+    const MAX_PIECE_LENGTH: u32 = 64 * 1024 * 1024; // 64 MiB — generous vs. real torrents (typically <= 16-32 MB)
+    if piece_length == 0 || piece_length > MAX_PIECE_LENGTH {
+        return Err(err("info.piece length is zero or unreasonably large"));
+    }
 
     let pieces = info_value
         .dict_get(b"pieces")
@@ -373,6 +377,19 @@ mod tests {
             (b"length".to_vec(), Value::Int(100)),
             (b"name".to_vec(), str_val("f.bin")),
             (b"piece length".to_vec(), Value::Int(-1)),
+            (b"pieces".to_vec(), Value::Bytes(vec![1u8; 20])),
+        ]);
+        let top = Value::Dict(vec![(b"info".to_vec(), info)]);
+        let bytes = encode(&top);
+        assert!(parse_torrent_file(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_absurdly_large_piece_length() {
+        let info = Value::Dict(vec![
+            (b"length".to_vec(), Value::Int(100)),
+            (b"name".to_vec(), str_val("f.bin")),
+            (b"piece length".to_vec(), Value::Int(u32::MAX as i64)),
             (b"pieces".to_vec(), Value::Bytes(vec![1u8; 20])),
         ]);
         let top = Value::Dict(vec![(b"info".to_vec(), info)]);

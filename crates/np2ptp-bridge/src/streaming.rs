@@ -52,7 +52,7 @@ struct StreamingPieceVerifier<'a> {
 
 impl<'a> StreamingPieceVerifier<'a> {
     fn new(piece_length: usize, piece_hashes: &'a [[u8; 20]]) -> Self {
-        StreamingPieceVerifier { piece_length, piece_hashes, buf: Vec::with_capacity(piece_length), next_piece: 0 }
+        StreamingPieceVerifier { piece_length, piece_hashes, buf: Vec::new(), next_piece: 0 }
     }
 
     fn feed(&mut self, mut data: &[u8]) -> Result<(), BridgeError> {
