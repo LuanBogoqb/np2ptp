@@ -8,7 +8,7 @@ for transport. **Read [`ROADMAP.md`](ROADMAP.md) for the full plan and status.**
 ## Build & test
 
 ```sh
-cargo test --workspace          # ~80 tests, keep green
+cargo test --workspace          # ~100 tests, keep green
 cargo clippy --workspace --all-targets   # keep at 0 warnings
 cargo run --release -p np2ptp-sim        # research harness -> reports/
 cargo build --release -p np2ptp-node     # the `np2ptp` CLI binary

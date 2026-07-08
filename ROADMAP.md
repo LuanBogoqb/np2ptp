@@ -26,7 +26,7 @@ Noise, Kademlia, NAT traversal). The novelty is the layers above.
 
 ## 2. Current state (what works)
 
-8 Rust crates + a Python CLI wrapper. ~80 tests green, clippy clean. Pushed to
+8 Rust crates + a Python CLI wrapper. ~100 tests green, clippy clean. Pushed to
 `github.com/LuGB18/np2ptp` (private).
 
 | Crate | Status | Responsibility |
@@ -35,7 +35,7 @@ Noise, Kademlia, NAT traversal). The novelty is the layers above.
 | `np2ptp-store` | ✅ | Content-addressed chunk store + dedup; **streaming** ingest/export |
 | `np2ptp-fec` | ✅ | RaptorQ erasure coding (k-of-n) |
 | `np2ptp-rep` | ✅ | Ed25519 identity, signed receipts, reputation `Ledger<K>` |
-| `np2ptp-net` | ✅ (core) | libp2p/QUIC: download by content id, DHT discovery + infohash mapping, reputation choke, FEC symbols, relay reservation |
+| `np2ptp-net` | ✅ (core) | libp2p/QUIC: download by content id, DHT discovery + infohash mapping, reputation choke + **signed receipt exchange** (portable reputation), FEC symbols, relay reservation |
 | `np2ptp-node` | ✅ | CLI: `pack` / `info` / `get` / `serve` / `fetch` (files **and** folders, streaming) |
 | `np2ptp-sim` | ✅ | Research harness: measures dedup, permanence, free-riding, FEC cost; writes `reports/` |
 | `np2ptp-bridge` | 🚧 core only | Torrent↔NP2PTP: `TorrentSource` trait, resolve-or-convert flow, piece verification. **librqbit source + CLI not done.** |
@@ -46,6 +46,10 @@ Noise, Kademlia, NAT traversal). The novelty is the layers above.
 - Download via plain chunks and via RaptorQ symbols (`--fec`).
 - DHT provider discovery + infohash→root mapping (tests).
 - Reputation choke cutting off a leech (test + sim).
+- Signed receipts: a peer that earned one serving someone else bypasses a
+  strict choke on first contact with a brand-new peer, while an equally cold
+  peer with no receipt is choked (test + sim). Reputation now persists across
+  `serve` restarts (`ledger.bin`/`receipts.bin` next to `identity.key`).
 - Streaming pack of a real **3.1 GB** file (no OOM); streaming root == in-memory root.
 
 ---
@@ -75,9 +79,19 @@ RaptorQ-symbol, CBOR codec), identify, relay (client+server), dcutr, autonat. Th
 headline op is `download(root, provider, into_store)`: fetch manifest, validate it
 against the root, then fetch+verify+store every chunk (concurrently, streaming).
 
-**Incentives.** `rep::Ledger<K>` tracks bytes served/received per peer. `net`
-embeds `Ledger<PeerId>` and a choke threshold: a peer that has taken far more than
-it gave is refused chunks.
+**Incentives.** `rep::Ledger<K>` tracks bytes served/received per peer, plus
+bytes credited by valid signed receipts. `net` embeds `Ledger<PeerId>` and a
+choke threshold: a peer that has taken far more than it gave (net of any
+receipt credit) is refused chunks. After a download, the client signs one
+`Receipt` crediting the server and sends it over the wire (`SubmitReceipt`);
+a server persists received receipts (`receipts.bin`, capped at 50) and, on
+first contact with a peer it has no ledger history for, pulls that peer's
+bag (`GetReceipts`) and credits it — reputation that survives restarts and
+travels to peers you've never talked to directly, unlike BitTorrent's
+memoryless tit-for-tat. This is *not* Sybil-resistant (a receipt only proves
+a key signed it, not that the signer is a distinct real peer) — see
+`docs/superpowers/specs/2026-07-08-signed-receipt-exchange-design.md`'s
+"Trust model / limitations" for what it does and doesn't defend against.
 
 **Research harness (`sim`).** Spins up real `Network` nodes and runs A/B scenarios,
 writing `reports/REPORT.md` + `results.csv`.
@@ -157,7 +171,10 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
 - **FEC permanence for real:** today only a full holder can mint symbols. Store and
   forward *partial* symbol sets across peers for true churn resilience.
 - **Resumable / multi-source downloads:** fetch chunks from several providers at once.
-- **Signed-receipt exchange over the wire** (the `rep` primitive exists; circulate it).
+- ✅ **Signed-receipt exchange over the wire** — done. `SubmitReceipt`/`GetReceipts`
+  ride the existing request-response protocol; see "Incentives" above. Remaining:
+  per-peer state (`rep_peers`, `receipts_pulled_from`) has no GC on disconnect —
+  fine for now, worth pruning if a long-lived node sees heavy peer churn.
 - **Mutable content:** signed pointers (a key "names" a feed) — IPNS/Dat style.
 
 ### ⏳ Phase 4 — Product & UX
@@ -169,7 +186,7 @@ bootstrap/relay infrastructure, docs site.
 ## 6. How to build, test, run
 
 ```sh
-cargo test --workspace                     # keep green (~80 tests)
+cargo test --workspace                     # keep green (~100 tests)
 cargo clippy --workspace --all-targets     # keep at 0 warnings
 cargo run --release -p np2ptp-sim          # research report -> reports/
 

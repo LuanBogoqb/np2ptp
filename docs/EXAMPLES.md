@@ -130,8 +130,9 @@ usual text on stderr — a consumer only needs to read stdout to get everything.
 ## Research Harness
 
 `np2ptp-sim` measures whether the project's core ideas — deduplication,
-permanence, and reputation-based incentives — actually outperform a naive
-baseline, using real nodes rather than a model.
+permanence, and reputation-based incentives (including portable, signed-receipt
+reputation) — actually outperform a naive baseline, using real nodes rather
+than a model.
 
 ```sh
 cargo run --release -p np2ptp-sim
@@ -144,6 +145,7 @@ A representative run reports:
 | **Dedup** — store a file, then a lightly-edited v2 | **~49%** of chunks deduplicated |
 | **Permanence** — seeder leaves after one peer re-shares | survives **only with** re-sharing |
 | **Free-riding** — leech under the reputation choke | choke off → completes; choke on → cut off |
+| **Receipt-bootstrapped trust** — cold peer vs. one vouched for by a signed receipt | no receipt → choked; with receipt → completes |
 | **FEC cost** — chunk vs. RaptorQ-symbol download (1 MB) | chunk ~107 ms vs. FEC ~110 ms |
 
 Build with `--release` — RaptorQ's GF(256) arithmetic is roughly 100x slower in a
