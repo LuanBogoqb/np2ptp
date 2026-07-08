@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NP2PTP — New Peer-To-Peer Transfer Protocol</title>
+  <meta name="description" content="A research prototype rethinking BitTorrent: content-addressed, permanent, verified.">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-inner">
+      <a href="#" class="nav-brand">NP2PTP</a>
+      <button class="nav-toggle" aria-label="Toggle menu" aria-expanded="false">☰</button>
+      <div class="nav-links">
+        <a href="#how-it-works">How it works</a>
+        <a href="#examples">Examples</a>
+        <a href="#research">Research</a>
+        <a href="https://github.com/LuanBogoqb/np2ptp" aria-label="GitHub repository">GitHub</a>
+        <a href="https://github.com/LuanBogoqb/np2ptp/releases/latest" class="nav-download">Download</a>
+      </div>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <h1>NP2PTP</h1>
+    <p class="hero-tagline">Torrents, rebuilt: dedup, permanence, and integrity that actually hold up.</p>
+    <div class="hero-ctas">
+      <a href="https://github.com/LuanBogoqb/np2ptp" class="btn btn-primary">View on GitHub</a>
+      <a href="https://github.com/LuanBogoqb/np2ptp/releases/latest" class="btn btn-secondary">Download latest release</a>
+    </div>
+  </header>
+
+  <section class="problems">
+    <h2>What it fixes</h2>
+    <div class="card-grid">
+      <div class="problem-card">
+        <h3>NAT &amp; connectivity</h3>
+        <p>Too many peers can't accept inbound connections. NP2PTP falls back to a public relay automatically — no port forwarding, no configuration.</p>
+      </div>
+      <div class="problem-card">
+        <h3>Permanence &amp; incentives</h3>
+        <p>Content dies when seeders leave, and seeding earns nothing. Erasure coding survives churn; a persistent reputation ledger rewards contribution.</p>
+      </div>
+      <div class="problem-card">
+        <h3>Integrity &amp; dedup</h3>
+        <p>Coarse verification and no cross-content deduplication. Every chunk is content-addressed and hash-verified — a lying peer is caught immediately.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="how-it-works" class="how-it-works">
+    <h2>How it works</h2>
+    <div class="how-grid">
+      <div class="how-item">
+        <h3>Content addressing</h3>
+        <p>Every file is split into content-defined chunks and hashed with BLAKE3 into a Merkle tree. The root of that tree <em>is</em> the content's identity — a link like <code>np2ptp:e0cf...</code> is all you ever need to fetch and verify it.</p>
+      </div>
+      <div class="how-item">
+        <h3>Deduplication</h3>
+        <p>Because chunk boundaries are defined by content, not fixed offsets, an edited file mostly reuses its old chunks. Identical files anywhere — even across unrelated downloads — are stored and transferred exactly once.</p>
+      </div>
+      <div class="how-item">
+        <h3>Permanence</h3>
+        <p>RaptorQ erasure coding turns a file into redundant symbols: any sufficiently large subset reconstructs the whole thing, so content survives seeders leaving without anyone re-uploading it whole.</p>
+      </div>
+      <div class="how-item">
+        <h3>Reachability</h3>
+        <p>Built on libp2p/QUIC with DHT discovery. Behind CGNAT or a closed router? NP2PTP tries UPnP, then NAT-PMP, then falls back to a public relay automatically.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="examples" class="examples">
+    <h2>Three commands</h2>
+    <p class="section-sub">Link a file, seed it, fetch it — that's the whole workflow.</p>
+    <div class="code-stack">
+      <div class="code-block">
+        <div class="code-label">Link what you want to share</div>
+        <pre><code>np2ptp pack myfile.zip --out myfile.nptp</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-label">Make it available on the network</div>
+        <pre><code>np2ptp serve myfile.nptp</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-label">Download it, anywhere</div>
+        <pre><code>np2ptp fetch np2ptp:abc123... --out ./downloaded</code></pre>
+      </div>
+    </div>
+    <a href="https://github.com/LuanBogoqb/np2ptp/blob/main/docs/USAGE.md" class="link-more">Full usage guide →</a>
+  </section>
+
+  <section id="research" class="research">
+    <h2>Does it actually work better?</h2>
+    <p class="section-sub">Measured with a research harness that compares against a plain-chunk baseline — not just claimed.</p>
+    <div class="stat-grid">
+      <div class="stat">
+        <div class="stat-value">~49%</div>
+        <div class="stat-label">chunks deduplicated on a lightly-edited file</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">Survives</div>
+        <div class="stat-label">seeder departure — only with re-sharing enabled</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">Cut off</div>
+        <div class="stat-label">a free-riding leech, under the reputation choke</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">~110ms</div>
+        <div class="stat-label">erasure-coded download vs. ~107ms plain chunk (1MB)</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="teaser">
+    <p>The CLI is just the start — a proper desktop app is brewing. 👀</p>
+  </section>
+
+  <footer class="footer">
+    <div class="footer-links">
+      <a href="https://github.com/LuanBogoqb/np2ptp">GitHub</a>
+      <a href="https://github.com/LuanBogoqb/np2ptp/releases/latest">Releases</a>
+      <a href="https://github.com/LuanBogoqb/np2ptp/blob/main/docs/USAGE.md">Usage</a>
+      <a href="https://github.com/LuanBogoqb/np2ptp/blob/main/docs/EXAMPLES.md">Examples</a>
+      <a href="https://github.com/LuanBogoqb/np2ptp/blob/main/docs/BUILDING.md">Building</a>
+    </div>
+    <p class="footer-note">A research prototype. Not a production client.</p>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
