@@ -268,6 +268,74 @@ pub async fn fec_cost() -> FecCostResult {
     FecCostResult { size: data.len(), chunk_ms, fec_ms }
 }
 
+// ---- scenario 5: receipt-bootstrapped trust ------------------------------
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiptTrustResult {
+    pub cold_peer_completed: bool,
+    pub vouched_peer_completed: bool,
+}
+
+/// A strict server (choke threshold 0, so any net-negative peer is cut off
+/// after its first freebie chunk) meets two peers it has no history with:
+/// one carries a signed receipt proving it served bytes to someone else
+/// earlier; the other has nothing. The vouched-for peer should be credited
+/// on first contact (via `GetReceipts`) and finish; the cold peer should be
+/// choked like any other unproven leech.
+pub async fn receipt_bootstraps_trust() -> ReceiptTrustResult {
+    // "B" earns a receipt by serving a small file to some earlier downloader.
+    let b_dir = TmpDir::new();
+    let b_store = Store::open(b_dir.path()).unwrap();
+    let voucher_data = sample(350_000, 20);
+    let voucher_manifest = b_store.ingest(&voucher_data, None).unwrap();
+    let voucher_root = voucher_manifest.root;
+
+    let b = Network::spawn(b_store, None).unwrap();
+    b.listen(QUIC_LISTEN.parse().unwrap()).await.unwrap();
+    let b_addr = first_listen_addr(&b).await;
+    let b_peer = b.local_peer_id();
+    b.provide(&voucher_manifest).await.unwrap();
+
+    let earlier_dir = TmpDir::new();
+    let earlier = Network::spawn(Store::open(earlier_dir.path()).unwrap(), None).unwrap();
+    let earlier_store = Store::open(earlier_dir.path()).unwrap();
+    earlier.dial(b_addr).await.unwrap();
+    assert!(
+        download_until(&earlier, voucher_root, b_peer, &earlier_store, 100).await,
+        "setup: the earlier download must complete so B earns a receipt"
+    );
+    // Give B's EventLoop a moment to receive and store the auto-submitted receipt.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The real content everyone wants, served by a strict seed.
+    let data = sample(300_000, 21); // multi-chunk
+    let seed_dir = TmpDir::new();
+    let seed_store = Store::open(seed_dir.path()).unwrap();
+    let manifest = seed_store.ingest(&data, None).unwrap();
+    let root = manifest.root;
+    let seed = Network::spawn(seed_store, None).unwrap();
+    seed.listen(QUIC_LISTEN.parse().unwrap()).await.unwrap();
+    let seed_addr = first_listen_addr(&seed).await;
+    let seed_peer = seed.local_peer_id();
+    seed.provide(&manifest).await.unwrap();
+    seed.set_choke_threshold(0).await.unwrap();
+
+    // B (carrying a receipt) connects cold to the seed.
+    let b_download_dir = TmpDir::new();
+    let b_download_store = Store::open(b_download_dir.path()).unwrap();
+    b.dial(seed_addr.clone()).await.unwrap();
+    let vouched_peer_completed = download_until(&b, root, seed_peer, &b_download_store, 60).await;
+
+    // A, an equally cold peer with no receipts at all, connects to the same seed.
+    let a_dir = TmpDir::new();
+    let a = Network::spawn(Store::open(a_dir.path()).unwrap(), None).unwrap();
+    let a_store = Store::open(a_dir.path()).unwrap();
+    a.dial(seed_addr).await.unwrap();
+    let cold_peer_completed = download_until(&a, root, seed_peer, &a_store, 60).await;
+
+    ReceiptTrustResult { cold_peer_completed, vouched_peer_completed }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +357,12 @@ mod tests {
     async fn choke_stops_the_free_rider() {
         assert!(freeride(false).await.leech_completed, "without choke the leech finishes");
         assert!(!freeride(true).await.leech_completed, "with choke the leech is cut off");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_receipt_lets_a_cold_peer_bypass_the_choke() {
+        let r = receipt_bootstraps_trust().await;
+        assert!(r.vouched_peer_completed, "a peer vouched for by a receipt should not be choked");
+        assert!(!r.cold_peer_completed, "a peer with no history and no receipt should be choked");
     }
 }
