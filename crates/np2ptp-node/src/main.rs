@@ -418,6 +418,7 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
         .cloned()
         .unwrap_or_else(|| tracker::DEFAULT_TRACKER.to_string());
     let no_tracker = flags.contains_key("no-tracker");
+    let json = flags.contains_key("json");
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -542,34 +543,57 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
         }
 
-        if no_tracker {
-            println!("\nProviding on the DHT. Press Ctrl-C to stop.");
-            tokio::signal::ctrl_c().await?;
-        } else {
-            println!("\nProviding on the DHT + announcing to {tracker_url}. Press Ctrl-C to stop.");
-            // Re-announce periodically (TTL ~30 min) — frequent enough to pick up
-            // a UPnP-mapped public address once the router responds.
-            let mut interval = tokio::time::interval(Duration::from_secs(120));
-            loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => break,
-                    _ = interval.tick() => {
-                        // Announce local listen addresses AND any public (UPnP)
-                        // external address so peers on other networks can reach us.
-                        let mut addrs = net.listeners().await.unwrap_or_default();
-                        for ext in net.external_addresses().await.unwrap_or_default() {
-                            if !addrs.contains(&ext) {
-                                addrs.push(ext);
-                            }
+        if !json {
+            if no_tracker {
+                println!("\nProviding on the DHT. Press Ctrl-C to stop.");
+            } else {
+                println!("\nProviding on the DHT + announcing to {tracker_url}. Press Ctrl-C to stop.");
+            }
+        }
+        let mut announce_interval = tokio::time::interval(Duration::from_secs(120));
+        let mut status_interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = announce_interval.tick(), if !no_tracker => {
+                    // Announce local listen addresses AND any public (UPnP)
+                    // external address so peers on other networks can reach us.
+                    let mut addrs = net.listeners().await.unwrap_or_default();
+                    for ext in net.external_addresses().await.unwrap_or_default() {
+                        if !addrs.contains(&ext) {
+                            addrs.push(ext);
                         }
-                        if let Err(e) = tracker::announce(&tracker_url, manifest.root, peer, &addrs).await {
+                    }
+                    if let Err(e) = tracker::announce(&tracker_url, manifest.root, peer, &addrs).await {
+                        if !json {
                             eprintln!("  (tracker announce failed: {e})");
                         }
                     }
                 }
+                _ = status_interval.tick(), if json => {
+                    let peers = net.connected_peers().await.unwrap_or_default();
+                    let totals = net.ledger_totals().await.unwrap_or_default();
+                    let tracker = if no_tracker {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(tracker_url.clone())
+                    };
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event":"status","op":"serve",
+                            "peers": peers.len(),
+                            "tracker": tracker,
+                            "bytes_served": totals.we_served,
+                            "bytes_received": totals.served_to_us,
+                        })
+                    );
+                }
             }
         }
-        println!("\nstopped.");
+        if !json {
+            println!("\nstopped.");
+        }
         Ok::<(), Box<dyn Error>>(())
     })
 }
