@@ -43,7 +43,9 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
+    let json = args.iter().any(|a| a == "--json");
+    let op = args.first().cloned().unwrap_or_default();
+    let result = match args.first().map(String::as_str) {
         Some("pack") => cmd_pack(&args[1..]),
         Some("info") => cmd_info(&args[1..]),
         Some("get") => cmd_get(&args[1..]),
@@ -59,7 +61,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             print_usage();
             Err("unknown command".into())
         }
+    };
+    if let Err(e) = &result {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"event": "error", "op": op, "message": e.to_string()})
+            );
+        }
     }
+    result
 }
 
 /// Split args into positionals and `--flag value` pairs. `value_flags` are the
