@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NP2PTP — New Peer-To-Peer Transfer Protocol</title>
+  <title>NP2PTP: New Peer-To-Peer Transfer Protocol</title>
   <meta name="description" content="A research prototype rethinking BitTorrent: content-addressed, permanent, verified.">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="stylesheet" href="style.css">
@@ -49,15 +49,15 @@
     <div class="card-grid">
       <div class="problem-card">
         <h3>NAT &amp; connectivity</h3>
-        <p>Too many peers can't accept inbound connections. NP2PTP falls back to a public relay automatically — no port forwarding, no configuration.</p>
+        <p>Too many peers can't accept inbound connections. NP2PTP falls back to a public relay automatically, so there's no port forwarding and nothing to configure.</p>
       </div>
       <div class="problem-card">
         <h3>Permanence &amp; incentives</h3>
-        <p>Content dies when seeders leave, and seeding earns nothing. Erasure coding survives churn; a persistent, portable reputation ledger rewards contribution — backed by signed receipts a peer can carry to prove itself to strangers, not just whoever it dealt with directly.</p>
+        <p>Content dies when seeders leave, and seeding earns nothing. Erasure coding keeps content alive through churn, and a reputation ledger rewards people for seeding. That ledger is portable, too: a peer can carry a signed receipt to prove itself to strangers, not just whoever it dealt with directly.</p>
       </div>
       <div class="problem-card">
         <h3>Integrity &amp; dedup</h3>
-        <p>Coarse verification and no cross-content deduplication. Every chunk is content-addressed and hash-verified — a lying peer is caught immediately.</p>
+        <p>Coarse verification and no cross-content deduplication. Every chunk is content-addressed and hash-verified, so a lying peer gets caught immediately.</p>
       </div>
     </div>
   </section>
@@ -67,15 +67,15 @@
     <div class="how-grid">
       <div class="how-item">
         <h3>Content addressing</h3>
-        <p>Every file is split into content-defined chunks and hashed with BLAKE3 into a Merkle tree. The root of that tree <em>is</em> the content's identity — a link like <code>np2ptp:e0cf...</code> is all you ever need to fetch and verify it.</p>
+        <p>Every file is split into content-defined chunks and hashed with BLAKE3 into a Merkle tree. The root of that tree <em>is</em> the content's identity. A link like <code>np2ptp:e0cf...</code> is all you need to fetch and verify it.</p>
       </div>
       <div class="how-item">
         <h3>Deduplication</h3>
-        <p>Because chunk boundaries are defined by content, not fixed offsets, an edited file mostly reuses its old chunks. Identical files anywhere — even across unrelated downloads — are stored and transferred exactly once.</p>
+        <p>Because chunk boundaries are defined by content, not fixed offsets, an edited file mostly reuses its old chunks. Identical files anywhere, even across unrelated downloads, get stored and transferred exactly once.</p>
       </div>
       <div class="how-item">
         <h3>Permanence</h3>
-        <p>RaptorQ erasure coding turns a file into redundant symbols: any sufficiently large subset reconstructs the whole thing, so content survives seeders leaving without anyone re-uploading it whole.</p>
+        <p>RaptorQ erasure coding turns a file into redundant symbols, so any big-enough subset of them rebuilds the whole thing. Content survives seeders leaving, and nobody has to re-upload it whole.</p>
       </div>
       <div class="how-item">
         <h3>Reachability</h3>
@@ -83,14 +83,14 @@
       </div>
       <div class="how-item">
         <h3>Torrent bridge</h3>
-        <p>Already have a torrent's data on disk? <code>np2ptp torrent</code> converts it in place — piece hashes verified streaming from disk, so even a 50&nbsp;GB torrent never touches RAM. Once bridged, it's discoverable to any NP2PTP peer, permanently — not just whoever had the original torrent.</p>
+        <p>Already have a torrent's data on disk? <code>np2ptp torrent</code> converts it in place, verifying piece hashes straight from disk so even a 50&nbsp;GB torrent never touches RAM. Once it's bridged, any NP2PTP peer can find it from then on, not just whoever had the original torrent.</p>
       </div>
     </div>
   </section>
 
   <section id="examples" class="examples">
     <h2>Three commands</h2>
-    <p class="section-sub">Link a file, seed it, fetch it — that's the whole workflow.</p>
+    <p class="section-sub">Link a file, seed it, fetch it. That's the whole workflow.</p>
     <div class="code-stack">
       <div class="code-block">
         <div class="code-label">Link what you want to share</div>
@@ -110,7 +110,7 @@
 
   <section id="research" class="research">
     <h2>Does it actually work better?</h2>
-    <p class="section-sub">Measured with a research harness that compares against a plain-chunk baseline — not just claimed.</p>
+    <p class="section-sub">Measured with a research harness that compares against a plain-chunk baseline, not just claimed.</p>
     <div class="stat-grid">
       <div class="stat">
         <div class="stat-value">~49%</div>
@@ -118,7 +118,7 @@
       </div>
       <div class="stat">
         <div class="stat-value">Survives</div>
-        <div class="stat-label">seeder departure — only with re-sharing enabled</div>
+        <div class="stat-label">seeder departure, but only if re-sharing is on</div>
       </div>
       <div class="stat">
         <div class="stat-value">Cut off</div>
@@ -136,7 +136,7 @@
   </section>
 
   <section class="teaser">
-    <p>The CLI is just the start — a proper desktop app is brewing. 👀</p>
+    <p>The CLI is just the start. A proper desktop app is brewing. 👀</p>
   </section>
 
   <footer class="footer">
