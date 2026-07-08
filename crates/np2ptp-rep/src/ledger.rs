@@ -72,6 +72,18 @@ where
         self.peers.get(peer).copied().unwrap_or_default()
     }
 
+    /// Sum of every peer's counters — one aggregate figure (e.g. "total bytes
+    /// served across all peers") instead of per-peer detail.
+    pub fn totals(&self) -> Counters {
+        let mut total = Counters::default();
+        for c in self.peers.values() {
+            total.served_to_us += c.served_to_us;
+            total.we_served += c.we_served;
+            total.credited_by_receipts += c.credited_by_receipts;
+        }
+        total
+    }
+
     /// Reciprocity score: how much a peer has given us beyond what we've given
     /// them. Positive = net giver (favor it), negative = net taker (choke it).
     pub fn reputation(&self, peer: &K) -> i64 {
@@ -173,6 +185,20 @@ mod tests {
         l.record_served(leech, 5000);
         let order = l.rank_for_unchoke(&[leech, ok, good], 2);
         assert_eq!(order, vec![good, ok]); // leech excluded from the 2 slots
+    }
+
+    #[test]
+    fn totals_sums_across_all_peers() {
+        let mut l = Ledger::new();
+        let a = pid(1);
+        let b = pid(2);
+        l.record_received(a, 1000);
+        l.record_served(a, 100);
+        l.record_received(b, 500);
+        l.record_served(b, 50);
+        let t = l.totals();
+        assert_eq!(t.served_to_us, 1500);
+        assert_eq!(t.we_served, 150);
     }
 
     #[test]
