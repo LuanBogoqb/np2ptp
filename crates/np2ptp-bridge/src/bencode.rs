@@ -49,13 +49,18 @@ fn err(msg: &str) -> BridgeError {
     BridgeError::Source(format!("bencode: {msg}"))
 }
 
+const MAX_DEPTH: usize = 32;
+
 /// Decode one bencode value from the front of `input`, returning it and the
 /// unconsumed remainder.
-fn decode(input: &[u8]) -> Result<(Value, &[u8]), BridgeError> {
+fn decode(input: &[u8], depth: usize) -> Result<(Value, &[u8]), BridgeError> {
+    if depth > MAX_DEPTH {
+        return Err(err("bencode nesting too deep"));
+    }
     match input.first() {
         Some(b'i') => decode_int(input),
-        Some(b'l') => decode_list(input),
-        Some(b'd') => decode_dict(input),
+        Some(b'l') => decode_list(input, depth),
+        Some(b'd') => decode_dict(input, depth),
         Some(b'0'..=b'9') => {
             let (b, rest) = decode_byte_string(input)?;
             Ok((Value::Bytes(b), rest))
@@ -84,7 +89,7 @@ fn decode_byte_string(input: &[u8]) -> Result<(Vec<u8>, &[u8]), BridgeError> {
     Ok((bytes.to_vec(), &input[end..]))
 }
 
-fn decode_list(input: &[u8]) -> Result<(Value, &[u8]), BridgeError> {
+fn decode_list(input: &[u8], depth: usize) -> Result<(Value, &[u8]), BridgeError> {
     let mut rest = input.strip_prefix(b"l").ok_or_else(|| err("expected 'l'"))?;
     let mut items = Vec::new();
     loop {
@@ -92,7 +97,7 @@ fn decode_list(input: &[u8]) -> Result<(Value, &[u8]), BridgeError> {
             Some(b'e') => return Ok((Value::List(items), &rest[1..])),
             None => return Err(err("unterminated list")),
             _ => {
-                let (v, r) = decode(rest)?;
+                let (v, r) = decode(rest, depth + 1)?;
                 items.push(v);
                 rest = r;
             }
@@ -100,7 +105,7 @@ fn decode_list(input: &[u8]) -> Result<(Value, &[u8]), BridgeError> {
     }
 }
 
-fn decode_dict(input: &[u8]) -> Result<(Value, &[u8]), BridgeError> {
+fn decode_dict(input: &[u8], depth: usize) -> Result<(Value, &[u8]), BridgeError> {
     let mut rest = input.strip_prefix(b"d").ok_or_else(|| err("expected 'd'"))?;
     let mut entries = Vec::new();
     loop {
@@ -109,7 +114,7 @@ fn decode_dict(input: &[u8]) -> Result<(Value, &[u8]), BridgeError> {
             None => return Err(err("unterminated dict")),
             _ => {
                 let (key, r) = decode_byte_string(rest)?;
-                let (v, r2) = decode(r)?;
+                let (v, r2) = decode(r, depth + 1)?;
                 entries.push((key, v));
                 rest = r2;
             }
@@ -133,7 +138,7 @@ fn find_info_offset(bytes: &[u8]) -> Result<usize, BridgeError> {
                 if key == b"info" {
                     return Ok(value_offset);
                 }
-                let (_, r2) = decode(r)?;
+                let (_, r2) = decode(r, 0)?;
                 rest = r2;
             }
         }
@@ -162,7 +167,7 @@ fn validate_relative_path(path: &str) -> Result<(), BridgeError> {
 pub fn parse_torrent_file(bytes: &[u8]) -> Result<TorrentMeta, BridgeError> {
     let info_offset = find_info_offset(bytes)?;
     let info_slice = &bytes[info_offset..];
-    let (info_value, info_rest) = decode(info_slice)?;
+    let (info_value, info_rest) = decode(info_slice, 0)?;
     let consumed = info_slice.len() - info_rest.len();
     let infohash = Sha1::digest(&info_slice[..consumed]).to_vec();
 
@@ -175,7 +180,8 @@ pub fn parse_torrent_file(bytes: &[u8]) -> Result<TorrentMeta, BridgeError> {
     let piece_length = info_value
         .dict_get(b"piece length")
         .and_then(Value::as_int)
-        .ok_or_else(|| err("info.piece length missing"))? as u32;
+        .ok_or_else(|| err("info.piece length missing"))?;
+    let piece_length = u32::try_from(piece_length).map_err(|_| err("info.piece length out of range"))?;
 
     let pieces = info_value
         .dict_get(b"pieces")
@@ -194,7 +200,8 @@ pub fn parse_torrent_file(bytes: &[u8]) -> Result<TorrentMeta, BridgeError> {
                 let length = entry
                     .dict_get(b"length")
                     .and_then(Value::as_int)
-                    .ok_or_else(|| err("files[].length missing"))? as u64;
+                    .ok_or_else(|| err("files[].length missing"))?;
+                let length = u64::try_from(length).map_err(|_| err("files[].length out of range"))?;
                 let path_segments = entry
                     .dict_get(b"path")
                     .and_then(Value::as_list)
@@ -214,7 +221,8 @@ pub fn parse_torrent_file(bytes: &[u8]) -> Result<TorrentMeta, BridgeError> {
             let length = info_value
                 .dict_get(b"length")
                 .and_then(Value::as_int)
-                .ok_or_else(|| err("single-file torrent missing info.length"))? as u64;
+                .ok_or_else(|| err("single-file torrent missing info.length"))?;
+            let length = u64::try_from(length).map_err(|_| err("info.length out of range"))?;
             validate_relative_path(&name)?;
             vec![TorrentFile { path: name.clone(), length }]
         }
@@ -356,6 +364,29 @@ mod tests {
         ]);
         let top = Value::Dict(vec![(b"info".to_vec(), info)]);
         let bytes = encode(&top);
+        assert!(parse_torrent_file(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_negative_piece_length() {
+        let info = Value::Dict(vec![
+            (b"length".to_vec(), Value::Int(100)),
+            (b"name".to_vec(), str_val("f.bin")),
+            (b"piece length".to_vec(), Value::Int(-1)),
+            (b"pieces".to_vec(), Value::Bytes(vec![1u8; 20])),
+        ]);
+        let top = Value::Dict(vec![(b"info".to_vec(), info)]);
+        let bytes = encode(&top);
+        assert!(parse_torrent_file(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_excessively_nested_input() {
+        // 100 nested empty lists inside a dict value, followed by unwinding 'e's.
+        let mut bytes = b"d4:infol".to_vec();
+        bytes.extend(std::iter::repeat_n(b'l', 100));
+        bytes.extend(std::iter::repeat_n(b'e', 100));
+        bytes.extend_from_slice(b"ee");
         assert!(parse_torrent_file(&bytes).is_err());
     }
 }
