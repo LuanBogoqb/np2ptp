@@ -52,8 +52,19 @@ mode.
 
 ## Page Structure (top to bottom)
 
-1. **Hero** — "NP2PTP" headline (serif), one-line pitch, a "View on GitHub"
-   button linking to the repo, and a secondary link to the latest release.
+0. **Nav bar** (sticky, thin) — "NP2PTP" wordmark on the left; in-page anchor
+   links (How it works, Examples, Research) in the middle; a GitHub mark-link
+   and a **"Download"** button on the right. This is the main repeated
+   "get back to the repo" affordance — collapses to a hamburger menu on
+   narrow viewports (the one place `script.js`'s mobile-nav toggle applies).
+1. **Hero** — "NP2PTP" headline (serif), one-line pitch, and two CTA buttons:
+   **"View on GitHub"** (links to the repo) and **"Download latest release"**
+   (links to `https://github.com/LuanBogoqb/np2ptp/releases/latest` — the
+   GitHub releases page itself, not a specific asset file, so it always shows
+   whatever platforms/assets the latest tag actually published; the page
+   already lists Windows/Linux clearly, so there is no need to guess the
+   visitor's OS or hardcode a filename that could drift from what CI
+   produces).
 2. **Problems it targets** — the three pain points from the README (NAT
    traversal, permanence/incentives, integrity/dedup), presented as three
    short cards, not a numbered list.
@@ -67,8 +78,14 @@ mode.
 5. **Research numbers** — the `np2ptp-sim` results table (dedup %, permanence,
    free-riding, FEC cost) from `docs/EXAMPLES.md`, presented as a small stat
    grid rather than a raw markdown table.
-6. **Footer** — links to the GitHub repo, releases, and the docs
-   (USAGE/EXAMPLES/BUILDING) already published on `main`.
+6. **Teaser** — a short, low-key section hinting at a native GUI (C#) in the
+   works, without committing to a timeline or feature list — something like
+   "the CLI is just the start — a proper desktop app is brewing." No mockups,
+   no roadmap, no signup form; this is a wink, not an announcement, and it
+   should read as one (light, a little playful, not a marketing promise).
+7. **Footer** — links to the GitHub repo, releases, and the docs
+   (USAGE/EXAMPLES/BUILDING) already published on `main` — the third and
+   last repo-link touchpoint, after the nav bar and the hero.
 
 ## File Structure
 
