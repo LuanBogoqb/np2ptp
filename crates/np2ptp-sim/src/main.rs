@@ -7,8 +7,8 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use np2ptp_sim::{
-    dedup, fec_cost, freeride, permanence, DedupResult, FecCostResult, FreerideResult,
-    PermanenceResult,
+    dedup, fec_cost, freeride, permanence, receipt_bootstraps_trust, DedupResult, FecCostResult,
+    FreerideResult, PermanenceResult, ReceiptTrustResult,
 };
 
 struct Results {
@@ -17,6 +17,7 @@ struct Results {
     perm_without: PermanenceResult,
     freeride_off: FreerideResult,
     freeride_on: FreerideResult,
+    receipt_trust: ReceiptTrustResult,
     fec: FecCostResult,
 }
 
@@ -30,6 +31,7 @@ async fn main() {
         perm_without: permanence(false).await,
         freeride_off: freeride(false).await,
         freeride_on: freeride(true).await,
+        receipt_trust: receipt_bootstraps_trust().await,
         fec: fec_cost().await,
     };
 
@@ -58,7 +60,9 @@ fn print_console(r: &Results) {
         b(r.perm_with.completed_after_seed_left), b(r.perm_without.completed_after_seed_left));
     println!("[3] Free-riding: leech completes with choke off = {}, choke on = {}",
         b(r.freeride_off.leech_completed), b(r.freeride_on.leech_completed));
-    println!("[4] FEC cost ({} bytes): chunk {} ms vs FEC {} ms",
+    println!("[4] Receipt-bootstrapped trust: cold peer (no receipt) completes = {}, vouched peer (receipt) completes = {}",
+        b(r.receipt_trust.cold_peer_completed), b(r.receipt_trust.vouched_peer_completed));
+    println!("[5] FEC cost ({} bytes): chunk {} ms vs FEC {} ms",
         r.fec.size, r.fec.chunk_ms, r.fec.fec_ms);
 }
 
@@ -71,6 +75,8 @@ fn build_csv(r: &Results) -> String {
     s.push_str(&format!("permanence,noreshare_completes,{}\n", r.perm_without.completed_after_seed_left as u8));
     s.push_str(&format!("freeride,choke_off_completes,{}\n", r.freeride_off.leech_completed as u8));
     s.push_str(&format!("freeride,choke_on_completes,{}\n", r.freeride_on.leech_completed as u8));
+    s.push_str(&format!("receipt_trust,cold_peer_completes,{}\n", r.receipt_trust.cold_peer_completed as u8));
+    s.push_str(&format!("receipt_trust,vouched_peer_completes,{}\n", r.receipt_trust.vouched_peer_completed as u8));
     s.push_str(&format!("fec,size_bytes,{}\n", r.fec.size));
     s.push_str(&format!("fec,chunk_ms,{}\n", r.fec.chunk_ms));
     s.push_str(&format!("fec,fec_ms,{}\n", r.fec.fec_ms));
@@ -97,6 +103,8 @@ fn build_markdown(r: &Results) -> String {
          | Permanence (seeder leaves) | new peer completes - without re-share | **{}** |\n\
          | Free-riding | leech completes - choke OFF | **{}** |\n\
          | Free-riding | leech completes - choke ON | **{}** |\n\
+         | Receipt-bootstrapped trust | cold peer (no receipt) completes | **{}** |\n\
+         | Receipt-bootstrapped trust | vouched peer (receipt) completes | **{}** |\n\
          | FEC cost ({} bytes) | chunk download | **{} ms** |\n\
          | FEC cost ({} bytes) | FEC (RaptorQ) download | **{} ms** |\n\n\
          ## Interpretation\n\n\
@@ -106,6 +114,10 @@ fn build_markdown(r: &Results) -> String {
            peer re-shared it. This is the swarm property that keeps files alive after seeders go.\n\
          - **Incentives** - the reputation choke cuts off a peer that takes without giving back,\n  \
            while honest peers are unaffected (BitTorrent's tit-for-tat, but with memory).\n\
+         - **Receipt-bootstrapped trust** - a peer that earned a signed receipt serving\n  \
+           someone else earlier is credited by a brand-new peer on first contact and is not\n  \
+           choked, while an equally cold peer with no receipt is — reputation that travels,\n  \
+           not memoryless tit-for-tat.\n\
          - **FEC cost** - with symbol batching and decode-once, erasure-coded download\n  \
            ~matches plain chunk download while adding any-*k*-of-*n* resilience. (Build in\n  \
            `release`; RaptorQ's GF(256) math is far slower in debug.)\n\n\
@@ -117,6 +129,8 @@ fn build_markdown(r: &Results) -> String {
         b(r.perm_without.completed_after_seed_left),
         b(r.freeride_off.leech_completed),
         b(r.freeride_on.leech_completed),
+        b(r.receipt_trust.cold_peer_completed),
+        b(r.receipt_trust.vouched_peer_completed),
         r.fec.size,
         r.fec.chunk_ms,
         r.fec.size,

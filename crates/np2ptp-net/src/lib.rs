@@ -15,6 +15,8 @@
 //! against the Merkle root before storing it — the same integrity guarantee the
 //! local client has, now over the wire.
 
+mod receipts;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -26,7 +28,8 @@ use libp2p::{
     upnp, yamux, StreamProtocol, Swarm,
 };
 use np2ptp_core::{Hash, Manifest};
-use np2ptp_rep::Ledger;
+use np2ptp_rep::{Identity, Ledger, Receipt};
+use crate::receipts::{ReceiptBag, ReceiptBagError};
 use np2ptp_store::Store;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -67,6 +70,10 @@ pub enum NetError {
     Shutdown,
     #[error("store error: {0}")]
     Store(#[from] np2ptp_store::StoreError),
+    #[error("ledger persistence: {0}")]
+    Ledger(#[from] np2ptp_rep::LedgerError),
+    #[error("receipt bag persistence: {0}")]
+    Receipts(#[from] ReceiptBagError),
     #[error("request to peer failed")]
     RequestFailed,
     #[error("peer did not have the requested manifest")]
@@ -81,8 +88,9 @@ pub enum NetError {
     NoProviders,
 }
 
-/// A request: a manifest by content id, a chunk by hash, or a RaptorQ repair
-/// symbol for a content id by index.
+/// A request: a manifest by content id, a chunk by hash, a RaptorQ repair
+/// symbol for a content id by index, a signed receipt to submit, or a pull
+/// for this peer's own collected receipts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Manifest([u8; 32]),
@@ -91,6 +99,12 @@ pub enum Request {
     /// A contiguous batch of RaptorQ symbols `[start, start+count)` — far fewer
     /// round-trips than fetching symbols one at a time.
     Symbols { root: [u8; 32], start: u32, count: u32 },
+    /// Sent by a client after a completed download: one signed receipt
+    /// crediting the server for bytes served this session.
+    SubmitReceipt(Receipt),
+    /// "Send me the receipts you've collected about yourself" — sent once,
+    /// to a peer this node has no ledger history for yet.
+    GetReceipts,
 }
 
 /// The matching response. `None` means the peer doesn't hold that item.
@@ -102,6 +116,9 @@ pub enum Response {
     /// Symbols for the requested range (may be shorter than asked near the end,
     /// empty once exhausted).
     Symbols(Vec<Vec<u8>>),
+    ReceiptAck,
+    /// This peer's own collected receipts (bounded, see `ReceiptBag`).
+    Receipts(Vec<Receipt>),
 }
 
 /// How many repair symbols a seeder generates per content, on top of the source
@@ -160,6 +177,10 @@ enum Command {
     FindProviders { root: Hash, reply: oneshot::Sender<Vec<PeerId>> },
     Request { peer: PeerId, request: Request, reply: oneshot::Sender<Result<Response, NetError>> },
     SetChokeThreshold { threshold: i64 },
+    /// Sign and send a receipt crediting `peer` for `bytes` this node
+    /// received from it. Fire-and-forget: the caller doesn't wait for the
+    /// server's acknowledgement.
+    SubmitReceipt { peer: PeerId, bytes: u64 },
     Reputation { peer: PeerId, reply: oneshot::Sender<i64> },
     PutRecord { key: Vec<u8>, value: Vec<u8>, reply: oneshot::Sender<bool> },
     GetRecord { key: Vec<u8>, reply: oneshot::Sender<Option<Vec<u8>>> },
@@ -186,11 +207,28 @@ impl Network {
     /// Build and spawn a node serving content from `store`. An optional 32-byte
     /// seed makes the peer identity deterministic (useful for tests).
     pub fn spawn(store: Store, seed: Option<[u8; 32]>) -> Result<Network, NetError> {
-        let keypair = match seed {
-            Some(mut bytes) => identity::Keypair::ed25519_from_bytes(&mut bytes)
-                .map_err(|e| NetError::Build(e.to_string()))?,
-            None => identity::Keypair::generate_ed25519(),
+        // A caller-supplied seed means this node keeps a stable identity
+        // across restarts (e.g. `serve`/`relay` persisting `identity.key`)
+        // — in that case its ledger and receipt bag are persisted alongside
+        // it too. With no seed, generate the random bytes ourselves (instead
+        // of letting libp2p's own RNG hide them) so the same 32 bytes build
+        // both the libp2p keypair and the paired `np2ptp_rep::Identity`
+        // used to sign outgoing receipts.
+        let persistent = seed.is_some();
+        let mut seed_bytes = match seed {
+            Some(bytes) => bytes,
+            None => {
+                let mut bytes = [0u8; 32];
+                getrandom::getrandom(&mut bytes).map_err(|e| NetError::Build(e.to_string()))?;
+                bytes
+            }
         };
+        // Build the rep identity BEFORE the libp2p keypair: `ed25519_from_bytes`
+        // zeroizes its input buffer once it's done with it, so building the
+        // rep identity second would sign with an all-zero seed.
+        let rep_identity = Identity::from_seed(seed_bytes);
+        let keypair = identity::Keypair::ed25519_from_bytes(&mut seed_bytes)
+            .map_err(|e| NetError::Build(e.to_string()))?;
         let local_peer_id = keypair.public().to_peer_id();
 
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -229,8 +267,18 @@ impl Network {
             .kad
             .set_mode(Some(kad::Mode::Server));
 
+        let (ledger, receipts) = if persistent {
+            let root = store.root();
+            (
+                Ledger::open(root.join("ledger.bin"))?,
+                ReceiptBag::open(root.join("receipts.bin"))?,
+            )
+        } else {
+            (Ledger::new(), ReceiptBag::new())
+        };
+
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
-        tokio::spawn(EventLoop::new(swarm, store, cmd_rx).run());
+        tokio::spawn(EventLoop::new(swarm, store, cmd_rx, ledger, receipts, rep_identity).run());
         Ok(Network { cmd_tx, local_peer_id })
     }
 
@@ -295,6 +343,13 @@ impl Network {
     /// Default is effectively unlimited (no choking).
     pub async fn set_choke_threshold(&self, threshold: i64) -> Result<(), NetError> {
         self.send(Command::SetChokeThreshold { threshold }).await
+    }
+
+    /// Credit `peer` with a signed receipt for `bytes` this node received
+    /// from it. Called automatically after a successful download; best
+    /// effort — a delivery failure does not undo the download.
+    pub async fn submit_receipt(&self, peer: PeerId, bytes: u64) -> Result<(), NetError> {
+        self.send(Command::SubmitReceipt { peer, bytes }).await
     }
 
     /// This node's recorded reputation for `peer` (positive = net giver).
@@ -445,10 +500,12 @@ impl Network {
 
         let mut symbols: Vec<Vec<u8>> = Vec::new();
         let mut start = 0u32;
+        let mut fetched_bytes: u64 = 0;
         let decoded = loop {
             let batch = self.fetch_symbols(provider, root, start, FEC_BATCH).await?;
             let exhausted = batch.is_empty();
             start += batch.len() as u32;
+            fetched_bytes += batch.iter().map(|s| s.len() as u64).sum::<u64>();
             symbols.extend(batch);
             on_progress(symbols.len().min(need), need);
 
@@ -470,6 +527,9 @@ impl Network {
             return Err(NetError::BadChunk);
         }
         into.ingest_tree(&files, manifest.name.clone())?;
+        if fetched_bytes > 0 {
+            let _ = self.submit_receipt(provider, fetched_bytes).await;
+        }
         Ok(manifest)
     }
 
@@ -528,17 +588,29 @@ impl Network {
             })
             .buffer_unordered(PARALLEL);
 
+        let mut fetched_bytes: u64 = 0;
         while let Some(result) = stream.next().await {
             let (i, bytes) = result?;
             if !manifest.chunk_hash_ok(i, &bytes) {
                 return Err(NetError::BadChunk);
             }
+            fetched_bytes += bytes.len() as u64;
             into.put(&bytes)?;
             done += 1;
             on_progress(done, total);
         }
+        if fetched_bytes > 0 {
+            let _ = self.submit_receipt(provider, fetched_bytes).await;
+        }
         Ok(manifest)
     }
+}
+
+/// What an internally-initiated outbound request (one `EventLoop` sent to
+/// itself, not on behalf of a `Network` handle call) was for.
+enum InternalRequest {
+    GetReceipts,
+    SubmitReceiptAck,
 }
 
 /// The background task owning the swarm.
@@ -561,10 +633,35 @@ struct EventLoop {
     choke_threshold: i64,
     /// Cache of RaptorQ symbols per content id, generated lazily on first request.
     symbols: HashMap<Hash, Vec<Vec<u8>>>,
+    /// This node's own signing identity, paired with its libp2p keypair.
+    rep_identity: Identity,
+    /// Bridges a connected peer's libp2p `PeerId` to its Ed25519 `rep::PeerId`,
+    /// learned from `identify` — needed to confirm a presented receipt is
+    /// genuinely about the peer presenting it.
+    rep_peers: HashMap<PeerId, np2ptp_rep::PeerId>,
+    /// Receipts collected about this node, presented to new peers on request.
+    receipts: ReceiptBag,
+    /// Outbound requests this `EventLoop` issued on its own initiative
+    /// (not on behalf of an external `Network` handle call), tagged with
+    /// what to do once the response arrives.
+    pending_internal: HashMap<request_response::OutboundRequestId, InternalRequest>,
+    /// Peers we have already sent a `GetReceipts` pull to, so we never send
+    /// a second one even if `identify` fires again for the same peer before
+    /// the first response arrives.
+    receipts_pulled_from: std::collections::HashSet<PeerId>,
+    /// Monotonic counter for receipts this node issues (see `Receipt::epoch`).
+    next_receipt_epoch: u64,
 }
 
 impl EventLoop {
-    fn new(swarm: Swarm<Behaviour>, store: Store, cmd_rx: mpsc::Receiver<Command>) -> EventLoop {
+    fn new(
+        swarm: Swarm<Behaviour>,
+        store: Store,
+        cmd_rx: mpsc::Receiver<Command>,
+        ledger: Ledger<PeerId>,
+        receipts: ReceiptBag,
+        rep_identity: Identity,
+    ) -> EventLoop {
         EventLoop {
             swarm,
             store,
@@ -574,9 +671,15 @@ impl EventLoop {
             pending_providers: HashMap::new(),
             pending_put: HashMap::new(),
             pending_get: HashMap::new(),
-            ledger: Ledger::new(),
+            ledger,
             choke_threshold: i64::MAX, // no choking until configured
             symbols: HashMap::new(),
+            rep_identity,
+            rep_peers: HashMap::new(),
+            receipts,
+            pending_internal: HashMap::new(),
+            receipts_pulled_from: std::collections::HashSet::new(),
+            next_receipt_epoch: 0,
         }
     }
 
@@ -631,6 +734,17 @@ impl EventLoop {
             Command::SetChokeThreshold { threshold } => {
                 self.choke_threshold = threshold;
             }
+            Command::SubmitReceipt { peer, bytes } => {
+                if let Some(&server) = self.rep_peers.get(&peer) {
+                    let epoch = self.next_receipt_epoch;
+                    self.next_receipt_epoch += 1;
+                    let receipt = Receipt::issue(&self.rep_identity, server, bytes, epoch);
+                    let id = self.swarm.behaviour_mut().rr.send_request(&peer, Request::SubmitReceipt(receipt));
+                    self.pending_internal.insert(id, InternalRequest::SubmitReceiptAck);
+                }
+                // If we haven't identified this peer yet, there's no rep::PeerId
+                // to credit — silently skip (best-effort, per submit_receipt's contract).
+            }
             Command::Reputation { peer, reply } => {
                 let _ = reply.send(self.ledger.reputation(&peer));
             }
@@ -671,6 +785,22 @@ impl EventLoop {
                 for addr in info.listen_addrs {
                     self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                 }
+                // Bridge this peer's libp2p identity to its Ed25519 rep::PeerId
+                // (every np2ptp node's key is Ed25519, so this always succeeds
+                // in practice) and, if we have no history for it yet, pull its
+                // collected receipts once — reputation that travels, instead
+                // of starting cold with every peer we meet.
+                if let Ok(ed_pk) = info.public_key.clone().try_into_ed25519() {
+                    let rep_peer = np2ptp_rep::PeerId::from_bytes(ed_pk.to_bytes());
+                    self.rep_peers.insert(peer_id, rep_peer);
+                    if !self.receipts_pulled_from.contains(&peer_id)
+                        && self.ledger.counters(&peer_id) == Counters::default()
+                    {
+                        self.receipts_pulled_from.insert(peer_id);
+                        let id = self.swarm.behaviour_mut().rr.send_request(&peer_id, Request::GetReceipts);
+                        self.pending_internal.insert(id, InternalRequest::GetReceipts);
+                    }
+                }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Upnp(event)) => match event {
                 upnp::Event::NewExternalAddr(addr) => {
@@ -702,17 +832,51 @@ impl EventLoop {
                     if let Response::Chunk(Some(data)) = &response {
                         self.ledger.record_received(peer, data.len() as u64);
                     }
-                    if let Some(reply) = self.pending_req.remove(&request_id) {
-                        let _ = reply.send(Ok(response));
+                    match self.pending_internal.remove(&request_id) {
+                        Some(InternalRequest::GetReceipts) => self.handle_receipts_response(peer, response),
+                        Some(InternalRequest::SubmitReceiptAck) => {} // nothing to do with a bare ack
+                        None => {
+                            if let Some(reply) = self.pending_req.remove(&request_id) {
+                                let _ = reply.send(Ok(response));
+                            }
+                        }
                     }
                 }
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
+                self.pending_internal.remove(&request_id);
                 if let Some(reply) = self.pending_req.remove(&request_id) {
                     let _ = reply.send(Err(NetError::RequestFailed));
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Handle a peer's answer to our `GetReceipts` pull: verify each receipt
+    /// and, only if it's genuinely about the peer that presented it, credit
+    /// that peer in our own ledger. Deduplicates by (client, epoch) within
+    /// this response so a peer can't inflate its credit by repeating the
+    /// same receipt.
+    ///
+    /// Note: this proves *a* key vouched for the peer, not that the voucher
+    /// is a distinct real peer — see "Trust model / limitations" in the
+    /// design doc for what this feature does and doesn't defend against.
+    fn handle_receipts_response(&mut self, peer: PeerId, response: Response) {
+        let Response::Receipts(receipts) = response else { return };
+        let Some(&expected_server) = self.rep_peers.get(&peer) else { return };
+        let mut seen = std::collections::HashSet::new();
+        let mut credited_any = false;
+        for r in receipts {
+            if r.verify() && r.server == expected_server && seen.insert((r.client, r.epoch)) {
+                self.ledger.credit_receipt(peer, r.bytes);
+                credited_any = true;
+            }
+        }
+        if credited_any {
+            if let Err(e) = self.ledger.save() {
+                eprintln!("np2ptp: failed to persist ledger: {e}");
+            }
         }
     }
 
@@ -751,6 +915,28 @@ impl EventLoop {
                 }
                 Response::Symbols(syms)
             }
+            Request::SubmitReceipt(receipt) => {
+                // A receipt must actually be about *this* node — otherwise an
+                // attacker can submit arbitrary high-`bytes` receipts naming
+                // someone else's `server`/a throwaway `client` key, evicting
+                // our real earned receipts out of the (capped) bag via the
+                // highest-`bytes`-wins insert policy. Also reject the
+                // degenerate case of a peer vouching for itself
+                // (`client == server`) — only a partial mitigation for
+                // Sybil self-dealing (see the design doc's "Trust model /
+                // limitations"), but it blocks the laziest form.
+                if receipt.verify()
+                    && receipt.server == self.rep_identity.peer_id()
+                    && receipt.client != receipt.server
+                {
+                    self.receipts.insert(receipt);
+                    if let Err(e) = self.receipts.save() {
+                        eprintln!("np2ptp: failed to persist receipts: {e}");
+                    }
+                }
+                Response::ReceiptAck
+            }
+            Request::GetReceipts => Response::Receipts(self.receipts.list().to_vec()),
         }
     }
 

@@ -60,6 +60,13 @@ impl Store {
         Ok(Store { objects, refs_path, refs: RwLock::new(refs) })
     }
 
+    /// The directory this store was opened with (what was passed to
+    /// [`Store::open`]) — used by callers that need to keep sidecar files
+    /// (e.g. a persisted network identity or ledger) next to the store.
+    pub fn root(&self) -> PathBuf {
+        self.objects.parent().expect("objects is always <dir>/objects").to_path_buf()
+    }
+
     fn path_for(&self, h: &Hash) -> PathBuf {
         let hex = h.to_hex();
         self.objects.join(&hex[..2]).join(&hex)
@@ -789,6 +796,13 @@ mod tests {
         // At least one call must report done > a_data.len(), proving progress
         // continued into the second file rather than stopping at the first.
         assert!(calls.iter().any(|(done, _, _)| *done > a_data.len() as u64));
+    }
+
+    #[test]
+    fn root_returns_the_directory_passed_to_open() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.root(), dir.path());
     }
 
     #[test]

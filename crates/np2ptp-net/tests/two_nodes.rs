@@ -432,3 +432,134 @@ async fn missing_content_is_reported_not_hung() {
     }
     assert!(saw_answer);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receipt_from_a_download_lets_a_third_party_credit_the_server() {
+    // A serves some content; B downloads it, which should automatically send
+    // A a signed receipt crediting A for the bytes served.
+    let a_dir = TmpDir::new();
+    let a_store = Store::open(a_dir.path()).unwrap();
+    let data = sample(300_000, 70);
+    let manifest = a_store.ingest(&data, None).unwrap();
+    let root = manifest.root;
+
+    let a = Network::spawn(a_store, Some([70u8; 32])).unwrap();
+    a.listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .await
+        .unwrap();
+    let a_addr = first_listen_addr(&a).await;
+    let a_peer = a.local_peer_id();
+    a.provide(&manifest).await.unwrap();
+
+    let b_dir = TmpDir::new();
+    let b = Network::spawn(Store::open(b_dir.path()).unwrap(), Some([71u8; 32])).unwrap();
+    let b_store = Store::open(b_dir.path()).unwrap();
+    b.dial(a_addr.clone()).await.unwrap();
+
+    for _ in 0..100 {
+        if b.download(root, a_peer, &b_store).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // C has no prior history with A. On connecting, C should pull A's receipt
+    // bag (which now holds B's receipt crediting A), verify it, and credit A
+    // — even though C never transacted with A directly.
+    let c_dir = TmpDir::new();
+    let c = Network::spawn(Store::open(c_dir.path()).unwrap(), Some([72u8; 32])).unwrap();
+    c.dial(a_addr).await.unwrap();
+
+    let mut credited = false;
+    for _ in 0..100 {
+        if c.reputation(a_peer).await.unwrap() > 0 {
+            credited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(credited, "C should credit A via A's receipt from B, despite no direct history");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_peer_with_a_receipt_is_not_choked() {
+    // B earns a receipt by serving a file to an earlier downloader. The choke
+    // threshold below is 0 (zero tolerance for negative reputation, see
+    // `choke_blocks_a_non_reciprocating_peer`), so the credited receipt has to
+    // cover the *entire* subsequent download for B to never dip negative —
+    // hence the voucher is sized comfortably larger than the real content.
+    let b_dir = TmpDir::new();
+    let b_store = Store::open(b_dir.path()).unwrap();
+    let voucher_data = sample(400_000, 60);
+    let voucher_manifest = b_store.ingest(&voucher_data, None).unwrap();
+    let voucher_root = voucher_manifest.root;
+
+    let b = Network::spawn(b_store, Some([60u8; 32])).unwrap();
+    b.listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .await
+        .unwrap();
+    let b_addr = first_listen_addr(&b).await;
+    let b_peer = b.local_peer_id();
+    b.provide(&voucher_manifest).await.unwrap();
+
+    let earlier_dir = TmpDir::new();
+    let earlier = Network::spawn(Store::open(earlier_dir.path()).unwrap(), Some([61u8; 32])).unwrap();
+    let earlier_store = Store::open(earlier_dir.path()).unwrap();
+    earlier.dial(b_addr.clone()).await.unwrap();
+    let mut earned = false;
+    for _ in 0..100 {
+        if earlier.download(voucher_root, b_peer, &earlier_store).await.is_ok() {
+            earned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(earned, "setup: B must earn a receipt from the earlier download");
+    // Give B's EventLoop a moment to receive and store the auto-submitted receipt.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A strict seed serving the real content: any net-negative peer is
+    // choked after its first freebie chunk.
+    let data = sample(300_000, 61);
+    let seed_dir = TmpDir::new();
+    let seed_store = Store::open(seed_dir.path()).unwrap();
+    let manifest = seed_store.ingest(&data, None).unwrap();
+    let root = manifest.root;
+    let seed = Network::spawn(seed_store, Some([62u8; 32])).unwrap();
+    seed.listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .await
+        .unwrap();
+    let seed_addr = first_listen_addr(&seed).await;
+    let seed_peer = seed.local_peer_id();
+    seed.provide(&manifest).await.unwrap();
+    seed.set_choke_threshold(0).await.unwrap();
+
+    // B, cold to the seed but carrying a receipt, should not be choked.
+    let b_download_dir = TmpDir::new();
+    let b_download_store = Store::open(b_download_dir.path()).unwrap();
+    b.dial(seed_addr.clone()).await.unwrap();
+    let mut b_completed = false;
+    for _ in 0..60 {
+        if b.download(root, seed_peer, &b_download_store).await.is_ok() {
+            b_completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(b_completed, "a peer vouched for by a receipt should not be choked");
+
+    // A, equally cold but with no receipt, should be choked.
+    let a_dir = TmpDir::new();
+    let a = Network::spawn(Store::open(a_dir.path()).unwrap(), Some([63u8; 32])).unwrap();
+    let a_store = Store::open(a_dir.path()).unwrap();
+    a.dial(seed_addr).await.unwrap();
+    let mut a_completed = false;
+    for _ in 0..60 {
+        if a.download(root, seed_peer, &a_store).await.is_ok() {
+            a_completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!a_completed, "a cold peer with no receipt should still be choked");
+}

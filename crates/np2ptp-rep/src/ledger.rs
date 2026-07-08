@@ -68,6 +68,14 @@ where
         self.peers.entry(to).or_default().we_served += bytes;
     }
 
+    /// Credit `peer` with `bytes` on the strength of a receipt whose
+    /// cryptographic validity the caller has already checked — this method
+    /// itself does no verification, so callers must call it only after
+    /// confirming the receipt is genuinely about `peer`.
+    pub fn credit_receipt(&mut self, peer: K, bytes: u64) {
+        self.peers.entry(peer).or_default().credited_by_receipts += bytes;
+    }
+
     pub fn counters(&self, peer: &K) -> Counters {
         self.peers.get(peer).copied().unwrap_or_default()
     }
@@ -84,11 +92,12 @@ where
         total
     }
 
-    /// Reciprocity score: how much a peer has given us beyond what we've given
-    /// them. Positive = net giver (favor it), negative = net taker (choke it).
+    /// Reciprocity score: how much a peer has given us (directly, or vouched
+    /// for by a valid third-party receipt) beyond what we've given them.
+    /// Positive = net giver (favor it), negative = net taker (choke it).
     pub fn reputation(&self, peer: &K) -> i64 {
         let c = self.counters(peer);
-        c.served_to_us as i64 - c.we_served as i64
+        c.served_to_us as i64 + c.credited_by_receipts as i64 - c.we_served as i64
     }
 
     /// Pick which peers to unchoke: the `slots` candidates with the highest
@@ -229,5 +238,24 @@ mod tests {
         let reopened: Ledger<PeerId> = Ledger::open(&path).unwrap();
         assert_eq!(reopened.reputation(&peer), 1200);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn credited_receipts_add_to_reputation() {
+        let mut l = Ledger::new();
+        let client = Identity::from_seed([9u8; 32]);
+        let peer = pid(6);
+        let r = Receipt::issue(&client, peer, 5000, 1);
+        assert!(l.apply_receipt(&r));
+        assert_eq!(l.reputation(&peer), 5000);
+    }
+
+    #[test]
+    fn credit_receipt_adds_without_needing_a_full_receipt_object() {
+        let mut l: Ledger<PeerId> = Ledger::new();
+        let peer = pid(7);
+        l.credit_receipt(peer, 2500);
+        assert_eq!(l.counters(&peer).credited_by_receipts, 2500);
+        assert_eq!(l.reputation(&peer), 2500);
     }
 }
