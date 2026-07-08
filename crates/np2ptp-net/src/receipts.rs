@@ -42,8 +42,12 @@ impl ReceiptBag {
         Ok(ReceiptBag { receipts, path: Some(path) })
     }
 
-    /// Insert `r`, then keep only the `MAX_RECEIPTS` highest-`bytes` entries.
+    /// Insert `r` unless it's an exact duplicate of one already held, then
+    /// keep only the `MAX_RECEIPTS` highest-`bytes` entries.
     pub fn insert(&mut self, r: Receipt) {
+        if self.receipts.contains(&r) {
+            return;
+        }
         self.receipts.push(r);
         self.receipts.sort_by_key(|r| std::cmp::Reverse(r.bytes));
         self.receipts.truncate(MAX_RECEIPTS);
@@ -115,5 +119,16 @@ mod tests {
         assert_eq!(reopened.list().len(), 1);
         assert_eq!(reopened.list()[0].bytes, 4096);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn insert_ignores_an_exact_duplicate() {
+        let mut bag = ReceiptBag::new();
+        let client = Identity::from_seed([5u8; 32]);
+        let server = Identity::from_seed([6u8; 32]).peer_id();
+        let r = Receipt::issue(&client, server, 1000, 1);
+        bag.insert(r.clone());
+        bag.insert(r);
+        assert_eq!(bag.list().len(), 1, "submitting the same receipt twice should not double-count it");
     }
 }

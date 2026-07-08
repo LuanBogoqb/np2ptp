@@ -645,6 +645,10 @@ struct EventLoop {
     /// (not on behalf of an external `Network` handle call), tagged with
     /// what to do once the response arrives.
     pending_internal: HashMap<request_response::OutboundRequestId, InternalRequest>,
+    /// Peers we have already sent a `GetReceipts` pull to, so we never send
+    /// a second one even if `identify` fires again for the same peer before
+    /// the first response arrives.
+    receipts_pulled_from: std::collections::HashSet<PeerId>,
     /// Monotonic counter for receipts this node issues (see `Receipt::epoch`).
     next_receipt_epoch: u64,
 }
@@ -674,6 +678,7 @@ impl EventLoop {
             rep_peers: HashMap::new(),
             receipts,
             pending_internal: HashMap::new(),
+            receipts_pulled_from: std::collections::HashSet::new(),
             next_receipt_epoch: 0,
         }
     }
@@ -788,7 +793,10 @@ impl EventLoop {
                 if let Ok(ed_pk) = info.public_key.clone().try_into_ed25519() {
                     let rep_peer = np2ptp_rep::PeerId::from_bytes(ed_pk.to_bytes());
                     self.rep_peers.insert(peer_id, rep_peer);
-                    if self.ledger.counters(&peer_id) == Counters::default() {
+                    if !self.receipts_pulled_from.contains(&peer_id)
+                        && self.ledger.counters(&peer_id) == Counters::default()
+                    {
+                        self.receipts_pulled_from.insert(peer_id);
                         let id = self.swarm.behaviour_mut().rr.send_request(&peer_id, Request::GetReceipts);
                         self.pending_internal.insert(id, InternalRequest::GetReceipts);
                     }
@@ -846,17 +854,24 @@ impl EventLoop {
 
     /// Handle a peer's answer to our `GetReceipts` pull: verify each receipt
     /// and, only if it's genuinely about the peer that presented it, credit
-    /// that peer in our own ledger.
+    /// that peer in our own ledger. Deduplicates by (client, epoch) within
+    /// this response so a peer can't inflate its credit by repeating the
+    /// same receipt.
     fn handle_receipts_response(&mut self, peer: PeerId, response: Response) {
         let Response::Receipts(receipts) = response else { return };
         let Some(&expected_server) = self.rep_peers.get(&peer) else { return };
+        let mut seen = std::collections::HashSet::new();
+        let mut credited_any = false;
         for r in receipts {
-            if r.verify() && r.server == expected_server {
+            if r.verify() && r.server == expected_server && seen.insert((r.client, r.epoch)) {
                 self.ledger.credit_receipt(peer, r.bytes);
+                credited_any = true;
             }
         }
-        if let Err(e) = self.ledger.save() {
-            eprintln!("np2ptp: failed to persist ledger: {e}");
+        if credited_any {
+            if let Err(e) = self.ledger.save() {
+                eprintln!("np2ptp: failed to persist ledger: {e}");
+            }
         }
     }
 
