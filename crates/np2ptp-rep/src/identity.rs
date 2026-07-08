@@ -10,7 +10,7 @@ use std::fmt;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-/// A peer's public identity â€” the 32-byte Ed25519 verifying key.
+/// A peer's public identity — the 32-byte Ed25519 verifying key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PeerId([u8; 32]);
 
@@ -51,7 +51,7 @@ impl PeerId {
 
 impl fmt::Debug for PeerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PeerId({}â€¦)", &self.to_hex()[..12])
+        write!(f, "PeerId({}…)", &self.to_hex()[..12])
     }
 }
 
@@ -61,7 +61,7 @@ impl fmt::Display for PeerId {
     }
 }
 
-/// A peer's secret identity â€” holds the signing key. Keep this private; share
+/// A peer's secret identity — holds the signing key. Keep this private; share
 /// only the [`PeerId`].
 pub struct Identity {
     signing: SigningKey,

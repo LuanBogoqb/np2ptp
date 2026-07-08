@@ -1,7 +1,7 @@
 //! The contribution ledger: per-peer accounting that drives choke/unchoke.
 //!
 //! BitTorrent's tit-for-tat favors peers who are currently uploading to you, but
-//! forgets them as soon as the connection ends â€” so seeding earns nothing
+//! forgets them as soon as the connection ends — so seeding earns nothing
 //! lasting and the system leans on altruism. Here every peer's give-and-take is
 //! remembered and (optionally) persisted, so a peer that has served you in the
 //! past keeps priority later, and a pure leech is deprioritized.
@@ -69,7 +69,7 @@ where
     }
 
     /// Credit `peer` with `bytes` on the strength of a receipt whose
-    /// cryptographic validity the caller has already checked â€” this method
+    /// cryptographic validity the caller has already checked — this method
     /// itself does no verification, so callers must call it only after
     /// confirming the receipt is genuinely about `peer`.
     pub fn credit_receipt(&mut self, peer: K, bytes: u64) {
@@ -80,7 +80,7 @@ where
         self.peers.get(peer).copied().unwrap_or_default()
     }
 
-    /// Sum of every peer's counters â€” one aggregate figure (e.g. "total bytes
+    /// Sum of every peer's counters — one aggregate figure (e.g. "total bytes
     /// served across all peers") instead of per-peer detail.
     pub fn totals(&self) -> Counters {
         let mut total = Counters::default();
