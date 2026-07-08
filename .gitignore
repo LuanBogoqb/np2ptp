@@ -9,3 +9,6 @@ download/
 # Generated research reports (regenerate with `cargo run -p np2ptp-sim`)
 /reports/
 # (Cargo.lock is committed — this workspace ships a binary)
+
+# Subagent-driven-development scratch (task briefs, reports, review diffs, ledgers)
+.superpowers/
