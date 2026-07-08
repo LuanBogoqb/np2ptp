@@ -35,6 +35,9 @@ use sha1::{Digest, Sha1};
 mod bencode;
 pub use bencode::parse_torrent_file;
 
+mod streaming;
+pub use streaming::{convert_local, resolve_or_convert_local, verify_pieces_streaming};
+
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
     #[error(transparent)]
