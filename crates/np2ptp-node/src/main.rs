@@ -250,7 +250,9 @@ fn cmd_get(args: &[String]) -> Result<(), Box<dyn Error>> {
             "{}",
             serde_json::json!({
                 "event":"result","op":"get",
+                "root": manifest.uri(),
                 "path": dest,
+                "bytes_total": manifest.total_size,
                 "chunks_fetched": report.fetched,
                 "chunks_deduped": report.deduped,
             })
@@ -427,22 +429,26 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
         net.provide(&manifest).await?;
         let peer = net.local_peer_id();
 
-        println!(
-            "serving {} ({} files, {} chunks)",
-            manifest.uri(),
-            manifest.files.len(),
-            manifest.chunks.len()
-        );
+        if !json {
+            println!(
+                "serving {} ({} files, {} chunks)",
+                manifest.uri(),
+                manifest.files.len(),
+                manifest.chunks.len()
+            );
+        }
         let addrs = wait_for_listeners(&net).await;
-        if addrs.is_empty() {
-            println!("peer id: {peer} (no listen address yet)");
-        } else {
-            println!("direct fetch:");
-            for a in &addrs {
-                println!("  np2ptp fetch {} --peer {a}/p2p/{peer}", manifest.uri());
-            }
-            if !no_tracker {
-                println!("or, once announced, just: np2ptp fetch {}   (peers found via the tracker)", manifest.uri());
+        if !json {
+            if addrs.is_empty() {
+                println!("peer id: {peer} (no listen address yet)");
+            } else {
+                println!("direct fetch:");
+                for a in &addrs {
+                    println!("  np2ptp fetch {} --peer {a}/p2p/{peer}", manifest.uri());
+                }
+                if !no_tracker {
+                    println!("or, once announced, just: np2ptp fetch {}   (peers found via the tracker)", manifest.uri());
+                }
             }
         }
 
@@ -456,7 +462,9 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
                 format!("/ip4/{p}/udp/{port}/quic-v1").parse()?
             };
             net.add_external_address(ext.clone()).await?;
-            println!("public address: {ext}/p2p/{peer}");
+            if !json {
+                println!("public address: {ext}/p2p/{peer}");
+            }
         }
 
         // Try NAT-PMP / PCP for a public address (complements net's UPnP/IGD).
@@ -469,7 +477,9 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
                             format!("/ip4/{ip}/udp/{}/quic-v1", mapped.external_port).parse::<Multiaddr>()
                         {
                             let _ = net.add_external_address(ext.clone()).await;
-                            println!("NAT-PMP/PCP: public address {ext}/p2p/{peer}");
+                            if !json {
+                                println!("NAT-PMP/PCP: public address {ext}/p2p/{peer}");
+                            }
                         }
                     }
                     Some(mapped)
@@ -502,7 +512,9 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
         } else if let Some(r) = relay_override {
             Some(r)
         } else if !has_external {
-            println!("no direct/UPnP/NAT-PMP public address — falling back to public relay");
+            if !json {
+                println!("no direct/UPnP/NAT-PMP public address — falling back to public relay");
+            }
             Some(DEFAULT_RELAY.to_string())
         } else {
             None
@@ -512,7 +524,9 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
         // forward, where UPnP and NAT-PMP/PCP both have nothing to work with.
         if let Some(r) = &relay_addr_str {
             let relay_addr: Multiaddr = r.parse()?;
-            println!("relay: dialing {relay_addr} ...");
+            if !json {
+                println!("relay: dialing {relay_addr} ...");
+            }
             net.dial(relay_addr.clone()).await?;
             // The reservation needs an established connection to the relay first.
             tokio::time::sleep(Duration::from_millis(800)).await;
@@ -531,7 +545,9 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             if got_circuit {
-                println!("relay: reservation ok -> {relay_addr}/p2p-circuit/p2p/{peer}");
+                if !json {
+                    println!("relay: reservation ok -> {relay_addr}/p2p-circuit/p2p/{peer}");
+                }
                 if !no_tracker {
                     let addrs = net.listeners().await.unwrap_or_default();
                     if let Err(e) = tracker::announce(&tracker_url, manifest.root, peer, &addrs).await {
@@ -651,7 +667,13 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
         };
 
         let mut last_emit = std::time::Instant::now();
+        let mut first_done: Option<usize> = None;
+        let mut last_total: usize = 0;
         let mut on_progress = |done: usize, total: usize| {
+            if first_done.is_none() {
+                first_done = Some(done);
+            }
+            last_total = total;
             if json {
                 let now = std::time::Instant::now();
                 if done == total || now.duration_since(last_emit) >= Duration::from_millis(100) {
@@ -694,6 +716,8 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
 
         let dest = write_output(&into, &manifest, out_flag)?;
         if json {
+            let deduped = first_done.unwrap_or(0);
+            let fetched = last_total.saturating_sub(deduped);
             println!(
                 "{}",
                 serde_json::json!({
@@ -701,6 +725,8 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
                     "root": manifest.uri(),
                     "path": dest,
                     "bytes_total": manifest.total_size,
+                    "chunks_fetched": fetched,
+                    "chunks_deduped": deduped,
                 })
             );
         } else {

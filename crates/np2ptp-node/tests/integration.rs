@@ -282,3 +282,64 @@ fn get_json_emits_valid_ndjson_and_a_final_result_event() {
         .unwrap_or_else(|e| panic!("last line not valid JSON: {:?}: {e}", lines.last()));
     assert_eq!(last["event"], "result", "expected the LAST line to be the result event, got: {stdout}");
 }
+
+#[test]
+fn serve_json_emits_only_valid_ndjson() {
+    let dir = TmpDir::new();
+    let input = dir.path().join("f.bin");
+    std::fs::write(&input, sample(200_000, 60)).unwrap();
+    let store_dir = dir.path().join("store");
+    let out = dir.path().join("f.nptp");
+
+    let pack_output = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
+        .arg("pack")
+        .arg(&input)
+        .arg("--store")
+        .arg(&store_dir)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(pack_output.status.success());
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
+        .arg("serve")
+        .arg(&out)
+        .arg("--store")
+        .arg(&store_dir)
+        .arg("--no-relay")
+        .arg("--no-tracker")
+        .arg("--json")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    // Let it run long enough to emit at least one status tick. cmd_serve spends
+    // ~3s polling for an external address (has_external loop) before it even
+    // reaches the 2s status_interval tick, so the first line lands around 4-5s in.
+    std::thread::sleep(std::time::Duration::from_millis(6000));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let captured = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or_default();
+    let lines: Vec<&str> = captured.lines().filter(|l| !l.is_empty()).collect();
+    assert!(!lines.is_empty(), "expected at least one NDJSON line from serve --json");
+    for line in &lines {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("line not valid JSON: {line:?}: {e}"));
+        assert_eq!(v["op"], "serve");
+    }
+    assert!(
+        lines.iter().any(|l| l.contains("\"event\":\"status\"")),
+        "expected at least one status event, got: {captured}"
+    );
+}
