@@ -286,6 +286,10 @@ pub async fn receipt_bootstraps_trust() -> ReceiptTrustResult {
     // "B" earns a receipt by serving a small file to some earlier downloader.
     let b_dir = TmpDir::new();
     let b_store = Store::open(b_dir.path()).unwrap();
+    // Must exceed `data`'s size below: this project's choke has zero
+    // tolerance and no decay, so a one-time receipt credit smaller than
+    // the total download it needs to cover will always eventually push
+    // reputation negative partway through.
     let voucher_data = sample(350_000, 20);
     let voucher_manifest = b_store.ingest(&voucher_data, None).unwrap();
     let voucher_root = voucher_manifest.root;

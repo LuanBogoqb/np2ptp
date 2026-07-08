@@ -165,6 +165,22 @@ elsewhere in the network), one with nothing. Assert the first is served and
 the second is choked, demonstrating that circulated receipts — not just
 direct history — change a real outcome.
 
+## Trust model / limitations
+
+A receipt proves only that some Ed25519 key signed "I received `bytes` from
+`server`" — it does not prove the signer is a distinct, real peer. An
+operator can run one target node plus disposable downloader nodes (even
+using the stock binary, no protocol violation), have the throwaways
+download real content from the target to generate genuinely valid
+large-`bytes` receipts, then present that bag to bootstrap trust with any
+new peer. This is a known ceiling of signed-receipt reputation without
+Sybil resistance, stake, or proof-of-unique-identity — acceptable for a
+research prototype measuring whether *portable* reputation changes
+outcomes at all, but not a claim that this reputation is Sybil-resistant.
+`SubmitReceipt`'s handler rejects the degenerate case of a peer vouching
+for itself (`receipt.client == receipt.server`), which blocks the laziest
+form of self-dealing but not multi-identity Sybil attacks.
+
 ## Testing
 
 - `np2ptp-rep::Ledger`: update the `reputation` formula's existing tests

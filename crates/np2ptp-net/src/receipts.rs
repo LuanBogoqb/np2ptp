@@ -19,13 +19,11 @@ pub enum ReceiptBagError {
     Codec(#[from] bincode::Error),
 }
 
-#[allow(dead_code)]
 pub struct ReceiptBag {
     receipts: Vec<Receipt>,
     path: Option<PathBuf>,
 }
 
-#[allow(dead_code)]
 impl ReceiptBag {
     pub fn new() -> ReceiptBag {
         ReceiptBag { receipts: Vec::new(), path: None }

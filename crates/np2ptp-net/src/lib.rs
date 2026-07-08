@@ -844,6 +844,7 @@ impl EventLoop {
                 }
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
+                self.pending_internal.remove(&request_id);
                 if let Some(reply) = self.pending_req.remove(&request_id) {
                     let _ = reply.send(Err(NetError::RequestFailed));
                 }
@@ -857,6 +858,10 @@ impl EventLoop {
     /// that peer in our own ledger. Deduplicates by (client, epoch) within
     /// this response so a peer can't inflate its credit by repeating the
     /// same receipt.
+    ///
+    /// Note: this proves *a* key vouched for the peer, not that the voucher
+    /// is a distinct real peer — see "Trust model / limitations" in the
+    /// design doc for what this feature does and doesn't defend against.
     fn handle_receipts_response(&mut self, peer: PeerId, response: Response) {
         let Response::Receipts(receipts) = response else { return };
         let Some(&expected_server) = self.rep_peers.get(&peer) else { return };
@@ -911,7 +916,19 @@ impl EventLoop {
                 Response::Symbols(syms)
             }
             Request::SubmitReceipt(receipt) => {
-                if receipt.verify() {
+                // A receipt must actually be about *this* node — otherwise an
+                // attacker can submit arbitrary high-`bytes` receipts naming
+                // someone else's `server`/a throwaway `client` key, evicting
+                // our real earned receipts out of the (capped) bag via the
+                // highest-`bytes`-wins insert policy. Also reject the
+                // degenerate case of a peer vouching for itself
+                // (`client == server`) — only a partial mitigation for
+                // Sybil self-dealing (see the design doc's "Trust model /
+                // limitations"), but it blocks the laziest form.
+                if receipt.verify()
+                    && receipt.server == self.rep_identity.peer_id()
+                    && receipt.client != receipt.server
+                {
                     self.receipts.insert(receipt);
                     if let Err(e) = self.receipts.save() {
                         eprintln!("np2ptp: failed to persist receipts: {e}");
