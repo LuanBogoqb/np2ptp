@@ -372,9 +372,24 @@ impl Store {
     /// Stream the whole content (all files concatenated) to a writer, verifying
     /// each chunk's content hash. For single-file content this is the file.
     pub fn export_to<W: Write>(&self, manifest: &Manifest, writer: W) -> Result<(), StoreError> {
+        self.export_to_with_progress(manifest, writer, |_, _| {})
+    }
+
+    /// Like [`Store::export_to`], but calls `on_progress(chunks_done,
+    /// chunks_total)` once per chunk as it's read back, verified, and
+    /// written — this phase (re-reading every chunk from disk and hashing
+    /// it again) has no relation to network download progress and can take
+    /// a while on its own for large content.
+    pub fn export_to_with_progress<W: Write>(
+        &self,
+        manifest: &Manifest,
+        writer: W,
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> Result<(), StoreError> {
         if !manifest.root_is_consistent() {
             return Err(StoreError::Corrupt(manifest.root));
         }
+        let total = manifest.chunks.len();
         let mut w = BufWriter::new(writer);
         for (i, cref) in manifest.chunks.iter().enumerate() {
             let bytes = self.get(&cref.hash)?.ok_or(StoreError::Missing(cref.hash))?;
@@ -382,6 +397,7 @@ impl Store {
                 return Err(StoreError::Corrupt(cref.hash));
             }
             w.write_all(&bytes)?;
+            on_progress(i + 1, total);
         }
         w.flush()?;
         Ok(())
@@ -390,9 +406,23 @@ impl Store {
     /// Write every file of `manifest` into `out_dir`, streaming each file
     /// chunk-by-chunk. Verifies chunk hashes and rejects unsafe paths.
     pub fn export_tree_to_dir(&self, manifest: &Manifest, out_dir: &Path) -> Result<(), StoreError> {
+        self.export_tree_to_dir_with_progress(manifest, out_dir, |_, _| {})
+    }
+
+    /// Like [`Store::export_tree_to_dir`], but calls `on_progress(chunks_done,
+    /// chunks_total)` once per chunk, cumulative across every file in the tree
+    /// (not reset per file) — see [`Store::export_to_with_progress`].
+    pub fn export_tree_to_dir_with_progress(
+        &self,
+        manifest: &Manifest,
+        out_dir: &Path,
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> Result<(), StoreError> {
         if !manifest.root_is_consistent() {
             return Err(StoreError::Corrupt(manifest.root));
         }
+        let total = manifest.chunks.len();
+        let mut done = 0;
         for entry in &manifest.files {
             let mut dest = out_dir.to_path_buf();
             for comp in entry.path.split('/') {
@@ -412,6 +442,8 @@ impl Store {
                     return Err(StoreError::Corrupt(cref.hash));
                 }
                 w.write_all(&bytes)?;
+                done += 1;
+                on_progress(done, total);
             }
             w.flush()?;
         }
@@ -816,5 +848,61 @@ mod tests {
             std::fs::read(out.path().join("sub").join("b.bin")).unwrap(),
             std::fs::read(&b).unwrap()
         );
+    }
+
+    #[test]
+    fn export_with_progress_reports_every_chunk_once() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+        let data = sample(400_000, 40);
+        let m = store.ingest(&data, None).unwrap();
+        let total = m.chunks.len();
+        assert!(total > 1, "want a multi-chunk transfer");
+
+        let mut calls: Vec<(usize, usize)> = Vec::new();
+        let mut out = Vec::new();
+        store
+            .export_to_with_progress(&m, &mut out, |done, total| calls.push((done, total)))
+            .unwrap();
+
+        assert_eq!(out, data);
+        assert_eq!(calls.len(), total);
+        assert!(calls.windows(2).all(|w| w[0].0 < w[1].0), "done must be strictly increasing");
+        assert_eq!(calls.last().unwrap(), &(total, total));
+    }
+
+    #[test]
+    fn export_tree_with_progress_accumulates_across_files() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+
+        let fdir = TmpDir::new();
+        std::fs::create_dir_all(fdir.path().join("sub")).unwrap();
+        let a = fdir.path().join("a.bin");
+        let b = fdir.path().join("sub").join("b.bin");
+        std::fs::write(&a, sample(300_000, 41)).unwrap();
+        std::fs::write(&b, sample(200_000, 42)).unwrap();
+
+        let files = vec![("a.bin".to_string(), a.clone()), ("sub/b.bin".to_string(), b.clone())];
+        let m = store.ingest_tree_files(&files, Some("tree".into())).unwrap();
+        let total = m.chunks.len();
+
+        let out = TmpDir::new();
+        let mut calls: Vec<(usize, usize)> = Vec::new();
+        store
+            .export_tree_to_dir_with_progress(&m, out.path(), |done, total| calls.push((done, total)))
+            .unwrap();
+
+        assert_eq!(std::fs::read(out.path().join("a.bin")).unwrap(), std::fs::read(&a).unwrap());
+        assert_eq!(
+            std::fs::read(out.path().join("sub").join("b.bin")).unwrap(),
+            std::fs::read(&b).unwrap()
+        );
+        // Every call reports the whole-tree total, and progress reaches it —
+        // proves the second file's count continues from the first's rather
+        // than resetting (the same cross-file bug class as the pack side).
+        assert!(calls.iter().all(|(_, t)| *t == total));
+        assert_eq!(calls.last().unwrap().0, total);
+        assert!(calls.windows(2).all(|w| w[0].0 < w[1].0), "done must be strictly increasing");
     }
 }
