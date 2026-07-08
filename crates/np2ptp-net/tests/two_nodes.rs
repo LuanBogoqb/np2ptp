@@ -320,6 +320,48 @@ async fn connected_peers_and_ledger_totals_reflect_a_transfer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn download_with_progress_reaches_total() {
+    let seed_dir = TmpDir::new();
+    let seed_store = Store::open(seed_dir.path()).unwrap();
+    let data = sample(300_000, 9);
+    let manifest = seed_store.ingest(&data, None).unwrap();
+    let root = manifest.root;
+    let total_chunks = manifest.chunks.len();
+    assert!(total_chunks > 1, "want a multi-chunk transfer");
+
+    let seed = Network::spawn(seed_store, Some([95u8; 32])).unwrap();
+    seed.listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .await
+        .unwrap();
+    let seed_addr = first_listen_addr(&seed).await;
+    let seed_peer = seed.local_peer_id();
+    seed.provide(&manifest).await.unwrap();
+
+    let client_dir = TmpDir::new();
+    let client = Network::spawn(Store::open(client_dir.path()).unwrap(), Some([96u8; 32])).unwrap();
+    let client_store = Store::open(client_dir.path()).unwrap();
+    client.dial(seed_addr).await.unwrap();
+
+    let last_done = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let mut ok = false;
+    for _ in 0..100 {
+        let done_cell = last_done.clone();
+        let result = client
+            .download_with_progress(root, seed_peer, &client_store, move |done, _total| {
+                *done_cell.lock().unwrap() = done;
+            })
+            .await;
+        if result.is_ok() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ok, "download should complete");
+    assert_eq!(*last_done.lock().unwrap(), total_chunks);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_content_is_reported_not_hung() {
     // A seed that serves nothing: manifest request returns NoManifest.
     let seed_dir = TmpDir::new();

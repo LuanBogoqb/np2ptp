@@ -470,6 +470,19 @@ impl Network {
         provider: PeerId,
         into: &Store,
     ) -> Result<Manifest, NetError> {
+        self.download_with_progress(root, provider, into, |_, _| {}).await
+    }
+
+    /// Like [`Network::download`], but calls `on_progress(chunks_done,
+    /// chunks_total)` — once immediately with however many chunks were
+    /// already local, then once per chunk actually pulled over the network.
+    pub async fn download_with_progress(
+        &self,
+        root: Hash,
+        provider: PeerId,
+        into: &Store,
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> Result<Manifest, NetError> {
         /// Chunk requests kept in flight at once. Hides per-request latency.
         const PARALLEL: usize = 16;
 
@@ -485,6 +498,10 @@ impl Network {
             .filter(|(_, c)| !into.has(&c.hash))
             .map(|(i, c)| (i, c.hash))
             .collect();
+
+        let total = manifest.chunks.len();
+        let mut done = total - missing.len();
+        on_progress(done, total);
 
         // Fetch concurrently, but store + verify each chunk AS it arrives so we
         // never hold more than a handful of chunks in memory (large content).
@@ -504,6 +521,8 @@ impl Network {
                 return Err(NetError::BadChunk);
             }
             into.put(&bytes)?;
+            done += 1;
+            on_progress(done, total);
         }
         Ok(manifest)
     }
