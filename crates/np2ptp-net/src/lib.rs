@@ -423,6 +423,18 @@ impl Network {
         provider: PeerId,
         into: &Store,
     ) -> Result<Manifest, NetError> {
+        self.download_fec_with_progress(root, provider, into, |_, _| {}).await
+    }
+
+    /// Like [`Network::download_fec`], but calls `on_progress(symbols_collected,
+    /// symbols_needed)` after each batch of symbols arrives.
+    pub async fn download_fec_with_progress(
+        &self,
+        root: Hash,
+        provider: PeerId,
+        into: &Store,
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> Result<Manifest, NetError> {
         let manifest = self.get_manifest(provider, root).await?;
         let config = np2ptp_fec::config_for(manifest.total_size, np2ptp_fec::DEFAULT_SYMBOL_SIZE);
 
@@ -438,6 +450,7 @@ impl Network {
             let exhausted = batch.is_empty();
             start += batch.len() as u32;
             symbols.extend(batch);
+            on_progress(symbols.len().min(need), need);
 
             if symbols.len() >= need || exhausted {
                 if let Some(data) = np2ptp_fec::decode(&config, manifest.total_size, symbols.clone()) {

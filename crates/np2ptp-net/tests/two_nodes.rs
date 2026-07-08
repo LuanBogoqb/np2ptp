@@ -362,6 +362,48 @@ async fn download_with_progress_reaches_total() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fec_download_with_progress_reaches_need() {
+    let seed_dir = TmpDir::new();
+    let seed_store = Store::open(seed_dir.path()).unwrap();
+    let data = sample(250_000, 11);
+    let manifest = seed_store.ingest(&data, Some("vid.bin".into())).unwrap();
+    let root = manifest.root;
+
+    let seed = Network::spawn(seed_store, Some([97u8; 32])).unwrap();
+    seed.listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .await
+        .unwrap();
+    let seed_addr = first_listen_addr(&seed).await;
+    let seed_peer = seed.local_peer_id();
+    seed.provide(&manifest).await.unwrap();
+
+    let client_dir = TmpDir::new();
+    let client = Network::spawn(Store::open(client_dir.path()).unwrap(), Some([98u8; 32])).unwrap();
+    let client_store = Store::open(client_dir.path()).unwrap();
+    client.dial(seed_addr).await.unwrap();
+
+    let last_call = std::sync::Arc::new(std::sync::Mutex::new((0usize, 0usize)));
+    let mut downloaded = None;
+    for _ in 0..100 {
+        let cell = last_call.clone();
+        let result = client
+            .download_fec_with_progress(root, seed_peer, &client_store, move |done, need| {
+                *cell.lock().unwrap() = (done, need);
+            })
+            .await;
+        if let Ok(m) = result {
+            downloaded = Some(m);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let got = downloaded.expect("FEC download should complete");
+    assert_eq!(client_store.export(&got).unwrap(), data);
+    let (done, need) = *last_call.lock().unwrap();
+    assert!(done >= need && need > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_content_is_reported_not_hung() {
     // A seed that serves nothing: manifest request returns NoManifest.
     let seed_dir = TmpDir::new();
