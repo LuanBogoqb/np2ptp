@@ -29,6 +29,13 @@ impl PeerId {
         Ok(PeerId(b))
     }
 
+    /// Build a `PeerId` from a raw 32-byte Ed25519 public key obtained from
+    /// somewhere other than an `Identity` of our own (e.g. a peer's public
+    /// key learned via a transport's own handshake).
+    pub fn from_bytes(bytes: [u8; 32]) -> PeerId {
+        PeerId(bytes)
+    }
+
     /// Verify a 64-byte signature over `msg` against this identity. Returns false
     /// on any malformed key/signature rather than panicking.
     pub fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
@@ -136,5 +143,13 @@ mod tests {
     fn malformed_signature_is_rejected_not_panicked() {
         let pid = Identity::from_seed([4u8; 32]).peer_id();
         assert!(!pid.verify(b"msg", &[0u8; 10])); // wrong length
+    }
+
+    #[test]
+    fn from_bytes_round_trips_with_a_public_key() {
+        let id = Identity::from_seed([11u8; 32]);
+        let original = id.peer_id();
+        let rebuilt = PeerId::from_bytes(*original.as_bytes());
+        assert_eq!(rebuilt, original);
     }
 }
