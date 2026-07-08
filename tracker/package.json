@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "NP2PTP discovery tracker — announce/discover peers by content id (serverless, Vercel)",
+  "description": "NP2PTP discovery tracker: announce/discover peers by content id",
   "dependencies": {
     "@upstash/redis": "^1.34.0"
   }

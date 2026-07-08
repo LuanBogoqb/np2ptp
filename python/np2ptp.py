@@ -200,7 +200,7 @@ def main(argv=None) -> int:
     f.add_argument("target", help="a .nptp file or an np2ptp:<root> link")
     f.add_argument("--peer", help="host:port (with --id) or a full multiaddr; omit to auto-discover")
     f.add_argument("--id", dest="peer_id", help="peer id (when --peer is host:port)")
-    f.add_argument("--tracker", help="tracker URL (default https://np2ptp.vercel.app)")
+    f.add_argument("--tracker", help="tracker URL (default https://nptp.bogotec.uk)")
     f.add_argument("--out")
     f.add_argument("--store")
     f.add_argument("--fec", action="store_true", help="reconstruct via RaptorQ symbols")

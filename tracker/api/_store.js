@@ -1,9 +1,9 @@
 // Peer store for the NP2PTP tracker.
 //
-// Uses Upstash Redis (Vercel KV) when its env vars are present, so state
-// survives across serverless invocations and instances. Falls back to an
-// in-process Map when no KV is configured — handy for a first deploy or local
-// test, but only consistent within a single warm instance (don't rely on it).
+// Uses Upstash Redis when its env vars are present, so state survives a
+// restart and can be shared across multiple instances. Falls back to an
+// in-process Map when no Redis is configured, which is fine for a single
+// long-running instance (don't rely on it if you ever run more than one).
 
 import { Redis } from "@upstash/redis";
 
