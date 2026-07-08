@@ -50,11 +50,7 @@ tracker only solves *discovery*.
 
 ## Live instance
 
-The "principal" tracker is self-hosted (not Vercel) at **https://nptp.bogotec.uk**,
-behind Caddy on the same VPS that fronts the rest of `bogotec.uk`. It runs as
-the `np2ptp-tracker` systemd unit under `/opt/np2ptp-tracker` (plain Node,
-`server.js` adapts the Vercel-style handlers in `api/` to a standalone HTTP
-server — no Upstash/Redis needed since the process stays warm, unlike
-serverless). This is now `tracker::DEFAULT_TRACKER`, so clients hit it
-automatically unless `--tracker` overrides it. The Vercel deploy steps below
-still work if you ever want a second/backup tracker instance.
+The principal tracker is **https://nptp.bogotec.uk** — this is
+`tracker::DEFAULT_TRACKER`, so clients use it automatically unless `--tracker`
+overrides it. The Vercel deploy steps above still work if you ever want a
+second/backup instance.
