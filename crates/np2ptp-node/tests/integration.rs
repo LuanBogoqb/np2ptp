@@ -214,6 +214,10 @@ fn pack_json_emits_valid_ndjson_and_a_final_result_event() {
         }
     }
     assert!(saw_result, "expected a final result event, got: {stdout}");
+
+    let last: serde_json::Value = serde_json::from_str(lines.last().unwrap())
+        .unwrap_or_else(|e| panic!("last line not valid JSON: {:?}: {e}", lines.last()));
+    assert_eq!(last["event"], "result", "expected the LAST line to be the result event, got: {stdout}");
 }
 
 #[test]
@@ -266,7 +270,15 @@ fn get_json_emits_valid_ndjson_and_a_final_result_event() {
         if v["event"] == "result" {
             saw_result = true;
             assert_eq!(v["chunks_deduped"], 0);
+            assert!(
+                v["chunks_fetched"].as_u64().unwrap() > 0,
+                "expected chunks_fetched > 0, got: {v}"
+            );
         }
     }
     assert!(saw_result, "expected a final result event, got: {stdout}");
+
+    let last: serde_json::Value = serde_json::from_str(lines.last().unwrap())
+        .unwrap_or_else(|e| panic!("last line not valid JSON: {:?}: {e}", lines.last()));
+    assert_eq!(last["event"], "result", "expected the LAST line to be the result event, got: {stdout}");
 }
