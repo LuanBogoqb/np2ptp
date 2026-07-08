@@ -858,7 +858,7 @@ fn print_usage() {
          \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay]\n\
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\
-         \x20 np2ptp torrent <file.torrent> --data <dir> [--store <dir>] [--no-copy] [--json]\n\n\
+         \x20 np2ptp torrent <file.torrent> --data <dir> [--store <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\n\
          NOTES:\n\
          \x20 'pack' is the linker: chunks a file/folder into a store and writes a .nptp file.\n\
          \x20 --no-copy references the input in place instead of copying its chunks into the\n\
