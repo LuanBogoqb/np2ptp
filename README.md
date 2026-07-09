@@ -59,3 +59,30 @@ running your own relay/bootstrap node (needed behind CGNAT), see
 Additional references: [Relay Setup](docs/RELAY.md) (running your own
 relay/bootstrap node) and [`tracker/README.md`](tracker/README.md) (the
 self-hosted discovery tracker).
+
+## Verifying the Windows Binary
+
+The Windows release binary is Authenticode-signed (SHA-256, timestamped) as
+part of the [release workflow](.github/workflows/release.yml). The
+certificate is a personal one, not an EV certificate from a large commercial
+CA, so Windows SmartScreen may still show an "unrecognized publisher" warning
+the first few times someone runs it — that's SmartScreen's reputation system
+still catching up, not a sign the signature is invalid or the file was
+tampered with.
+
+To check the signature yourself, either right-click the `.exe` → Properties →
+Digital Signatures tab, or in PowerShell:
+
+```powershell
+Get-AuthenticodeSignature .\np2ptp-windows-x86_64.exe | Format-List *
+```
+
+`Status` should read `Valid`, and the signer should match:
+
+```
+Subject:    CN=Luan Bogo, E=LuanBogoqb@users.noreply.github.com, C=BR
+Thumbprint: 36477BB5DCB10D2C0381A2D79533F0386C5CCACA
+```
+
+The thumbprint changes whenever the certificate is renewed — the `Subject`
+is what stays stable across renewals, so treat that as the primary check.
