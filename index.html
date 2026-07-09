@@ -53,7 +53,7 @@
       </div>
       <div class="problem-card">
         <h3>Permanence &amp; incentives</h3>
-        <p>Content dies when seeders leave, and seeding earns nothing. Erasure coding keeps content alive through churn, and a reputation ledger rewards people for seeding. That ledger is portable, too: a peer can carry a signed receipt to prove itself to strangers, not just whoever it dealt with directly.</p>
+        <p>Content dies when seeders leave, and seeding earns nothing. Erasure coding keeps content alive through churn, as long as at least one peer already re-shared it. A reputation ledger cuts off free-riders and rewards people for seeding. That ledger is portable, too: a peer can carry a signed receipt to prove itself on first contact with a stranger, while an equally new peer with no receipt still gets choked.</p>
       </div>
       <div class="problem-card">
         <h3>Integrity &amp; dedup</h3>
@@ -75,7 +75,7 @@
       </div>
       <div class="how-item">
         <h3>Permanence</h3>
-        <p>RaptorQ erasure coding turns a file into redundant symbols, so any big-enough subset of them rebuilds the whole thing. Content survives seeders leaving, and nobody has to re-upload it whole.</p>
+        <p>RaptorQ erasure coding turns a file into redundant symbols, so any big-enough subset of them rebuilds the whole thing. Content survives seeders leaving, as long as at least one peer already re-shared it — nobody has to re-upload it whole.</p>
       </div>
       <div class="how-item">
         <h3>Reachability</h3>
@@ -110,23 +110,11 @@
 
   <section id="research" class="research">
     <h2>Does it actually work better?</h2>
-    <p class="section-sub">Each pair below is the same scenario run twice, condition flipped — not a claim, a controlled comparison. Raw numbers in the <a href="https://github.com/LuanBogoqb/np2ptp/blob/main/reports/REPORT.md">full report ↗</a>, re-run with <code>cargo run --release -p np2ptp-sim</code>.</p>
+    <p class="section-sub">Measured against a plain-chunk baseline, not just claimed. Full numbers in the <a href="https://github.com/LuanBogoqb/np2ptp/blob/main/reports/REPORT.md">full report ↗</a>, re-run with <code>cargo run --release -p np2ptp-sim</code>.</p>
     <div class="stat-grid">
       <div class="stat">
         <div class="stat-value">~49%</div>
         <div class="stat-label">chunks deduplicated on a lightly-edited file</div>
-      </div>
-      <div class="stat">
-        <div class="stat-value">✓ / ✗</div>
-        <div class="stat-label">new peer completes after the seeder leaves — with re-sharing / without it</div>
-      </div>
-      <div class="stat">
-        <div class="stat-value">✓ / ✗</div>
-        <div class="stat-label">a free-riding leech completes — reputation choke off / on</div>
-      </div>
-      <div class="stat">
-        <div class="stat-value">✓ / ✗</div>
-        <div class="stat-label">completes on first contact with a stranger — vouched by a signed receipt / no receipt</div>
       </div>
       <div class="stat">
         <div class="stat-value">~110ms</div>
