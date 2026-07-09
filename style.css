@@ -130,4 +130,3 @@ section h2 { text-align: center; margin-bottom: 12px; }
 .footer { text-align: center; padding: 48px 24px; }
 .footer-links { display: flex; justify-content: center; gap: 20px; flex-wrap: wrap; margin-bottom: 16px; }
 .footer-links a { text-decoration: none; font-size: 0.9rem; }
-.footer-note { font-size: 0.8rem; }
