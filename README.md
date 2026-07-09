@@ -40,7 +40,7 @@ harness measures whether any of it actually beats a baseline (see
 | `np2ptp-rep`    | Ed25519 identity, signed receipts, reputation ledger                  |
 | `np2ptp-net`    | libp2p/QUIC transport, DHT discovery, reputation choke, relay/NAT traversal |
 | `np2ptp-sim`    | Research harness measuring dedup, permanence, free-riding, FEC cost    |
-| `np2ptp-bridge` | BitTorrent ↔ NP2PTP gateway: convert an already-downloaded torrent (`np2ptp torrent`) |
+| `np2ptp-bridge` | BitTorrent ↔ NP2PTP gateway: convert an already-downloaded torrent, or fetch one you don't have yet (`np2ptp torrent`) |
 
 There is also a small **tracker**: BitTorrent-tracker-style peer discovery over
 plain HTTP, self-hostable. See [`tracker/README.md`](tracker/README.md). For

@@ -783,23 +783,29 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
     })
 }
 
-/// Convert an already-downloaded `.torrent`'s content into NP2PTP. Only
-/// reads local files (`--data <dir>`, which must contain the torrent's
-/// file tree directly, e.g. what a BitTorrent client's save-path already
-/// looks like for that torrent) — downloading a torrent you don't have yet
-/// is a separate, later feature.
+/// Bridge a torrent into NP2PTP: either an already-downloaded one
+/// (`--data <dir>`, which must contain the torrent's file tree directly,
+/// e.g. what a BitTorrent client's save-path already looks like for that
+/// torrent) or, with the `librqbit` feature, a magnet link / `.torrent` /
+/// `http(s)://` URL you don't have yet — downloaded via a real BitTorrent
+/// swarm first.
 fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
     let (pos, flags) = parse(args, &["--data", "--store", "--relay"]);
-    let torrent_file = *pos.first().ok_or("torrent: missing <file.torrent>")?;
-    let data_dir = flags.get("data").cloned().ok_or("torrent: missing --data <dir>")?;
+    let input = *pos.first().ok_or("torrent: missing <file.torrent|magnet:...>")?;
+    let data_dir = flags.get("data").cloned();
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
     let no_copy = flags.contains_key("no-copy");
     let no_relay = flags.contains_key("no-relay");
     let relay_override = flags.get("relay").cloned();
     let json = flags.contains_key("json");
 
-    let torrent_bytes = fs::read(torrent_file)?;
-    let meta = np2ptp_bridge::parse_torrent_file(&torrent_bytes)?;
+    // `--data` means "already downloaded" — parse the .torrent file upfront
+    // so a bad file fails fast, before any networking spins up.
+    let local_meta = match &data_dir {
+        Some(_) => Some(np2ptp_bridge::parse_torrent_file(&fs::read(input)?)?),
+        None => None,
+    };
+
     // Store::open creates store_dir if it doesn't exist yet — must happen
     // before load_or_create_seed writes identity.key under it.
     let store = Store::open(&store_dir)?;
@@ -820,8 +826,12 @@ fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
 
         let store = Store::open(&store_dir)?;
-        let outcome =
-            np2ptp_bridge::resolve_or_convert_local(&net, &store, &meta, Path::new(&data_dir), no_copy).await?;
+        let outcome = match (local_meta, &data_dir) {
+            (Some(meta), Some(data_dir)) => {
+                np2ptp_bridge::resolve_or_convert_local(&net, &store, &meta, Path::new(data_dir), no_copy).await?
+            }
+            _ => fetch_remote_torrent(&net, &store, input, no_copy).await?,
+        };
 
         if json {
             println!(
@@ -848,6 +858,29 @@ fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
     })
 }
 
+#[cfg(feature = "librqbit")]
+async fn fetch_remote_torrent(
+    net: &Network,
+    store: &Store,
+    input: &str,
+    no_copy: bool,
+) -> Result<np2ptp_bridge::Outcome, Box<dyn Error>> {
+    Ok(np2ptp_bridge::resolve_or_convert_remote(net, store, input, no_copy).await?)
+}
+
+#[cfg(not(feature = "librqbit"))]
+async fn fetch_remote_torrent(
+    _net: &Network,
+    _store: &Store,
+    _input: &str,
+    _no_copy: bool,
+) -> Result<np2ptp_bridge::Outcome, Box<dyn Error>> {
+    Err("torrent: fetching a magnet/torrent you don't already have needs the 'librqbit' \
+         feature (rebuild with `cargo build --features librqbit`), or pass --data <dir> \
+         for content you've already downloaded"
+        .into())
+}
+
 fn print_usage() {
     eprintln!(
         "np2ptp — New Peer-To-Peer Transfer Protocol (prototype)\n\n\
@@ -858,7 +891,7 @@ fn print_usage() {
          \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay]\n\
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\
-         \x20 np2ptp torrent <file.torrent> --data <dir> [--store <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\n\
+         \x20 np2ptp torrent <file.torrent|magnet:...> [--data <dir>] [--store <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\n\
          NOTES:\n\
          \x20 'pack' is the linker: chunks a file/folder into a store and writes a .nptp file.\n\
          \x20 --no-copy references the input in place instead of copying its chunks into the\n\

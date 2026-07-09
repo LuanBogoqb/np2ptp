@@ -27,6 +27,9 @@ crab_nat = "0.7"
 netdev = "0.31"
 getrandom = "0.2"
 
+[features]
+librqbit = ["np2ptp-bridge/librqbit"]
+
 [dev-dependencies]
 sha1 = "0.10"
 
