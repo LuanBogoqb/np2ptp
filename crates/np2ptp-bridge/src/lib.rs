@@ -38,6 +38,11 @@ pub use bencode::parse_torrent_file;
 mod streaming;
 pub use streaming::{convert_local, resolve_or_convert_local, verify_pieces_streaming};
 
+#[cfg(feature = "librqbit")]
+mod librqbit_source;
+#[cfg(feature = "librqbit")]
+pub use librqbit_source::resolve_or_convert_remote;
+
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
     #[error(transparent)]

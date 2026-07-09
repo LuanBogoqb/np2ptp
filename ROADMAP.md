@@ -7,17 +7,17 @@ what exists, the architecture, the non-obvious gotchas, and the concrete next st
 
 ## 1. Vision
 
-NP2PTP ("New Peer-To-Peer Transfer Protocol", a.k.a. "Torrent 2.0") is a research
-prototype that keeps what BitTorrent does well and fixes what it does badly. The
-user's priorities, in order:
+NP2PTP ("New Peer-To-Peer Transfer Protocol") is inspired by BitTorrent: it
+keeps what BitTorrent does well and fixes what it does badly. The user's
+priorities, in order:
 
 1. **NAT / connectivity** — most peers can't accept inbound connections.
 2. **Permanence / incentives** — content dies when seeders leave; seeding is unrewarded.
 3. **Integrity / dedup** — coarse verification, no cross-content deduplication.
 
-It is a **research project**: the deliverables must be *measurable* (see
-`np2ptp-sim`), not a polished product. Out of scope (for now): privacy/anonymity,
-streaming playback, mutable content.
+Changes are checked against a measurement harness (see `np2ptp-sim`) rather
+than taken on faith. Out of scope (for now): privacy/anonymity, streaming
+playback, mutable content.
 
 Guiding principle: **don't reinvent the plumbing.** Build on `libp2p` (QUIC,
 Noise, Kademlia, NAT traversal). The novelty is the layers above.
@@ -38,7 +38,7 @@ Noise, Kademlia, NAT traversal). The novelty is the layers above.
 | `np2ptp-net` | ✅ (core) | libp2p/QUIC: download by content id, DHT discovery + infohash mapping, reputation choke + **signed receipt exchange** (portable reputation), FEC symbols, relay reservation |
 | `np2ptp-node` | ✅ | CLI: `pack` / `info` / `get` / `serve` / `fetch` (files **and** folders, streaming) |
 | `np2ptp-sim` | ✅ | Research harness: measures dedup, permanence, free-riding, FEC cost; writes `reports/` |
-| `np2ptp-bridge` | 🚧 core only | Torrent↔NP2PTP: `TorrentSource` trait, resolve-or-convert flow, piece verification. **librqbit source + CLI not done.** |
+| `np2ptp-bridge` | ✅ | Torrent↔NP2PTP: `TorrentSource` trait, resolve-or-convert flow, piece verification, streaming local conversion, and `LibrqbitSource` (remote magnet/`.torrent` fetch) behind the `librqbit` feature. |
 | `python/np2ptp.py` | ✅ | Friendly wrapper over the binary (host:port instead of multiaddr) |
 
 **Validated for real:**
@@ -143,10 +143,14 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
      piece hashes) + `resolve_or_convert_local`/`convert_local`, streaming both
      piece verification and ingestion from disk (never the whole torrent in RAM).
      `np2ptp torrent <file.torrent> --data <dir>` CLI command.
-   - **`LibrqbitSource`** — download torrents you *don't* have (behind the
-     `librqbit` feature, already in `Cargo.toml`). `.torrent` + magnet. Not yet
-     started — a real BitTorrent swarm is harder to test deterministically, so
-     the fully-offline local-conversion half shipped first.
+   - ✅ **`LibrqbitSource`** — downloads a torrent/magnet you *don't* have yet
+     (behind the `librqbit` feature) straight to disk, then feeds it through
+     the same streaming `resolve_or_convert_local` path as an already-
+     downloaded torrent (never the whole thing in RAM). `np2ptp torrent
+     <file.torrent|magnet:...>` (no `--data`) drives it. Validated end-to-end
+     with a real BitTorrent peer-wire download (seeder + downloader via
+     direct peer injection, no DHT/tracker dependency — deterministic and
+     fast); a live public-swarm/magnet-DHT run hasn't been done yet.
 2. **Automatic discovery** (so `fetch <link>` needs no `--peer`):
    - ✅ **HTTP discovery tracker** — LIVE at `https://nptp.bogotec.uk`, self-hosted
      on the VPS (`tracker/`, systemd + Caddy). `serve` announces; `fetch <link>`
@@ -187,12 +191,14 @@ bootstrap/relay infrastructure, docs site.
 ```sh
 cargo test --workspace                     # keep green (~100 tests)
 cargo clippy --workspace --all-targets     # keep at 0 warnings
+cargo test -p np2ptp-bridge --features librqbit   # + the real-BitTorrent-download test
 cargo run --release -p np2ptp-sim          # research report -> reports/
 
 # CLI (build once: cargo build --release -p np2ptp-node)
 np2ptp pack ./folder --out f.nptp --store seedstore
 np2ptp serve f.nptp --store seedstore --listen /ip4/0.0.0.0/udp/4001/quic-v1
 np2ptp fetch f.nptp --peer /ip4/<host>/udp/4001/quic-v1/p2p/<id> --out got [--fec]
+np2ptp torrent 'magnet:?xt=urn:btih:...' --store seedstore   # needs --features librqbit
 # or via Python: python python/np2ptp.py fetch f.nptp --peer <host>:4001 --id <id> --out got
 ```
 
@@ -202,5 +208,5 @@ np2ptp fetch f.nptp --peer /ip4/<host>/udp/4001/quic-v1/p2p/<id> --out got [--fe
 - Store + streaming: `crates/np2ptp-store/src/lib.rs`
 - Network protocol, DHT, download, choke, FEC, relay: `crates/np2ptp-net/src/lib.rs`
 - CLI: `crates/np2ptp-node/src/main.rs`; reusable bits in `.../src/lib.rs`
-- Bridge (in progress): `crates/np2ptp-bridge/src/lib.rs`
+- Bridge: `crates/np2ptp-bridge/src/lib.rs`; remote fetch: `.../src/librqbit_source.rs`
 - Research scenarios: `crates/np2ptp-sim/src/lib.rs`

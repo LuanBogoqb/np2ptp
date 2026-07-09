@@ -7,9 +7,9 @@
 [![Release](https://github.com/LuanBogoqb/np2ptp/actions/workflows/release.yml/badge.svg)](https://github.com/LuanBogoqb/np2ptp/actions/workflows/release.yml)
 [![Latest release](https://img.shields.io/github/v/release/LuanBogoqb/np2ptp)](https://github.com/LuanBogoqb/np2ptp/releases/latest)
 
-A research prototype exploring a "BitTorrent 2.0": fix what torrents do badly and
-improve what they already do well. The goal is **measurable** experiments, not a
-production client.
+A peer-to-peer transfer protocol inspired by BitTorrent: keeps what torrents do
+well, fixes what they don't. Every change is checked against a measurement
+harness (`np2ptp-sim`) rather than taken on faith.
 
 ## Pain Points Being Targeted
 
@@ -17,7 +17,7 @@ production client.
 2. **Permanence / incentives**: content dies when seeders leave, and seeding earns nothing.
 3. **Integrity / dedup**: coarse verification and no cross-content deduplication.
 
-Out of scope for the MVP: privacy/anonymity, streaming, mutable content.
+Out of scope for now: privacy/anonymity, streaming, mutable content.
 
 ## Design in One Paragraph
 
@@ -40,7 +40,7 @@ harness measures whether any of it actually beats a baseline (see
 | `np2ptp-rep`    | Ed25519 identity, signed receipts, reputation ledger                  |
 | `np2ptp-net`    | libp2p/QUIC transport, DHT discovery, reputation choke, relay/NAT traversal |
 | `np2ptp-sim`    | Research harness measuring dedup, permanence, free-riding, FEC cost    |
-| `np2ptp-bridge` | BitTorrent ↔ NP2PTP gateway: convert an already-downloaded torrent (`np2ptp torrent`) |
+| `np2ptp-bridge` | BitTorrent ↔ NP2PTP gateway: convert an already-downloaded torrent, or fetch one you don't have yet (`np2ptp torrent`) |
 
 There is also a small **tracker**: BitTorrent-tracker-style peer discovery over
 plain HTTP, self-hostable. See [`tracker/README.md`](tracker/README.md). For
@@ -59,3 +59,30 @@ running your own relay/bootstrap node (needed behind CGNAT), see
 Additional references: [Relay Setup](docs/RELAY.md) (running your own
 relay/bootstrap node) and [`tracker/README.md`](tracker/README.md) (the
 self-hosted discovery tracker).
+
+## Verifying the Windows Binary
+
+The Windows release binary is Authenticode-signed (SHA-256, timestamped) as
+part of the [release workflow](.github/workflows/release.yml). The
+certificate is a personal one, not an EV certificate from a large commercial
+CA, so Windows SmartScreen may still show an "unrecognized publisher" warning
+the first few times someone runs it — that's SmartScreen's reputation system
+still catching up, not a sign the signature is invalid or the file was
+tampered with.
+
+To check the signature yourself, either right-click the `.exe` → Properties →
+Digital Signatures tab, or in PowerShell:
+
+```powershell
+Get-AuthenticodeSignature .\np2ptp-windows-x86_64.exe | Format-List *
+```
+
+`Status` should read `Valid`, and the signer should match:
+
+```
+Subject:    CN=Luan Bogo, E=LuanBogoqb@users.noreply.github.com, C=BR
+Thumbprint: 36477BB5DCB10D2C0381A2D79533F0386C5CCACA
+```
+
+The thumbprint changes whenever the certificate is renewed — the `Subject`
+is what stays stable across renewals, so treat that as the primary check.

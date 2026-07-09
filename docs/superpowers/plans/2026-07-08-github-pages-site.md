@@ -45,7 +45,7 @@ Working directory must be the `web` branch checkout. Write exactly:
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NP2PTP — New Peer-To-Peer Transfer Protocol</title>
-  <meta name="description" content="A research prototype rethinking BitTorrent: content-addressed, permanent, verified.">
+  <meta name="description" content="Peer-to-peer transfer inspired by BitTorrent: content-addressed, permanent, verified.">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="stylesheet" href="style.css">
 </head>
@@ -168,7 +168,6 @@ Working directory must be the `web` branch checkout. Write exactly:
       <a href="https://github.com/LuanBogoqb/np2ptp/blob/main/docs/EXAMPLES.md">Examples</a>
       <a href="https://github.com/LuanBogoqb/np2ptp/blob/main/docs/BUILDING.md">Building</a>
     </div>
-    <p class="footer-note">A research prototype. Not a production client.</p>
   </footer>
 
   <script src="script.js"></script>
