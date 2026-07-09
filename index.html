@@ -110,23 +110,23 @@
 
   <section id="research" class="research">
     <h2>Does it actually work better?</h2>
-    <p class="section-sub">Measured with a research harness that compares against a plain-chunk baseline, not just claimed.</p>
+    <p class="section-sub">Each pair below is the same scenario run twice, condition flipped — not a claim, a controlled comparison. Raw numbers in the <a href="https://github.com/LuanBogoqb/np2ptp/blob/main/reports/REPORT.md">full report ↗</a>, re-run with <code>cargo run --release -p np2ptp-sim</code>.</p>
     <div class="stat-grid">
       <div class="stat">
         <div class="stat-value">~49%</div>
         <div class="stat-label">chunks deduplicated on a lightly-edited file</div>
       </div>
       <div class="stat">
-        <div class="stat-value">Survives</div>
-        <div class="stat-label">seeder departure, but only if re-sharing is on</div>
+        <div class="stat-value">✓ / ✗</div>
+        <div class="stat-label">new peer completes after the seeder leaves — with re-sharing / without it</div>
       </div>
       <div class="stat">
-        <div class="stat-value">Cut off</div>
-        <div class="stat-label">a free-riding leech, under the reputation choke</div>
+        <div class="stat-value">✓ / ✗</div>
+        <div class="stat-label">a free-riding leech completes — reputation choke off / on</div>
       </div>
       <div class="stat">
-        <div class="stat-value">Trust travels</div>
-        <div class="stat-label">a peer vouched for by a signed receipt isn't choked by a stranger; an equally new peer with no receipt still is</div>
+        <div class="stat-value">✓ / ✗</div>
+        <div class="stat-label">completes on first contact with a stranger — vouched by a signed receipt / no receipt</div>
       </div>
       <div class="stat">
         <div class="stat-value">~110ms</div>
