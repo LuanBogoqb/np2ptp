@@ -174,9 +174,9 @@ using the stock binary, no protocol violation), have the throwaways
 download real content from the target to generate genuinely valid
 large-`bytes` receipts, then present that bag to bootstrap trust with any
 new peer. This is a known ceiling of signed-receipt reputation without
-Sybil resistance, stake, or proof-of-unique-identity — acceptable for a
-research prototype measuring whether *portable* reputation changes
-outcomes at all, but not a claim that this reputation is Sybil-resistant.
+Sybil resistance, stake, or proof-of-unique-identity — acceptable while
+measuring whether *portable* reputation changes outcomes at all, but not a
+claim that this reputation is Sybil-resistant.
 `SubmitReceipt`'s handler rejects the degenerate case of a peer vouching
 for itself (`receipt.client == receipt.server`), which blocks the laziest
 form of self-dealing but not multi-identity Sybil attacks.

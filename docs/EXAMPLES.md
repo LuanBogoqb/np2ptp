@@ -95,9 +95,9 @@ first checks whether another peer already bridged this exact torrent
 (matched by BitTorrent infohash) and, if so, downloads it from NP2PTP instead
 of re-verifying anything.
 
-Only a `.torrent` **file** is supported for now (not a magnet link) — pulling
-a torrent you don't already have, via a real BitTorrent swarm, is a separate,
-later feature.
+Don't have the data yet? Build the binary with `--features librqbit` and drop
+`--data`: `np2ptp torrent <magnet-link-or-.torrent-or-url> --store seedstore`
+downloads it over a real BitTorrent swarm first, then bridges it the same way.
 
 ## Non-Interactive Usage (`--json`)
 
