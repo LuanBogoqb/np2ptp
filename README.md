@@ -7,9 +7,9 @@
 [![Release](https://github.com/LuanBogoqb/np2ptp/actions/workflows/release.yml/badge.svg)](https://github.com/LuanBogoqb/np2ptp/actions/workflows/release.yml)
 [![Latest release](https://img.shields.io/github/v/release/LuanBogoqb/np2ptp)](https://github.com/LuanBogoqb/np2ptp/releases/latest)
 
-A research prototype exploring a "BitTorrent 2.0": fix what torrents do badly and
-improve what they already do well. The goal is **measurable** experiments, not a
-production client.
+A peer-to-peer transfer protocol inspired by BitTorrent: keeps what torrents do
+well, fixes what they don't. Every change is checked against a measurement
+harness (`np2ptp-sim`) rather than taken on faith.
 
 ## Pain Points Being Targeted
 
@@ -17,7 +17,7 @@ production client.
 2. **Permanence / incentives**: content dies when seeders leave, and seeding earns nothing.
 3. **Integrity / dedup**: coarse verification and no cross-content deduplication.
 
-Out of scope for the MVP: privacy/anonymity, streaming, mutable content.
+Out of scope for now: privacy/anonymity, streaming, mutable content.
 
 ## Design in One Paragraph
 

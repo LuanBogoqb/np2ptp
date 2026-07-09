@@ -1,6 +1,6 @@
 # CLAUDE.md — guide for AI agents working on NP2PTP
 
-NP2PTP ("Torrent 2.0") is a research P2P transfer protocol in Rust. It fixes
+NP2PTP is a P2P transfer protocol in Rust, inspired by BitTorrent. It fixes
 BitTorrent's weak spots: content-defined chunking + BLAKE3 Merkle for integrity &
 dedup, RaptorQ for permanence, a reputation ledger for incentives, and libp2p/QUIC
 for transport. **Read [`ROADMAP.md`](ROADMAP.md) for the full plan and status.**

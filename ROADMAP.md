@@ -7,17 +7,17 @@ what exists, the architecture, the non-obvious gotchas, and the concrete next st
 
 ## 1. Vision
 
-NP2PTP ("New Peer-To-Peer Transfer Protocol", a.k.a. "Torrent 2.0") is a research
-prototype that keeps what BitTorrent does well and fixes what it does badly. The
-user's priorities, in order:
+NP2PTP ("New Peer-To-Peer Transfer Protocol") is inspired by BitTorrent: it
+keeps what BitTorrent does well and fixes what it does badly. The user's
+priorities, in order:
 
 1. **NAT / connectivity** — most peers can't accept inbound connections.
 2. **Permanence / incentives** — content dies when seeders leave; seeding is unrewarded.
 3. **Integrity / dedup** — coarse verification, no cross-content deduplication.
 
-It is a **research project**: the deliverables must be *measurable* (see
-`np2ptp-sim`), not a polished product. Out of scope (for now): privacy/anonymity,
-streaming playback, mutable content.
+Changes are checked against a measurement harness (see `np2ptp-sim`) rather
+than taken on faith. Out of scope (for now): privacy/anonymity, streaming
+playback, mutable content.
 
 Guiding principle: **don't reinvent the plumbing.** Build on `libp2p` (QUIC,
 Noise, Kademlia, NAT traversal). The novelty is the layers above.
