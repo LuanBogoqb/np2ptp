@@ -2972,7 +2972,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 
 [[package]]
 name = "np2ptp-bridge"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "hex 0.4.3",
  "librqbit",
@@ -2986,7 +2986,7 @@ dependencies = [
 
 [[package]]
 name = "np2ptp-core"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "bincode 1.3.3",
  "blake3",
@@ -2998,14 +2998,14 @@ dependencies = [
 
 [[package]]
 name = "np2ptp-fec"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "raptorq",
 ]
 
 [[package]]
 name = "np2ptp-net"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "bincode 1.3.3",
  "futures",
@@ -3022,7 +3022,7 @@ dependencies = [
 
 [[package]]
 name = "np2ptp-node"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "crab_nat",
  "getrandom 0.2.17",
@@ -3042,7 +3042,7 @@ dependencies = [
 
 [[package]]
 name = "np2ptp-rep"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "bincode 1.3.3",
  "ed25519-dalek",
@@ -3054,7 +3054,7 @@ dependencies = [
 
 [[package]]
 name = "np2ptp-sim"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "np2ptp-core",
  "np2ptp-net",
@@ -3064,7 +3064,7 @@ dependencies = [
 
 [[package]]
 name = "np2ptp-store"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "fastcdc",
  "hex 0.4.3",
