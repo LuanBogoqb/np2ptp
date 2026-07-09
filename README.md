@@ -6,6 +6,7 @@
 
 [![Release](https://github.com/LuanBogoqb/np2ptp/actions/workflows/release.yml/badge.svg)](https://github.com/LuanBogoqb/np2ptp/actions/workflows/release.yml)
 [![Latest release](https://img.shields.io/github/v/release/LuanBogoqb/np2ptp)](https://github.com/LuanBogoqb/np2ptp/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A peer-to-peer transfer protocol inspired by BitTorrent: keeps what torrents do
 well, fixes what they don't. Every change is checked against a measurement
@@ -86,3 +87,9 @@ Thumbprint: 36477BB5DCB10D2C0381A2D79533F0386C5CCACA
 
 The thumbprint changes whenever the certificate is renewed — the `Subject`
 is what stays stable across renewals, so treat that as the primary check.
+
+## License
+
+Released under the MIT License. You can use, modify, and redistribute it,
+including in commercial work, as long as the copyright notice stays intact.
+Full text in [LICENSE](LICENSE).
