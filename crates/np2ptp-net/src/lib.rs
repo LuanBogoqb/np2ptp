@@ -562,12 +562,55 @@ impl Network {
         root: Hash,
         provider: PeerId,
         into: &Store,
+        on_progress: impl FnMut(usize, usize),
+    ) -> Result<Manifest, NetError> {
+        self.download_multi_with_progress(root, &[provider], into, on_progress).await
+    }
+
+    /// Like [`Network::download`], but spreads the work across several
+    /// providers: the manifest comes from whichever responds first, and each
+    /// chunk is fetched from a provider chosen round-robin, falling back to
+    /// the others if that one fails or doesn't have it, before giving up on
+    /// that chunk. Each provider is credited a receipt only for the bytes it
+    /// actually served.
+    pub async fn download_multi(
+        &self,
+        root: Hash,
+        providers: &[PeerId],
+        into: &Store,
+    ) -> Result<Manifest, NetError> {
+        self.download_multi_with_progress(root, providers, into, |_, _| {}).await
+    }
+
+    /// [`Network::download_multi`] with progress reporting; see
+    /// [`Network::download_with_progress`].
+    pub async fn download_multi_with_progress(
+        &self,
+        root: Hash,
+        providers: &[PeerId],
+        into: &Store,
         mut on_progress: impl FnMut(usize, usize),
     ) -> Result<Manifest, NetError> {
         /// Chunk requests kept in flight at once. Hides per-request latency.
         const PARALLEL: usize = 16;
 
-        let manifest = self.get_manifest(provider, root).await?;
+        if providers.is_empty() {
+            return Err(NetError::NoProviders);
+        }
+
+        // Manifest: whichever provider answers first, tried in order.
+        let mut manifest = None;
+        let mut last_err = NetError::NoProviders;
+        for &p in providers {
+            match self.get_manifest(p, root).await {
+                Ok(m) => {
+                    manifest = Some(m);
+                    break;
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        let manifest = manifest.ok_or(last_err)?;
         // get_manifest already validated the chunk list against the root, so a
         // cheap per-chunk content-hash check is sufficient below.
 
@@ -586,29 +629,39 @@ impl Network {
 
         // Fetch concurrently, but store + verify each chunk AS it arrives so we
         // never hold more than a handful of chunks in memory (large content).
-        let mut stream = futures::stream::iter(missing)
-            .map(|(i, hash)| async move {
-                let bytes = self
-                    .fetch_chunk(provider, hash)
-                    .await?
-                    .ok_or(NetError::MissingChunk(hash))?;
-                Ok::<(usize, Vec<u8>), NetError>((i, bytes))
+        // Each chunk starts at a round-robin provider (spreading load evenly)
+        // and falls back to the rest, in order, before failing that chunk.
+        let n = providers.len();
+        let mut stream = futures::stream::iter(missing.into_iter().enumerate())
+            .map(|(slot, (i, hash))| async move {
+                let mut last_err = NetError::MissingChunk(hash);
+                for k in 0..n {
+                    let p = providers[(slot + k) % n];
+                    match self.fetch_chunk(p, hash).await {
+                        Ok(Some(bytes)) => return Ok::<(usize, Vec<u8>, PeerId), NetError>((i, bytes, p)),
+                        Ok(None) => last_err = NetError::MissingChunk(hash),
+                        Err(e) => last_err = e,
+                    }
+                }
+                Err(last_err)
             })
             .buffer_unordered(PARALLEL);
 
-        let mut fetched_bytes: u64 = 0;
+        let mut fetched_bytes: HashMap<PeerId, u64> = HashMap::new();
         while let Some(result) = stream.next().await {
-            let (i, bytes) = result?;
+            let (i, bytes, from) = result?;
             if !manifest.chunk_hash_ok(i, &bytes) {
                 return Err(NetError::BadChunk);
             }
-            fetched_bytes += bytes.len() as u64;
+            *fetched_bytes.entry(from).or_insert(0) += bytes.len() as u64;
             into.put(&bytes)?;
             done += 1;
             on_progress(done, total);
         }
-        if fetched_bytes > 0 {
-            let _ = self.submit_receipt(provider, fetched_bytes).await;
+        for (peer, bytes) in fetched_bytes {
+            if bytes > 0 {
+                let _ = self.submit_receipt(peer, bytes).await;
+            }
         }
         Ok(manifest)
     }

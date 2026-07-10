@@ -203,7 +203,23 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
   store directory itself stays under a tenth of the content size.
 - **FEC permanence for real:** today only a full holder can mint symbols. Store and
   forward *partial* symbol sets across peers for true churn resilience.
-- **Resumable / multi-source downloads:** fetch chunks from several providers at once.
+- ✅ **Resumable / multi-source downloads:** `Network::download_multi`/
+  `download_multi_with_progress` (`crates/np2ptp-net/src/lib.rs`) take
+  `providers: &[PeerId]` instead of one. The manifest comes from whichever
+  provider answers first; each chunk starts at a round-robin provider and
+  falls back to the rest, in order, before failing that chunk — a single
+  unreachable/missing-chunk provider no longer aborts the whole download.
+  Each provider is credited a receipt only for the bytes it actually served
+  (`HashMap<PeerId, u64>`, not one aggregate total). `download`/
+  `download_with_progress` (single provider) are now thin wrappers calling
+  this with a one-element slice — no existing caller needed to change.
+  `download_fec`/`download_fec_with_progress` are still single-provider;
+  FEC's "any sufficiently large symbol set works" property makes them an
+  even more natural fit for this, just not done yet.
+  Verified with a real disconnect: two seeders holding identical content,
+  one dropped mid-session, `download_multi` still completes via the other
+  and credits it correctly; confirmed to actually fail without the
+  per-chunk fallback (`crates/np2ptp-net/tests/multi_source.rs`).
 - ✅ **Signed-receipt exchange over the wire** — done. `SubmitReceipt`/`GetReceipts`
   ride the existing request-response protocol; see "Incentives" above.
   ✅ **GC on disconnect** — `SwarmEvent::ConnectionClosed { num_established: 0, .. }`

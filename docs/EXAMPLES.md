@@ -217,6 +217,8 @@ let net = Network::spawn(store, None)?;
 net.listen("/ip4/0.0.0.0/udp/0/quic-v1".parse()?).await?;
 net.provide(&manifest).await?;
 let downloaded = net.download(root, provider_peer_id, &local_store).await?;
+// Or from several providers at once — falls back per-chunk if one is down:
+let downloaded = net.download_multi(root, &[peer_a, peer_b], &local_store).await?;
 ```
 
 See each crate's own documentation comments (`cargo doc --open -p np2ptp-net`,
