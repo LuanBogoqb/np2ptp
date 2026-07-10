@@ -205,9 +205,14 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
   forward *partial* symbol sets across peers for true churn resilience.
 - **Resumable / multi-source downloads:** fetch chunks from several providers at once.
 - ✅ **Signed-receipt exchange over the wire** — done. `SubmitReceipt`/`GetReceipts`
-  ride the existing request-response protocol; see "Incentives" above. Remaining:
-  per-peer state (`rep_peers`, `receipts_pulled_from`) has no GC on disconnect —
-  fine for now, worth pruning if a long-lived node sees heavy peer churn.
+  ride the existing request-response protocol; see "Incentives" above.
+  ✅ **GC on disconnect** — `SwarmEvent::ConnectionClosed { num_established: 0, .. }`
+  now clears `rep_peers`/`receipts_pulled_from` for that peer (never `ledger` —
+  reputation persists and travels across reconnects on purpose). Without this,
+  a peer that disconnects and reconnects (same identity, e.g. a restart) never
+  got its receipts pulled again, even after earning a new one while away.
+  Verified with a real disconnect+reconnect (`np2ptp-net/tests/receipt_gc.rs`),
+  confirmed to actually fail without the fix, not just pass incidentally.
 - **Mutable content:** signed pointers (a key "names" a feed) — IPNS/Dat style.
 
 ### ⏳ Phase 4 — Product & UX

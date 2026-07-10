@@ -842,6 +842,14 @@ impl EventLoop {
                 // depends on pruning them from Kademlia's on our side.
                 mdns::Event::Expired(_) => {}
             },
+            // Only once every connection to this peer is gone (it could have
+            // more than one) — and only the transient per-connection
+            // bookkeeping, never `ledger`: reputation is meant to persist and
+            // travel across reconnects, not reset on disconnect.
+            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                self.rep_peers.remove(&peer_id);
+                self.receipts_pulled_from.remove(&peer_id);
+            }
             _ => {}
         }
     }
