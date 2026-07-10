@@ -812,6 +812,10 @@ impl EventLoop {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Upnp(event)) => match event {
                 upnp::Event::NewExternalAddr(addr) => {
+                    // Without this, UPnP finds the mapped address but nothing
+                    // ever announces it — relay's own reservation-usability
+                    // gotcha, applies here too.
+                    self.swarm.add_external_address(addr.clone());
                     eprintln!("upnp: mapped a public address via the router: {addr}");
                 }
                 upnp::Event::GatewayNotFound => {
@@ -821,6 +825,7 @@ impl EventLoop {
                     eprintln!("upnp: gateway has no public IP (CGNAT?) — needs relay/hole-punch");
                 }
                 upnp::Event::ExpiredExternalAddr(addr) => {
+                    self.swarm.remove_external_address(&addr);
                     eprintln!("upnp: external address expired: {addr}");
                 }
             },

@@ -173,9 +173,16 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
      `fetch` invocation does by default, not just adds new code.
    - Wire the `torrent` command to use discovery as well.
 3. **NAT without a VPN** (the real adoption unlock):
-   - **UPnP / NAT-PMP** — libp2p port-mapping behaviour so the node auto-opens a
-     router port and becomes publicly reachable (this is *the* big win; how torrents
-     "just work").
+   - ✅ **UPnP** — libp2p `upnp::tokio::Behaviour` was already wired (spawn +
+     event logging); fixed the actual gap: `NewExternalAddr` now calls
+     `swarm.add_external_address()` (previously only logged — the mapped
+     address was found but never announced, so it went unused, same
+     reservation-usability gotcha as relay). `ExpiredExternalAddr` now calls
+     `remove_external_address()` symmetrically.
+   - ✅ **NAT-PMP/PCP** — already done, just not a libp2p `NetworkBehaviour`:
+     `crates/np2ptp-node/src/portmap.rs` (`crab_nat` crate) tries PCP then
+     NAT-PMP on the default gateway, called from `cmd_serve` as a second
+     avenue alongside UPnP/IGD. Documented in `docs/RELAY.md`.
    - Finish **DCUtR + relay** (debug the relayed-QUIC teardown on real NATs).
    - Run a public **relay** as the always-works fallback.
 
