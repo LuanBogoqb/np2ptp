@@ -193,8 +193,14 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
 ### ⏳ Phase 3 — Hardening & performance
 - **Store performance:** packing 3 GB took ~219 s (~15 MB/s) because every chunk is
   a separate small file. Consider packfiles / larger avg chunk / batched writes.
-- **No-copy / streaming bridge:** avoid duplicating 51 GB into the store; verify
-  pieces by streaming from disk.
+- ✅ **No-copy / streaming bridge:** already there — `convert_local`/
+  `resolve_or_convert_local` (`streaming.rs`) verify pieces by streaming from
+  disk (`verify_pieces_streaming`, 64 KiB windows) and, with `no_copy: true`,
+  call `Store::ingest_tree_files_no_copy` instead of copying chunks in.
+  Confirmed end-to-end: `convert_local_no_copy_does_not_duplicate_a_sizeable_torrent_on_disk`
+  (`crates/np2ptp-bridge/tests/streaming_convert.rs`) converts an 8 MB
+  two-file torrent with `--no-copy` and asserts `object_count() == 0` and the
+  store directory itself stays under a tenth of the content size.
 - **FEC permanence for real:** today only a full holder can mint symbols. Store and
   forward *partial* symbol sets across peers for true churn resilience.
 - **Resumable / multi-source downloads:** fetch chunks from several providers at once.

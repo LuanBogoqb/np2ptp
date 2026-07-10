@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use np2ptp_bridge::{convert, verify_pieces_streaming, BridgeError, TorrentFile, TorrentMeta};
+use np2ptp_bridge::{convert, convert_local, verify_pieces_streaming, BridgeError, TorrentFile, TorrentMeta};
 use np2ptp_store::Store;
 use sha1::{Digest, Sha1};
 
@@ -90,7 +90,7 @@ fn streaming_verifier_rejects_piece_count_mismatch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn convert_local_matches_in_memory_convert_root() {
-    use np2ptp_bridge::{convert_local, TorrentSource, TorrentDownload};
+    use np2ptp_bridge::{TorrentSource, TorrentDownload};
 
     let files = vec![
         ("dir/a.bin".to_string(), sample(200_000, 4)),
@@ -151,8 +151,6 @@ async fn convert_local_matches_in_memory_convert_root() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn convert_local_rejects_corrupted_file_on_disk() {
-    use np2ptp_bridge::convert_local;
-
     let files = vec![("a.bin".to_string(), sample(60_000, 6))];
     let piece_length = 16_384;
     let piece_hashes = piece_hashes_for(&files, piece_length);
@@ -175,4 +173,74 @@ async fn convert_local_rejects_corrupted_file_on_disk() {
         convert_local(&store, &meta, data_dir.path(), false),
         Err(BridgeError::PieceVerificationFailed)
     ));
+}
+
+/// End-to-end check of the ROADMAP's "no-copy bridge" concern: converting a
+/// sizeable already-downloaded torrent with `--no-copy` must not duplicate
+/// its bytes into the store, and must still verify + reconstruct correctly.
+/// 8 MB is plenty to catch a "copies everything anyway" bug (it would show
+/// up the same way regardless of file size) without slowing the suite down
+/// the way an actual 50+ GB fixture would.
+#[test]
+fn convert_local_no_copy_does_not_duplicate_a_sizeable_torrent_on_disk() {
+    let files = vec![
+        ("videos/movie.bin".to_string(), sample(5_000_000, 7)),
+        ("subs/movie.srt".to_string(), sample(3_000_000, 8)),
+    ];
+    let piece_length = 262_144; // 256 KiB, a realistic BitTorrent piece size
+    let piece_hashes = piece_hashes_for(&files, piece_length);
+    let total_bytes: u64 = files.iter().map(|(_, b)| b.len() as u64).sum();
+    let meta = TorrentMeta {
+        infohash: vec![9u8; 20],
+        name: "big-pack".to_string(),
+        files: files.iter().map(|(p, b)| TorrentFile { path: p.clone(), length: b.len() as u64 }).collect(),
+        piece_length: piece_length as u32,
+        piece_hashes,
+    };
+
+    let data_dir = TmpDir::new();
+    for (rel, bytes) in &files {
+        let p = data_dir.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+    }
+
+    let store_dir = TmpDir::new();
+    let store = Store::open(store_dir.path()).unwrap();
+    let manifest = convert_local(&store, &meta, data_dir.path(), true).unwrap();
+
+    // No chunk was copied into the store — no_copy references the source
+    // files in place instead.
+    assert_eq!(store.object_count().unwrap(), 0, "no-copy must not write chunk files into the store");
+
+    // The store directory itself stays tiny (just refs.tsv bookkeeping),
+    // nowhere near the ~8 MB of actual content — the real "no duplication"
+    // guarantee, not just an object count of zero.
+    let store_disk_bytes = dir_size(store_dir.path());
+    assert!(
+        store_disk_bytes < total_bytes / 10,
+        "store dir ({store_disk_bytes} bytes) should stay far below the content size ({total_bytes} bytes)"
+    );
+
+    // And it still reconstructs correctly by reading through the reference.
+    let rebuilt = store.export_tree(&manifest).unwrap();
+    let mut rebuilt_sorted = rebuilt.clone();
+    rebuilt_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut expected_sorted = files.clone();
+    expected_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(rebuilt_sorted, expected_sorted);
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let meta = entry.metadata().unwrap();
+        if meta.is_dir() {
+            total += dir_size(&entry.path());
+        } else {
+            total += meta.len();
+        }
+    }
+    total
 }
