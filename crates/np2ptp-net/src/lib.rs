@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::{
-    autonat, dcutr, identify, identity, kad, noise, relay,
+    autonat, dcutr, identify, identity, kad, mdns, noise, relay,
     request_response::{self, ProtocolSupport},
     swarm::SwarmEvent,
     upnp, yamux, StreamProtocol, Swarm,
@@ -163,6 +163,9 @@ struct Behaviour {
     // Auto-open a port on the home router (IGD) so the node is reachable from the
     // open internet without a VPN — the single biggest NAT win for home users.
     upnp: upnp::tokio::Behaviour,
+    // Zero-config discovery on the same LAN — no tracker/DHT/--peer needed to
+    // find another NP2PTP node a few feet away.
+    mdns: mdns::tokio::Behaviour,
 }
 
 /// Commands sent from a [`Network`] handle to the swarm task.
@@ -230,6 +233,10 @@ impl Network {
         let keypair = identity::Keypair::ed25519_from_bytes(&mut seed_bytes)
             .map_err(|e| NetError::Build(e.to_string()))?;
         let local_peer_id = keypair.public().to_peer_id();
+        // Built outside the `with_behaviour` closure (which must be infallible)
+        // so its `io::Result` can still propagate through `NetError::Build`.
+        let mdns_behaviour = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
+            .map_err(|e| NetError::Build(e.to_string()))?;
 
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -253,6 +260,7 @@ impl Network {
                     dcutr: dcutr::Behaviour::new(peer_id),
                     autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
                     upnp: upnp::tokio::Behaviour::default(),
+                    mdns: mdns_behaviour,
                 }
             })
             .map_err(|e| NetError::Build(e.to_string()))?
@@ -815,6 +823,19 @@ impl EventLoop {
                 upnp::Event::ExpiredExternalAddr(addr) => {
                     eprintln!("upnp: external address expired: {addr}");
                 }
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(event)) => match event {
+                mdns::Event::Discovered(found) => {
+                    for (peer_id, addr) in found {
+                        // Route through Kademlia (so find_providers/get_record can
+                        // use it) and dial directly (same LAN, should connect fast).
+                        self.swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                        let _ = self.swarm.dial(addr);
+                    }
+                }
+                // Addresses just age out of libp2p-mdns's own table; nothing here
+                // depends on pruning them from Kademlia's on our side.
+                mdns::Event::Expired(_) => {}
             },
             _ => {}
         }

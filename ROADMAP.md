@@ -155,9 +155,22 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
    - ✅ **HTTP discovery tracker** — LIVE at `https://nptp.bogotec.uk`, self-hosted
      on the VPS (`tracker/`, systemd + Caddy). `serve` announces; `fetch <link>`
      with no `--peer` discovers providers and downloads. Validated end-to-end.
-   - **mDNS** — libp2p mDNS behaviour for zero-config discovery on the same LAN.
+   - ✅ **mDNS** — libp2p mDNS behaviour wired (`crates/np2ptp-net/src/lib.rs`):
+     a discovered peer is added to Kademlia and dialed directly, zero config.
+     Can't be validated by an automated test in this dev sandbox (multicast
+     isn't delivered between two local processes here — same category as the
+     relay test below); `crates/np2ptp-net/tests/mdns.rs` documents this and
+     is `#[ignore]`d, needs a real network to confirm by hand.
    - **Bootstrap DHT nodes** — run 1+ stable nodes (persist the Ed25519 key for a
      fixed peer id) so `find_providers(root)` works without the tracker too.
+     Not done: today only nodes that actually need the relay *for NAT
+     fallback* ever dial it (`serve`/`fetch`'s relay logic is conditional on
+     `has_external` being false), so a node with a working public/UPnP
+     address never seeds its Kademlia table from a stable, known-good peer.
+     Needs a deliberate default-behavior change (dial a bootstrap contact
+     unconditionally, distinct from the NAT-fallback relay circuit) — flagged
+     for a decision before implementing, since it changes what every `serve`/
+     `fetch` invocation does by default, not just adds new code.
    - Wire the `torrent` command to use discovery as well.
 3. **NAT without a VPN** (the real adoption unlock):
    - **UPnP / NAT-PMP** — libp2p port-mapping behaviour so the node auto-opens a
