@@ -191,8 +191,36 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
    - Run a public **relay** as the always-works fallback.
 
 ### ⏳ Phase 3 — Hardening & performance
-- **Store performance:** packing 3 GB took ~219 s (~15 MB/s) because every chunk is
-  a separate small file. Consider packfiles / larger avg chunk / batched writes.
+- ✅ **Store performance:** packing used to take ~219 s for 3 GB (~15 MB/s)
+  because every chunk was its own small file (`objects/<aa>/<hex>`, one
+  open+write+rename per chunk). Chunks now append to `packs/<id>.pack`
+  (rotated at 256 MiB, `PACK_ROTATE_SIZE` in `crates/np2ptp-store/src/lib.rs`)
+  with a hash → `(pack_id, offset, length)` index in `packs/index` — one
+  `write` on an already-open file handle per chunk, no new inode/directory
+  entry. **Measured: 1 GB packed in ~8 s (~135 MB/s), ~9x the old rate**,
+  verified byte-identical on a full round trip (`pack` → `get`).
+  A store from before this existed keeps working: `get`/`has`/`put`'s dedup
+  check all fall back to the old per-chunk-file layout, but every new chunk
+  goes to a pack — see `crates/np2ptp-store/tests` (well, unit tests in
+  `lib.rs`): `reads_a_chunk_from_the_old_per_chunk_file_layout`,
+  `put_on_a_legacy_object_dedups_instead_of_double_writing_to_the_pack`,
+  `new_writes_after_upgrade_go_to_a_pack_not_the_legacy_layout`.
+  **Real bug hit and fixed along the way:** two independent `Store` handles
+  opened on the same directory (a completely normal pattern here —
+  `Network::spawn` owns one, a caller opens a second right after) each kept
+  their own in-memory pack index, so one handle couldn't see chunks the
+  *other* had just packed — caught by `np2ptp-bridge`'s existing
+  `second_node_resolves_torrent_from_np2ptp_without_converting` test failing,
+  not a new one written for this. Fixed with a refresh-on-miss that tails
+  only the *new* bytes appended to `packs/index` since last checked
+  (`Store::refresh_pack_index`) — the first attempt re-read and re-parsed
+  the *whole* index file on every miss, which is exactly what happens on
+  every `put()` of a chunk nobody's ever seen before (the common case for
+  `pack`), making a 1 GB file's ~13,000 new chunks an accidental O(n²): it
+  hung past 3 minutes before this was caught by actually timing a real pack,
+  not just trusting the unit tests (which run on small enough data that the
+  quadratic cost that hangs a real file never printed). Pinned with
+  `a_second_store_instance_sees_chunks_the_first_one_packed`.
 - ✅ **No-copy / streaming bridge:** already there — `convert_local`/
   `resolve_or_convert_local` (`streaming.rs`) verify pieces by streaming from
   disk (`verify_pieces_streaming`, 64 KiB windows) and, with `no_copy: true`,
