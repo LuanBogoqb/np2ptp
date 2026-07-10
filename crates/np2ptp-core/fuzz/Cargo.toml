@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "np2ptp-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.np2ptp-core]
+path = ".."
+
+[[bin]]
+name = "manifest_from_nptp"
+path = "fuzz_targets/manifest_from_nptp.rs"
+test = false
+doc = false
+bench = false

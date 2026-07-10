@@ -52,6 +52,31 @@ auto-detect. If a fresh shell can't find `link.exe`, build from an "x64 Native
 Tools Command Prompt" (or run `vcvars64.bat` first) — this is usually unnecessary
 once `rustc`'s own auto-detection kicks in.
 
+## Fuzzing
+
+The two parsers that touch adversarial bytes before anything is verified —
+`.torrent` files and `.nptp` manifests — have
+[`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) targets:
+
+```sh
+cargo install cargo-fuzz
+rustup toolchain install nightly   # cargo-fuzz requires nightly
+
+cd crates/np2ptp-bridge && cargo +nightly fuzz run bencode_parse
+cd crates/np2ptp-core   && cargo +nightly fuzz run manifest_from_nptp
+```
+
+Add `-- -max_total_time=60` (seconds) to bound a run instead of letting it go
+indefinitely. On Windows/MSVC, cargo-fuzz currently doesn't work in this
+project: with AddressSanitizer, the runtime DLL isn't part of a standard
+rustup nightly install; without it (`--sanitizer none`), nothing provides the
+coverage instrumentation's `__sancov_*` symbols at link time either way, and
+`bencode_parse` additionally fails to *build* under sancov because
+`np2ptp-bridge` transitively pulls in all of `np2ptp-net` (libp2p, DHT, QUIC)
+just to fuzz a parser with no networking of its own — a dependency in that
+graph (`if-watch`) doesn't link under Windows+sancov. Run these on
+Linux/macOS/WSL instead.
+
 ## Continuous Integration
 
 Every push tagged `v*` (or a manual `workflow_dispatch`) triggers

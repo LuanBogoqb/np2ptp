@@ -213,6 +213,24 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
   got its receipts pulled again, even after earning a new one while away.
   Verified with a real disconnect+reconnect (`np2ptp-net/tests/receipt_gc.rs`),
   confirmed to actually fail without the fix, not just pass incidentally.
+- ✅ **Fuzzing the untrusted-input parsers** — `.torrent` files and `.nptp`
+  manifests are the two parsers that touch adversarial bytes (disk or
+  network) before anything is verified. `cargo-fuzz` targets:
+  `crates/np2ptp-bridge/fuzz/fuzz_targets/bencode_parse.rs`
+  (`parse_torrent_file`) and
+  `crates/np2ptp-core/fuzz/fuzz_targets/manifest_from_nptp.rs`
+  (`Manifest::from_nptp`). **Not actually run on this dev machine**: cargo-fuzz
+  needs nightly + libFuzzer, and Windows MSVC hit a wall both ways — with
+  AddressSanitizer, the runtime DLL cargo-fuzz expects isn't part of this
+  rustup nightly install; without it (`--sanitizer none`), the coverage
+  instrumentation (`__sancov_*` symbols) has nothing providing them at link
+  time either way, and `np2ptp-bridge`'s target additionally fails to even
+  *build* under sancov because it transitively pulls in all of `np2ptp-net`
+  (libp2p, DHT, QUIC) just to fuzz a parser with zero networking of its own —
+  a dependency in that graph (`if-watch`) doesn't link under Windows+sancov.
+  Run these on Linux/macOS/WSL instead: `cd crates/np2ptp-bridge && cargo
+  +nightly fuzz run bencode_parse` (same for `np2ptp-core` /
+  `manifest_from_nptp`).
 - **Mutable content:** signed pointers (a key "names" a feed) — IPNS/Dat style.
 
 ### ⏳ Phase 4 — Product & UX
