@@ -2,14 +2,26 @@
 //!
 //! Status on a single dev machine:
 //! * ✅ A "behind-NAT" listener obtains a **relay reservation** and gets a usable
-//!   `/…/p2p-circuit/p2p/<peer>` address (the test below).
-//! * 🚧 A full **data transfer over the relayed connection** is flaky on loopback:
-//!   the circuit connects, then the relayed (QUIC→circuit→noise→yamux) stream
-//!   tears down with a decode error, and DCUtR hole-punching times out because
-//!   there is no real NAT to punch through. That path needs real NATed hosts (or
-//!   the simulation harness) to validate; the `download_through_a_relay` test is
-//!   `#[ignore]`d until then. The relay/dcutr/autonat behaviours are wired in and
-//!   work for real deployments.
+//!   `/…/p2p-circuit/p2p/<peer>` address (`listener_gets_relay_reservation`).
+//! * ✅ A full **data transfer over the relayed connection** works on loopback
+//!   (`download_through_a_relay`, `relay_moves_content_past_the_old_default_byte_cap`).
+//!   This used to be `#[ignore]`d as "flaky, needs real NATs" — that diagnosis
+//!   was wrong. The actual cause: `relay::Config::default()` caps a circuit at
+//!   128 KiB, and `download_through_a_relay`'s 120,000-byte payload sat just
+//!   under that cap, right at the edge of failing. Once `relay_config()`
+//!   raised the cap to 512 MiB (see `lib.rs`), re-running the un-ignored test
+//!   passed 5/5 — no real NAT involved, loopback the whole time.
+//!
+//! DCUtR hole-punching itself (as opposed to the relay circuit) still has
+//! nothing to punch through on loopback and is only validated against a real
+//! NAT by hand (see `docs/RELAY.md`).
+//!
+//! Unrelated background noise you may see in `--nocapture` output: a
+//! "failed to persist receipts" I/O error and an occasional UPnP background-task
+//! panic ("sender shouldn't have been dropped"), both from an *earlier* test's
+//! `Network` being dropped (its temp dir removed) while its own background
+//! tasks were still winding down. Neither affects this file's assertions —
+//! all three tests pass either way — but it's real noise, not imagined.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -109,9 +121,7 @@ async fn listener_gets_relay_reservation() {
     );
 }
 
-/// Full content download through a relay. Flaky on loopback (see module docs);
-/// run explicitly with `cargo test -- --ignored` on real NATed hosts.
-#[ignore = "relayed data transfer over QUIC needs real NATs; reservation path is covered above"]
+/// Full content download through a relay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn download_through_a_relay() {
     let relay_dir = TmpDir::new();
@@ -167,12 +177,11 @@ async fn download_through_a_relay() {
 /// multi-thousand-chunk `.nptp` file through the relay failed every time —
 /// not flaky, every time — because `relay::Config::default()` caps a
 /// circuit at `max_circuit_bytes` = 128 KiB (`1 << 17`), and the manifest
-/// alone (a few thousand chunk hashes) was already ~12x over that. This is
-/// also almost certainly why `download_through_a_relay` above was flaky:
-/// its 120_000-byte payload sits just under that same 128 KiB cap. The fix
+/// alone (a few thousand chunk hashes) was already ~12x over that. This was
+/// confirmed to be why `download_through_a_relay` above used to be flaky too:
+/// its 120_000-byte payload sat just under that same 128 KiB cap. The fix
 /// (`relay_config()` in `lib.rs`) raises the cap to 512 MiB / 10 min, so
-/// this payload — comfortably past the *old* cap — should now transfer
-/// cleanly.
+/// this payload — comfortably past the *old* cap — transfers cleanly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_moves_content_past_the_old_default_byte_cap() {
     let relay_dir = TmpDir::new();

@@ -28,12 +28,14 @@ cargo test -p np2ptp-core       # a single crate
 cargo clippy --workspace --all-targets   # lints; keep at 0 warnings
 ```
 
-The workspace currently carries roughly 85 unit and integration tests, including
+The workspace currently carries roughly 110 unit and integration tests, including
 real `libp2p` nodes exchanging content over QUIC (chunk-by-chunk and via RaptorQ
-symbols), DHT peer discovery, reputation-based choking, and a behind-NAT node
-obtaining a relay reservation. One relayed-transfer test is `#[ignore]`d — it is
-flaky on loopback and is instead validated against a real NAT by hand; see
-[Relay Setup](RELAY.md) for that story.
+symbols), DHT peer discovery, reputation-based choking, a behind-NAT node
+obtaining a relay reservation, and a full download through that relay. One
+mDNS test is `#[ignore]`d — this dev sandbox doesn't deliver UDP multicast
+between two local processes, so it needs a real network to confirm by hand;
+see [Relay Setup](RELAY.md) for the relay story (no longer ignored — see
+that doc for what was actually wrong).
 
 ## Windows Setup
 

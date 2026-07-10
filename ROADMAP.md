@@ -113,9 +113,12 @@ writing `reports/REPORT.md` + `results.csv`.
 - **Relay:** a relay node must call `add_external_address(its_listen_addr)` or the
   reservations it grants are address-less and clients reject them
   (`NoAddressesInReservation`). Connect to the relay BEFORE listening on the
-  circuit. **Relayed *data transfer* over QUIC is flaky on loopback** — the
-  reservation works, but the relayed stream tears down; needs real NATs to validate
-  (`download_through_a_relay` is `#[ignore]`d).
+  circuit. Relayed data transfer over QUIC used to look flaky on loopback, but
+  that was a misdiagnosis: the real cause was `relay::Config::default()`'s
+  128 KiB circuit cap (see `relay_config()` in `np2ptp-net/src/lib.rs`), not
+  loopback/NAT — with the cap raised, `download_through_a_relay` passes
+  every time and is no longer `#[ignore]`d. DCUtR hole-punching itself still
+  has nothing to punch through on loopback and needs a real NAT to validate.
 - **Tailscale is a TEST crutch, not the answer.** Real NAT story = UPnP/NAT-PMP +
   DCUtR + a public relay fallback (see Phase 2). Requiring a VPN would kill adoption.
 - **Bridge determinism:** convert torrents by chunking files in the **torrent's
@@ -158,9 +161,10 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
    - ✅ **mDNS** — libp2p mDNS behaviour wired (`crates/np2ptp-net/src/lib.rs`):
      a discovered peer is added to Kademlia and dialed directly, zero config.
      Can't be validated by an automated test in this dev sandbox (multicast
-     isn't delivered between two local processes here — same category as the
-     relay test below); `crates/np2ptp-net/tests/mdns.rs` documents this and
-     is `#[ignore]`d, needs a real network to confirm by hand.
+     isn't delivered between two local processes here — same category as
+     DCUtR hole-punching below, which also needs a real network, not
+     loopback); `crates/np2ptp-net/tests/mdns.rs` documents this and is
+     `#[ignore]`d, needs a real network to confirm by hand.
    - **Bootstrap DHT nodes** — run 1+ stable nodes (persist the Ed25519 key for a
      fixed peer id) so `find_providers(root)` works without the tracker too.
      Not done: today only nodes that actually need the relay *for NAT
