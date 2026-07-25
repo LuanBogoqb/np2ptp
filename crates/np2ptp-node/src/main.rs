@@ -403,15 +403,31 @@ fn write_output_with_progress(
 }
 
 async fn wait_for_listeners(net: &Network) -> Vec<Multiaddr> {
-    for _ in 0..40 {
+    // Listener addresses trickle in one interface at a time, so returning at
+    // the first non-empty poll can miss most of them (loopback included).
+    // Wait until the list holds still for a few polls — and be generous with
+    // the overall deadline (10s): a cold start can take well over 2s to bind,
+    // and giving up early means `serve` never prints its direct-fetch
+    // addresses at all.
+    let mut last: Vec<Multiaddr> = Vec::new();
+    let mut stable = 0;
+    for _ in 0..200 {
         if let Ok(addrs) = net.listeners().await {
             if !addrs.is_empty() {
-                return addrs;
+                if addrs.len() == last.len() {
+                    stable += 1;
+                    if stable >= 4 {
+                        return addrs;
+                    }
+                } else {
+                    stable = 0;
+                }
+                last = addrs;
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Vec::new()
+    last
 }
 
 /// Extract the UDP port from a `/…/udp/<port>/…` multiaddr.
@@ -422,7 +438,7 @@ fn udp_port(addr: &Multiaddr) -> Option<u16> {
 /// Seed content on the network: load a `.nptp`, serve its chunks from the store,
 /// and announce it on the DHT until interrupted.
 fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (pos, flags) = parse(args, &["--store", "--listen", "--tracker", "--public", "--relay"]);
+    let (pos, flags) = parse(args, &["--store", "--listen", "--tracker", "--public", "--relay", "--choke-threshold"]);
     let file = *pos.first().ok_or("serve: missing <file.nptp>")?;
     let manifest = Manifest::from_nptp(&fs::read(file)?)?;
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
@@ -451,10 +467,23 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| tracker::DEFAULT_TRACKER.to_string());
     let no_tracker = flags.contains_key("no-tracker");
     let json = flags.contains_key("json");
+    // Arm the reputation choke: refuse chunks to any peer whose reciprocity
+    // (bytes they gave us + valid receipts − bytes we gave them) falls below
+    // -N. Off by default — the ledger still records everything either way.
+    let choke_threshold: Option<i64> = flags
+        .get("choke-threshold")
+        .map(|v| v.parse().map_err(|_| format!("serve: --choke-threshold expects a byte count, got {v:?}")))
+        .transpose()?;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let net = Network::spawn(store, Some(identity_seed))?;
+        if let Some(t) = choke_threshold {
+            net.set_choke_threshold(t).await?;
+            if !json {
+                println!("choke: refusing peers whose reciprocity drops below -{t} bytes");
+            }
+        }
         net.listen(listen.parse()?).await?;
         net.provide(&manifest).await?;
         let peer = net.local_peer_id();
@@ -888,7 +917,7 @@ fn print_usage() {
          \x20 np2ptp pack  <input> [--out <file.nptp>] [--store <dir>] [--name <name>] [--no-copy]\n\
          \x20 np2ptp info  <file.nptp>\n\
          \x20 np2ptp get   <file.nptp> --source <store-dir> [--store <dir>] [--out <output>]\n\
-         \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay]\n\
+         \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay] [--choke-threshold <bytes>]\n\
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\
          \x20 np2ptp torrent <file.torrent|magnet:...> [--data <dir>] [--store <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\n\
@@ -902,6 +931,9 @@ fn print_usage() {
          \x20 'serve' falls back to the public relay automatically when --public/UPnP/NAT-PMP\n\
          \x20 all fail to find a reachable address (e.g. CGNAT) — override with --relay, or\n\
          \x20 disable with --no-relay.\n\
+         \x20 --choke-threshold arms the reputation choke: peers whose reciprocity (bytes given\n\
+         \x20 to us + signed receipts - bytes we served them) drops below -<bytes> are refused\n\
+         \x20 further chunks. Off by default; 0 is the strictest setting.\n\
          \x20 Default store dir: {DEFAULT_STORE}"
     );
 }

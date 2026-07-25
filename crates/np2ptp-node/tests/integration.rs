@@ -344,6 +344,115 @@ fn serve_json_emits_only_valid_ndjson() {
     );
 }
 
+/// `serve --choke-threshold 0` must arm the reputation choke: a cold leech
+/// (fresh identity, nothing served, no receipts) gets its first chunk free,
+/// goes net-negative, and is then refused — so a multi-chunk fetch cannot
+/// complete. Mirrors `two_nodes::choke_blocks_a_non_reciprocating_peer`, but
+/// through the real binary, proving the CLI actually wires the flag through.
+#[test]
+fn serve_choke_threshold_cuts_off_a_cold_leech() {
+    let dir = TmpDir::new();
+    let input = dir.path().join("f.bin");
+    std::fs::write(&input, sample(2_000_000, 80)).unwrap();
+    let store_dir = dir.path().join("store");
+    let out = dir.path().join("f.nptp");
+
+    let pack_output = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
+        .arg("pack")
+        .arg(&input)
+        .arg("--store")
+        .arg(&store_dir)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(pack_output.status.success());
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
+        .arg("serve")
+        .arg(&out)
+        .arg("--store")
+        .arg(&store_dir)
+        .arg("--no-relay")
+        .arg("--no-tracker")
+        .arg("--choke-threshold")
+        .arg("0")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Read serve's stdout line by line until it prints a direct-fetch command
+    // with a loopback address — that's both the link and the peer multiaddr.
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut seen = Vec::new();
+    let mut fetch_line = None;
+    while std::time::Instant::now() < deadline && fetch_line.is_none() {
+        if let Ok(line) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            if line.contains("--peer") && line.contains("/ip4/127.0.0.1/") {
+                fetch_line = Some(line.clone());
+            }
+            seen.push(line);
+        }
+    }
+    let fetch_line = match fetch_line {
+        Some(l) => l,
+        None => {
+            let _ = child.kill();
+            panic!("serve never printed a 127.0.0.1 direct-fetch line; saw:\n{}", seen.join("\n"));
+        }
+    };
+    // Line shape: "  np2ptp fetch <link> --peer <multiaddr>"
+    let link = fetch_line
+        .split_whitespace()
+        .skip_while(|w| *w != "fetch")
+        .nth(1)
+        .expect("no link in fetch line")
+        .to_string();
+    let peer_addr = fetch_line
+        .split_whitespace()
+        .skip_while(|w| *w != "--peer")
+        .nth(1)
+        .expect("no --peer address in fetch line")
+        .to_string();
+
+    let leech_store = dir.path().join("leech-store");
+    let restored = dir.path().join("restored.bin");
+    let fetch_output = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
+        .arg("fetch")
+        .arg(&link)
+        .arg("--peer")
+        .arg(&peer_addr)
+        .arg("--store")
+        .arg(&leech_store)
+        .arg("--out")
+        .arg(&restored)
+        .output()
+        .unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let stderr = String::from_utf8_lossy(&fetch_output.stderr);
+    assert!(
+        !fetch_output.status.success(),
+        "a choked leech should not be able to complete the fetch"
+    );
+    assert!(
+        stderr.contains("download failed"),
+        "expected a download failure, got stderr: {stderr}"
+    );
+    assert!(!restored.exists(), "no output file should be written for a choked fetch");
+}
+
 #[test]
 fn torrent_json_converts_local_data_and_emits_a_final_result_event() {
     // Minimal hand-encoded single-file .torrent: a bencode dict with an

@@ -75,6 +75,11 @@ or tampered content cannot arrive undetected.
   downloading anything.
 - `np2ptp fetch ... --fec` — downloads using erasure coding (RaptorQ) instead of
   chunk by chunk; useful when seeders come and go.
+- `np2ptp serve ... --choke-threshold 0` — arms the reputation choke: peers that
+  only take (nothing given back, no signed receipts vouching for them) stop
+  receiving chunks once their deficit passes the threshold. Off by default, so
+  a plain `serve` never refuses anyone; the ledger records contributions either
+  way.
 
 See [Usage Examples](EXAMPLES.md) for real network transfers between two
 machines, non-interactive (`--json`) usage for scripting or embedding NP2PTP in
