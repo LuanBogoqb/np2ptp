@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "np2ptp-bridge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.np2ptp-bridge]
+path = ".."
+
+[[bin]]
+name = "bencode_parse"
+path = "fuzz_targets/bencode_parse.rs"
+test = false
+doc = false
+bench = false

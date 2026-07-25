@@ -83,9 +83,12 @@ below for how this was confirmed against a real CGNAT host.
 The relay (v2), DCUtR, and AutoNAT behaviours are wired in. On a single
 development machine, a behind-NAT node successfully reserves a slot on a relay
 and gets a dialable `/…/p2p-circuit/p2p/<peer>` address (covered by a passing
-test). A *full content download through the relay* is flaky on loopback — the
-relayed QUIC stream tears down and DCUtR has no real NAT to punch on
-`127.0.0.1` — so that specific test stays `#[ignore]`d.
+test), and a *full content download through the relay* now passes reliably on
+loopback too. That test used to be `#[ignore]`d as "flaky, needs real NATs" —
+the actual cause turned out to be `relay::Config::default()`'s 128 KiB circuit
+cap, not loopback or NAT (see `np2ptp-net/tests/relay.rs`'s module doc). DCUtR
+hole-punching itself still has nothing to punch through on `127.0.0.1` and is
+only exercised for real against an actual NAT (below).
 
 That path **has been validated by hand against a real NAT**: a Windows host
 behind CGNAT (a Mikrotik router, no UPnP, no port forward) served content that a

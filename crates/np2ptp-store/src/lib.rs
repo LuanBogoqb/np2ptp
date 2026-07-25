@@ -1,20 +1,38 @@
 //! `np2ptp-store` — a content-addressed chunk store with dedup.
 //!
-//! Chunks are written to disk under their BLAKE3 hash, so the same bytes are
+//! Chunks are content-addressed by their BLAKE3 hash, so the same bytes are
 //! only ever stored once — no matter how many files or versions contain them.
 //! This is where the content-defined chunking from `np2ptp-core` turns into
 //! real savings: edit a big file and re-share it, and only the changed chunks
 //! cost new storage.
 //!
-//! Layout: `<root>/objects/<aa>/<full-hex>` where `aa` is the first hash byte,
-//! a 256-way fan-out that keeps directories small. Writes are atomic
-//! (temp file + rename) so a crash mid-write can't leave a corrupt object.
+//! Layout: new chunks are appended to `<root>/packs/<id>.pack` (rotated at
+//! [`PACK_ROTATE_SIZE`]), with a hash → `(pack_id, offset, length)` index in
+//! `<root>/packs/index` — one `write` per chunk on an already-open file
+//! handle, instead of a whole new small file (open + write + rename) per
+//! chunk. A store opened from before this existed still reads its old
+//! `<root>/objects/<aa>/<full-hex>` layout (`aa` = first hash byte, a 256-way
+//! fan-out) — `get`/`has`/`put`'s dedup check all fall back to it — but never
+//! write to it again; every new chunk goes to the packfile.
+//!
+//! `--no-copy` references (a chunk's bytes read from a source file the caller
+//! keeps in place, never copied in) are a separate mechanism from either
+//! layout above — see `refs.tsv` below.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
+
+/// Where a packed chunk's bytes live: a byte range inside one of this store's
+/// own `packs/<id>.pack` files.
+type PackLoc = (u32, u64, u32);
+
+/// Roll over to a new pack file once the current one reaches this size, so
+/// no single file grows unbounded and a crash mid-write only risks the tail
+/// of one pack, not the whole store.
+const PACK_ROTATE_SIZE: u64 = 256 * 1024 * 1024;
 
 use fastcdc::v2020::StreamCDC;
 use np2ptp_core::chunk::{AVG_CHUNK, MAX_CHUNK, MIN_CHUNK};
@@ -48,16 +66,47 @@ pub struct Store {
     /// the caller keeps in place. Appended to as `<dir>/refs.tsv`.
     refs_path: PathBuf,
     refs: RwLock<HashMap<Hash, RefLoc>>,
+    packs_dir: PathBuf,
+    pack_index_path: PathBuf,
+    pack_index: RwLock<HashMap<Hash, PackLoc>>,
+    /// Bytes of `pack_index_path` already parsed into `pack_index` — lets
+    /// [`Store::refresh_pack_index`] tail just the new bytes appended by a
+    /// sibling instance/process since last time, instead of re-reading and
+    /// re-parsing the whole (ever-growing) index file on every call. Without
+    /// this, packing N new chunks costs O(N²): every one of the N `put()`
+    /// calls would re-parse all chunks packed before it.
+    pack_index_pos: Mutex<u64>,
+    /// The currently-open pack file being appended to. A `Mutex` (not
+    /// `RwLock`): every write needs `current_size` read and advanced as one
+    /// atomic step, so there's never a reader-only case worth optimizing for.
+    pack_state: Mutex<PackState>,
 }
 
 impl Store {
     /// Open (creating if needed) a store rooted at `dir`.
     pub fn open(dir: impl AsRef<Path>) -> Result<Store, StoreError> {
-        let objects = dir.as_ref().join("objects");
+        let dir = dir.as_ref();
+        let objects = dir.join("objects");
         fs::create_dir_all(&objects)?;
-        let refs_path = dir.as_ref().join("refs.tsv");
+        let refs_path = dir.join("refs.tsv");
         let refs = load_refs(&refs_path)?;
-        Ok(Store { objects, refs_path, refs: RwLock::new(refs) })
+
+        let packs_dir = dir.join("packs");
+        fs::create_dir_all(&packs_dir)?;
+        let pack_index_path = packs_dir.join("index");
+        let (pack_index, pack_index_pos) = load_pack_index(&pack_index_path)?;
+        let pack_state = Mutex::new(PackState::open(&packs_dir)?);
+
+        Ok(Store {
+            objects,
+            refs_path,
+            refs: RwLock::new(refs),
+            packs_dir,
+            pack_index_path,
+            pack_index: RwLock::new(pack_index),
+            pack_index_pos: Mutex::new(pack_index_pos),
+            pack_state,
+        })
     }
 
     /// The directory this store was opened with (what was passed to
@@ -72,9 +121,58 @@ impl Store {
         self.objects.join(&hex[..2]).join(&hex)
     }
 
-    /// True if this exact content is already stored (copied in or referenced).
+    /// True if this exact content is already stored (packed, copied in under
+    /// the old per-chunk-file layout, or referenced).
     pub fn has(&self, h: &Hash) -> bool {
-        self.path_for(h).exists() || self.refs.read().unwrap().contains_key(h)
+        if self.pack_index.read().unwrap().contains_key(h)
+            || self.path_for(h).exists()
+            || self.refs.read().unwrap().contains_key(h)
+        {
+            return true;
+        }
+        // Miss so far — another `Store` instance/process pointed at this same
+        // directory (a very normal pattern here: e.g. `Network::spawn` owns
+        // one handle, a caller opens a second) may have packed this chunk
+        // after we last loaded our in-memory index. Refresh once and re-check
+        // before concluding it's really absent.
+        let _ = self.refresh_pack_index();
+        self.pack_index.read().unwrap().contains_key(h)
+    }
+
+    /// Pick up entries a sibling `Store` instance/process appended to
+    /// `packs/index` since we last checked — tailing only the *new* bytes
+    /// (a `stat` plus, only if the size grew, a seek+read of just the
+    /// tail), never re-reading the whole file. That distinction matters:
+    /// this runs on every `put()`/`has()` miss, so re-parsing the entire
+    /// index each time would make packing N new chunks cost O(N²).
+    fn refresh_pack_index(&self) -> Result<(), StoreError> {
+        let mut pos = self.pack_index_pos.lock().unwrap();
+        let len = match fs::metadata(&self.pack_index_path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if len <= *pos {
+            return Ok(()); // nothing new (the common case — just the one stat)
+        }
+        let mut f = File::open(&self.pack_index_path)?;
+        f.seek(SeekFrom::Start(*pos))?;
+        let mut tail = String::new();
+        f.read_to_string(&mut tail)?;
+        // Only fully-written lines are safe to parse — a concurrent
+        // append's write() may not have landed in full yet. Whatever's past
+        // the last newline is picked up on a later refresh once complete.
+        let Some(last_nl) = tail.rfind('\n') else { return Ok(()) };
+        let complete = &tail[..=last_nl];
+        let mut index = self.pack_index.write().unwrap();
+        for line in complete.lines() {
+            if let Some((h, loc)) = parse_pack_index_line(line) {
+                index.insert(h, loc);
+            }
+        }
+        drop(index);
+        *pos += complete.len() as u64;
+        Ok(())
     }
 
     /// Record that `h`'s bytes live at `data[offset..offset+length]` in
@@ -120,53 +218,90 @@ impl Store {
     }
 
     /// Store `bytes`, returning their hash. Returns `(hash, newly_written)` so
-    /// callers can measure dedup. A no-op if the content is already present.
+    /// callers can measure dedup. A no-op if the content is already present
+    /// (checked against the packfile index first, then the old per-chunk-file
+    /// layout — but new writes always go to the packfile).
     pub fn put(&self, bytes: &[u8]) -> Result<(Hash, bool), StoreError> {
         let h = Hash::of(bytes);
-        let dest = self.path_for(&h);
-        if dest.exists() {
+        if self.has(&h) {
             return Ok((h, false)); // dedup hit
         }
-        let dir = dest.parent().expect("object path always has a parent");
-        fs::create_dir_all(dir)?;
-
-        // Atomic write: unique temp name in the same dir, then rename.
-        let tmp = dir.join(format!("{}.tmp.{}", h.to_hex(), std::process::id()));
-        fs::write(&tmp, bytes)?;
-        match fs::rename(&tmp, &dest) {
-            Ok(()) => Ok((h, true)),
-            Err(e) => {
-                // Lost a race or hit an error; clean up. If the dest now exists,
-                // a concurrent writer won — treat as a dedup hit.
-                let _ = fs::remove_file(&tmp);
-                if dest.exists() {
-                    Ok((h, false))
-                } else {
-                    Err(e.into())
-                }
-            }
+        let mut state = self.pack_state.lock().unwrap();
+        // Re-check while holding the pack lock — it's the single
+        // serialization point for "is this new" for concurrent writers in
+        // *this* process; refresh first in case a sibling `Store`
+        // instance/process wrote this exact hash between our check above and
+        // taking the lock. Held across the write AND the index update below
+        // (not dropped until then) — otherwise a second thread could pass
+        // this same re-check before the first thread's write is indexed.
+        let _ = self.refresh_pack_index();
+        if self.pack_index.read().unwrap().contains_key(&h) || self.path_for(&h).exists() {
+            return Ok((h, false));
         }
+        let (pack_id, offset) = state.write(&self.packs_dir, bytes)?;
+        let length = bytes.len() as u32;
+        let written = append_pack_index_line(&self.pack_index_path, &h, pack_id, offset, length)?;
+        self.pack_index.write().unwrap().insert(h, (pack_id, offset, length));
+        // Advance our own read cursor past the line we just wrote, so a
+        // later refresh (e.g. the very next put()) never re-reads it —
+        // refresh_pack_index only exists to pick up *other* instances' writes.
+        *self.pack_index_pos.lock().unwrap() += written;
+        drop(state);
+        Ok((h, true))
     }
 
     /// Fetch content by hash, verifying it still matches on the way out.
-    /// Checks copied-in objects first, then the `--no-copy` reference index.
+    /// Checks the packfile index, then the old per-chunk-file layout, then
+    /// the `--no-copy` reference index.
     pub fn get(&self, h: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
-        let path = self.path_for(h);
-        match fs::read(&path) {
+        if let Some(bytes) = self.get_from_pack_index(h)? {
+            return Ok(Some(bytes));
+        }
+        match fs::read(self.path_for(h)) {
             Ok(bytes) => {
                 if Hash::of(&bytes) != *h {
                     return Err(StoreError::Corrupt(*h));
                 }
-                Ok(Some(bytes))
+                return Ok(Some(bytes));
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => self.get_reference(h),
-            Err(e) => Err(e.into()),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+            Err(_) => {}
         }
+        if let Some(bytes) = self.get_reference(h)? {
+            return Ok(Some(bytes));
+        }
+        // Still nothing local — refresh in case a sibling `Store`
+        // instance/process packed this chunk after we last loaded our
+        // in-memory index (see `has`), then try the pack index one more time.
+        self.refresh_pack_index()?;
+        self.get_from_pack_index(h)
     }
 
-    /// Number of distinct objects currently stored (walks the fan-out dirs).
+    fn get_from_pack_index(&self, h: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some((pack_id, offset, length)) = self.pack_index.read().unwrap().get(h).copied() else {
+            return Ok(None);
+        };
+        let bytes = self.read_from_pack(pack_id, offset, length)?;
+        if Hash::of(&bytes) != *h {
+            return Err(StoreError::Corrupt(*h));
+        }
+        Ok(Some(bytes))
+    }
+
+    fn read_from_pack(&self, pack_id: u32, offset: u64, length: u32) -> Result<Vec<u8>, StoreError> {
+        let mut file = File::open(self.packs_dir.join(format!("{pack_id}.pack")))?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0u8; length as usize];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Number of distinct objects currently stored: packed chunks plus
+    /// whatever's left in the old per-chunk-file layout (walks its fan-out
+    /// dirs). Never counts `--no-copy` references.
     pub fn object_count(&self) -> Result<usize, StoreError> {
-        let mut count = 0;
+        self.refresh_pack_index()?;
+        let mut count = self.pack_index.read().unwrap().len();
         for shard in fs::read_dir(&self.objects)? {
             let shard = shard?;
             if shard.file_type()?.is_dir() {
@@ -484,6 +619,109 @@ fn load_refs(path: &Path) -> Result<HashMap<Hash, RefLoc>, StoreError> {
         refs.insert(hash, (PathBuf::from(path), offset, length));
     }
     Ok(refs)
+}
+
+/// Parse one `packs/index` line (`<hash-hex>\t<pack_id>\t<offset>\t<length>`).
+/// `None` for a malformed or truncated line (e.g. a crash mid-append) —
+/// tolerated the same way [`load_refs`] tolerates one, by skipping it.
+fn parse_pack_index_line(line: &str) -> Option<(Hash, PackLoc)> {
+    let mut fields = line.splitn(4, '\t');
+    let (Some(hash), Some(pack_id), Some(offset), Some(length)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    let (Ok(hash), Ok(pack_id), Ok(offset), Ok(length)) =
+        (Hash::from_hex(hash), pack_id.parse::<u32>(), offset.parse::<u64>(), length.parse::<u32>())
+    else {
+        return None;
+    };
+    Some((hash, (pack_id, offset, length)))
+}
+
+/// Load the whole of `packs/index`, if it exists, returning the parsed
+/// entries plus the file's byte length at read time (the starting point for
+/// [`Store::refresh_pack_index`]'s incremental tailing).
+fn load_pack_index(path: &Path) -> Result<(HashMap<Hash, PackLoc>, u64), StoreError> {
+    let mut index = HashMap::new();
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((index, 0)),
+        Err(e) => return Err(e.into()),
+    };
+    for line in text.lines() {
+        if let Some((h, loc)) = parse_pack_index_line(line) {
+            index.insert(h, loc);
+        }
+    }
+    Ok((index, text.len() as u64))
+}
+
+/// Append one line to `packs/index` for a chunk just written to a pack file.
+/// Returns the number of bytes written, so the caller can advance its own
+/// read cursor past it (see [`Store::refresh_pack_index`]).
+fn append_pack_index_line(path: &Path, h: &Hash, pack_id: u32, offset: u64, length: u32) -> io::Result<u64> {
+    let mut line = String::new();
+    line.push_str(&h.to_hex());
+    line.push('\t');
+    line.push_str(&pack_id.to_string());
+    line.push('\t');
+    line.push_str(&offset.to_string());
+    line.push('\t');
+    line.push_str(&length.to_string());
+    line.push('\n');
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(line.as_bytes())?;
+    Ok(line.len() as u64)
+}
+
+/// The pack file currently being appended to, plus enough state to rotate to
+/// a new one once it grows past [`PACK_ROTATE_SIZE`].
+struct PackState {
+    current_id: u32,
+    current_file: File,
+    current_size: u64,
+}
+
+impl PackState {
+    /// Resume the highest-numbered `<id>.pack` found in `packs_dir` (0 if
+    /// none exist yet) — rotation itself is checked lazily on the next
+    /// [`PackState::write`], not here, so a store that was already past the
+    /// threshold when it last closed just rotates on its first new write.
+    fn open(packs_dir: &Path) -> io::Result<PackState> {
+        let mut max_id: Option<u32> = None;
+        for entry in fs::read_dir(packs_dir)? {
+            let entry = entry?;
+            if let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".pack"))
+                .and_then(|stem| stem.parse::<u32>().ok())
+            {
+                max_id = Some(max_id.map_or(id, |m| m.max(id)));
+            }
+        }
+        let current_id = max_id.unwrap_or(0);
+        let path = packs_dir.join(format!("{current_id}.pack"));
+        let current_file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let current_size = fs::metadata(&path)?.len();
+        Ok(PackState { current_id, current_file, current_size })
+    }
+
+    /// Append `bytes` to the current pack (rotating first if it's already at
+    /// capacity), returning where they landed.
+    fn write(&mut self, packs_dir: &Path, bytes: &[u8]) -> io::Result<(u32, u64)> {
+        if self.current_size >= PACK_ROTATE_SIZE {
+            self.current_id += 1;
+            let path = packs_dir.join(format!("{}.pack", self.current_id));
+            self.current_file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+            self.current_size = 0;
+        }
+        let offset = self.current_size;
+        self.current_file.write_all(bytes)?;
+        self.current_size += bytes.len() as u64;
+        Ok((self.current_id, offset))
+    }
 }
 
 #[cfg(test)]
@@ -918,5 +1156,165 @@ mod tests {
         assert!(calls.iter().all(|(_, t)| *t == total));
         assert_eq!(calls.last().unwrap().0, total);
         assert!(calls.windows(2).all(|w| w[0].0 < w[1].0), "done must be strictly increasing");
+    }
+
+    /// Write a chunk directly into the *old* per-chunk-file layout, bypassing
+    /// `put()` entirely — simulates a store that existed before packfiles did.
+    fn write_legacy_object(root: &Path, bytes: &[u8]) -> Hash {
+        let h = Hash::of(bytes);
+        let hex = h.to_hex();
+        let dir = root.join("objects").join(&hex[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&hex), bytes).unwrap();
+        h
+    }
+
+    #[test]
+    fn reads_a_chunk_from_the_old_per_chunk_file_layout() {
+        let dir = TmpDir::new();
+        // Object written before the store is ever `open()`ed by this code —
+        // exactly what upgrading in place looks like.
+        let bytes = sample(50_000, 70);
+        let h = write_legacy_object(dir.path(), &bytes);
+
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.has(&h), "must recognize a pre-existing legacy object");
+        assert_eq!(store.get(&h).unwrap().unwrap(), bytes);
+    }
+
+    #[test]
+    fn put_on_a_legacy_object_dedups_instead_of_double_writing_to_the_pack() {
+        let dir = TmpDir::new();
+        let bytes = sample(50_000, 71);
+        let h = write_legacy_object(dir.path(), &bytes);
+
+        let store = Store::open(dir.path()).unwrap();
+        let (h2, is_new) = store.put(&bytes).unwrap();
+        assert_eq!(h2, h);
+        assert!(!is_new, "content already present under the legacy layout must dedup, not re-copy into a pack");
+
+        // Only the one legacy object exists — nothing new got written to
+        // packs/index (object_count would double-count if put() didn't
+        // check the legacy layout before writing).
+        assert_eq!(store.object_count().unwrap(), 1);
+        assert!(!dir.path().join("packs").join("index").exists());
+    }
+
+    #[test]
+    fn new_writes_after_upgrade_go_to_a_pack_not_the_legacy_layout() {
+        let dir = TmpDir::new();
+        // Establish the store with the legacy layout already present, then
+        // open it (the "upgrade" moment) and write something brand new.
+        let old = sample(50_000, 72);
+        write_legacy_object(dir.path(), &old);
+        let store = Store::open(dir.path()).unwrap();
+
+        let new_bytes = sample(50_000, 73);
+        let (h, is_new) = store.put(&new_bytes).unwrap();
+        assert!(is_new);
+        assert_eq!(store.get(&h).unwrap().unwrap(), new_bytes);
+
+        // The new chunk landed in a pack file, not a new legacy object path.
+        assert!(dir.path().join("packs").join("0.pack").exists());
+        assert!(dir.path().join("packs").join("index").exists());
+        let hex = h.to_hex();
+        assert!(!dir.path().join("objects").join(&hex[..2]).join(&hex).exists());
+
+        // Both old (legacy) and new (packed) chunks are visible side by side.
+        assert_eq!(store.object_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn pack_index_survives_a_reopened_store() {
+        let dir = TmpDir::new();
+        let data = sample(300_000, 74);
+        let m = {
+            let store = Store::open(dir.path()).unwrap();
+            store.ingest(&data, None).unwrap()
+        };
+        // Fresh `Store` handle, as a later `serve` process would open — the
+        // packfile index must be reloaded from disk, not just in-memory state.
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.export(&m).unwrap(), data);
+        assert_eq!(reopened.object_count().unwrap(), m.chunks.len());
+    }
+
+    #[test]
+    fn pack_rotates_to_a_new_file_past_the_size_threshold() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+        // Bytes bigger than the rotation threshold in one `put()` — forces an
+        // immediate rotation on the *next* write, without needing to actually
+        // accumulate hundreds of MB of real chunks in this test.
+        let big = vec![7u8; (PACK_ROTATE_SIZE + 1) as usize];
+        store.put(&big).unwrap();
+        assert!(dir.path().join("packs").join("0.pack").exists());
+
+        let small = sample(1_000, 75);
+        let (h, _) = store.put(&small).unwrap();
+        assert!(dir.path().join("packs").join("1.pack").exists(), "should have rotated to a new pack file");
+        assert_eq!(store.get(&h).unwrap().unwrap(), small);
+
+        // Reopening must resume from the highest-numbered pack, not restart
+        // at 0.pack (which would silently start overwriting old data).
+        let small2 = sample(1_000, 76);
+        let reopened = Store::open(dir.path()).unwrap();
+        let (h2, _) = reopened.put(&small2).unwrap();
+        assert_eq!(reopened.get(&h2).unwrap().unwrap(), small2);
+        assert!(!dir.path().join("packs").join("2.pack").exists(), "should keep appending to 1.pack, not roll again");
+    }
+
+    #[test]
+    fn concurrent_put_of_identical_bytes_writes_exactly_once() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TmpDir::new();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let bytes = Arc::new(sample(100_000, 77));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                let bytes = bytes.clone();
+                thread::spawn(move || store.put(&bytes).unwrap())
+            })
+            .collect();
+        let results: Vec<(Hash, bool)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(results.iter().filter(|(_, is_new)| *is_new).count(), 1, "exactly one thread should win the write");
+        assert_eq!(store.object_count().unwrap(), 1);
+        assert_eq!(store.get(&results[0].0).unwrap().unwrap(), *bytes);
+    }
+
+    /// Two independent `Store` handles opened on the *same* directory is a
+    /// completely normal pattern in this codebase (e.g. `Network::spawn`
+    /// takes ownership of one, a caller opens a second right after). Each
+    /// keeps its own in-memory pack index, so a naive implementation would
+    /// have one handle unable to see chunks the other just packed — this
+    /// pinned a real regression caught via `np2ptp-bridge`'s
+    /// `second_node_resolves_torrent_from_np2ptp_without_converting` test,
+    /// where a node's own request-handling `Store` handle couldn't serve a
+    /// chunk a *different* handle (same directory) had just packed.
+    #[test]
+    fn a_second_store_instance_sees_chunks_the_first_one_packed() {
+        let dir = TmpDir::new();
+        let writer = Store::open(dir.path()).unwrap();
+        let reader = Store::open(dir.path()).unwrap(); // opened before the write below
+
+        let bytes = sample(60_000, 78);
+        let (h, is_new) = writer.put(&bytes).unwrap();
+        assert!(is_new);
+
+        assert!(reader.has(&h), "a sibling instance must see a chunk packed after it was opened");
+        assert_eq!(reader.get(&h).unwrap().unwrap(), bytes);
+        assert_eq!(reader.object_count().unwrap(), 1);
+
+        // And it must dedup against the writer's chunk, not silently pack a
+        // second copy under its own stale view.
+        let (h2, is_new2) = reader.put(&bytes).unwrap();
+        assert_eq!(h2, h);
+        assert!(!is_new2, "the second instance must recognize this chunk as already packed");
+        assert_eq!(reader.object_count().unwrap(), 1);
     }
 }

@@ -113,9 +113,12 @@ writing `reports/REPORT.md` + `results.csv`.
 - **Relay:** a relay node must call `add_external_address(its_listen_addr)` or the
   reservations it grants are address-less and clients reject them
   (`NoAddressesInReservation`). Connect to the relay BEFORE listening on the
-  circuit. **Relayed *data transfer* over QUIC is flaky on loopback** — the
-  reservation works, but the relayed stream tears down; needs real NATs to validate
-  (`download_through_a_relay` is `#[ignore]`d).
+  circuit. Relayed data transfer over QUIC used to look flaky on loopback, but
+  that was a misdiagnosis: the real cause was `relay::Config::default()`'s
+  128 KiB circuit cap (see `relay_config()` in `np2ptp-net/src/lib.rs`), not
+  loopback/NAT — with the cap raised, `download_through_a_relay` passes
+  every time and is no longer `#[ignore]`d. DCUtR hole-punching itself still
+  has nothing to punch through on loopback and needs a real NAT to validate.
 - **Tailscale is a TEST crutch, not the answer.** Real NAT story = UPnP/NAT-PMP +
   DCUtR + a public relay fallback (see Phase 2). Requiring a VPN would kill adoption.
 - **Bridge determinism:** convert torrents by chunking files in the **torrent's
@@ -155,29 +158,123 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
    - ✅ **HTTP discovery tracker** — LIVE at `https://nptp.bogotec.uk`, self-hosted
      on the VPS (`tracker/`, systemd + Caddy). `serve` announces; `fetch <link>`
      with no `--peer` discovers providers and downloads. Validated end-to-end.
-   - **mDNS** — libp2p mDNS behaviour for zero-config discovery on the same LAN.
+   - ✅ **mDNS** — libp2p mDNS behaviour wired (`crates/np2ptp-net/src/lib.rs`):
+     a discovered peer is added to Kademlia and dialed directly, zero config.
+     Can't be validated by an automated test in this dev sandbox (multicast
+     isn't delivered between two local processes here — same category as
+     DCUtR hole-punching below, which also needs a real network, not
+     loopback); `crates/np2ptp-net/tests/mdns.rs` documents this and is
+     `#[ignore]`d, needs a real network to confirm by hand.
    - **Bootstrap DHT nodes** — run 1+ stable nodes (persist the Ed25519 key for a
      fixed peer id) so `find_providers(root)` works without the tracker too.
+     Not done: today only nodes that actually need the relay *for NAT
+     fallback* ever dial it (`serve`/`fetch`'s relay logic is conditional on
+     `has_external` being false), so a node with a working public/UPnP
+     address never seeds its Kademlia table from a stable, known-good peer.
+     Needs a deliberate default-behavior change (dial a bootstrap contact
+     unconditionally, distinct from the NAT-fallback relay circuit) — flagged
+     for a decision before implementing, since it changes what every `serve`/
+     `fetch` invocation does by default, not just adds new code.
    - Wire the `torrent` command to use discovery as well.
 3. **NAT without a VPN** (the real adoption unlock):
-   - **UPnP / NAT-PMP** — libp2p port-mapping behaviour so the node auto-opens a
-     router port and becomes publicly reachable (this is *the* big win; how torrents
-     "just work").
+   - ✅ **UPnP** — libp2p `upnp::tokio::Behaviour` was already wired (spawn +
+     event logging); fixed the actual gap: `NewExternalAddr` now calls
+     `swarm.add_external_address()` (previously only logged — the mapped
+     address was found but never announced, so it went unused, same
+     reservation-usability gotcha as relay). `ExpiredExternalAddr` now calls
+     `remove_external_address()` symmetrically.
+   - ✅ **NAT-PMP/PCP** — already done, just not a libp2p `NetworkBehaviour`:
+     `crates/np2ptp-node/src/portmap.rs` (`crab_nat` crate) tries PCP then
+     NAT-PMP on the default gateway, called from `cmd_serve` as a second
+     avenue alongside UPnP/IGD. Documented in `docs/RELAY.md`.
    - Finish **DCUtR + relay** (debug the relayed-QUIC teardown on real NATs).
    - Run a public **relay** as the always-works fallback.
 
 ### ⏳ Phase 3 — Hardening & performance
-- **Store performance:** packing 3 GB took ~219 s (~15 MB/s) because every chunk is
-  a separate small file. Consider packfiles / larger avg chunk / batched writes.
-- **No-copy / streaming bridge:** avoid duplicating 51 GB into the store; verify
-  pieces by streaming from disk.
+- ✅ **Store performance:** packing used to take ~219 s for 3 GB (~15 MB/s)
+  because every chunk was its own small file (`objects/<aa>/<hex>`, one
+  open+write+rename per chunk). Chunks now append to `packs/<id>.pack`
+  (rotated at 256 MiB, `PACK_ROTATE_SIZE` in `crates/np2ptp-store/src/lib.rs`)
+  with a hash → `(pack_id, offset, length)` index in `packs/index` — one
+  `write` on an already-open file handle per chunk, no new inode/directory
+  entry. **Measured: 1 GB packed in ~8 s (~135 MB/s), ~9x the old rate**,
+  verified byte-identical on a full round trip (`pack` → `get`).
+  A store from before this existed keeps working: `get`/`has`/`put`'s dedup
+  check all fall back to the old per-chunk-file layout, but every new chunk
+  goes to a pack — see `crates/np2ptp-store/tests` (well, unit tests in
+  `lib.rs`): `reads_a_chunk_from_the_old_per_chunk_file_layout`,
+  `put_on_a_legacy_object_dedups_instead_of_double_writing_to_the_pack`,
+  `new_writes_after_upgrade_go_to_a_pack_not_the_legacy_layout`.
+  **Real bug hit and fixed along the way:** two independent `Store` handles
+  opened on the same directory (a completely normal pattern here —
+  `Network::spawn` owns one, a caller opens a second right after) each kept
+  their own in-memory pack index, so one handle couldn't see chunks the
+  *other* had just packed — caught by `np2ptp-bridge`'s existing
+  `second_node_resolves_torrent_from_np2ptp_without_converting` test failing,
+  not a new one written for this. Fixed with a refresh-on-miss that tails
+  only the *new* bytes appended to `packs/index` since last checked
+  (`Store::refresh_pack_index`) — the first attempt re-read and re-parsed
+  the *whole* index file on every miss, which is exactly what happens on
+  every `put()` of a chunk nobody's ever seen before (the common case for
+  `pack`), making a 1 GB file's ~13,000 new chunks an accidental O(n²): it
+  hung past 3 minutes before this was caught by actually timing a real pack,
+  not just trusting the unit tests (which run on small enough data that the
+  quadratic cost that hangs a real file never printed). Pinned with
+  `a_second_store_instance_sees_chunks_the_first_one_packed`.
+- ✅ **No-copy / streaming bridge:** already there — `convert_local`/
+  `resolve_or_convert_local` (`streaming.rs`) verify pieces by streaming from
+  disk (`verify_pieces_streaming`, 64 KiB windows) and, with `no_copy: true`,
+  call `Store::ingest_tree_files_no_copy` instead of copying chunks in.
+  Confirmed end-to-end: `convert_local_no_copy_does_not_duplicate_a_sizeable_torrent_on_disk`
+  (`crates/np2ptp-bridge/tests/streaming_convert.rs`) converts an 8 MB
+  two-file torrent with `--no-copy` and asserts `object_count() == 0` and the
+  store directory itself stays under a tenth of the content size.
 - **FEC permanence for real:** today only a full holder can mint symbols. Store and
   forward *partial* symbol sets across peers for true churn resilience.
-- **Resumable / multi-source downloads:** fetch chunks from several providers at once.
+- ✅ **Resumable / multi-source downloads:** `Network::download_multi`/
+  `download_multi_with_progress` (`crates/np2ptp-net/src/lib.rs`) take
+  `providers: &[PeerId]` instead of one. The manifest comes from whichever
+  provider answers first; each chunk starts at a round-robin provider and
+  falls back to the rest, in order, before failing that chunk — a single
+  unreachable/missing-chunk provider no longer aborts the whole download.
+  Each provider is credited a receipt only for the bytes it actually served
+  (`HashMap<PeerId, u64>`, not one aggregate total). `download`/
+  `download_with_progress` (single provider) are now thin wrappers calling
+  this with a one-element slice — no existing caller needed to change.
+  `download_fec`/`download_fec_with_progress` are still single-provider;
+  FEC's "any sufficiently large symbol set works" property makes them an
+  even more natural fit for this, just not done yet.
+  Verified with a real disconnect: two seeders holding identical content,
+  one dropped mid-session, `download_multi` still completes via the other
+  and credits it correctly; confirmed to actually fail without the
+  per-chunk fallback (`crates/np2ptp-net/tests/multi_source.rs`).
 - ✅ **Signed-receipt exchange over the wire** — done. `SubmitReceipt`/`GetReceipts`
-  ride the existing request-response protocol; see "Incentives" above. Remaining:
-  per-peer state (`rep_peers`, `receipts_pulled_from`) has no GC on disconnect —
-  fine for now, worth pruning if a long-lived node sees heavy peer churn.
+  ride the existing request-response protocol; see "Incentives" above.
+  ✅ **GC on disconnect** — `SwarmEvent::ConnectionClosed { num_established: 0, .. }`
+  now clears `rep_peers`/`receipts_pulled_from` for that peer (never `ledger` —
+  reputation persists and travels across reconnects on purpose). Without this,
+  a peer that disconnects and reconnects (same identity, e.g. a restart) never
+  got its receipts pulled again, even after earning a new one while away.
+  Verified with a real disconnect+reconnect (`np2ptp-net/tests/receipt_gc.rs`),
+  confirmed to actually fail without the fix, not just pass incidentally.
+- ✅ **Fuzzing the untrusted-input parsers** — `.torrent` files and `.nptp`
+  manifests are the two parsers that touch adversarial bytes (disk or
+  network) before anything is verified. `cargo-fuzz` targets:
+  `crates/np2ptp-bridge/fuzz/fuzz_targets/bencode_parse.rs`
+  (`parse_torrent_file`) and
+  `crates/np2ptp-core/fuzz/fuzz_targets/manifest_from_nptp.rs`
+  (`Manifest::from_nptp`). **Not actually run on this dev machine**: cargo-fuzz
+  needs nightly + libFuzzer, and Windows MSVC hit a wall both ways — with
+  AddressSanitizer, the runtime DLL cargo-fuzz expects isn't part of this
+  rustup nightly install; without it (`--sanitizer none`), the coverage
+  instrumentation (`__sancov_*` symbols) has nothing providing them at link
+  time either way, and `np2ptp-bridge`'s target additionally fails to even
+  *build* under sancov because it transitively pulls in all of `np2ptp-net`
+  (libp2p, DHT, QUIC) just to fuzz a parser with zero networking of its own —
+  a dependency in that graph (`if-watch`) doesn't link under Windows+sancov.
+  Run these on Linux/macOS/WSL instead: `cd crates/np2ptp-bridge && cargo
+  +nightly fuzz run bencode_parse` (same for `np2ptp-core` /
+  `manifest_from_nptp`).
 - **Mutable content:** signed pointers (a key "names" a feed) — IPNS/Dat style.
 
 ### ⏳ Phase 4 — Product & UX

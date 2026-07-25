@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::{
-    autonat, dcutr, identify, identity, kad, noise, relay,
+    autonat, dcutr, identify, identity, kad, mdns, noise, relay,
     request_response::{self, ProtocolSupport},
     swarm::SwarmEvent,
     upnp, yamux, StreamProtocol, Swarm,
@@ -163,6 +163,9 @@ struct Behaviour {
     // Auto-open a port on the home router (IGD) so the node is reachable from the
     // open internet without a VPN — the single biggest NAT win for home users.
     upnp: upnp::tokio::Behaviour,
+    // Zero-config discovery on the same LAN — no tracker/DHT/--peer needed to
+    // find another NP2PTP node a few feet away.
+    mdns: mdns::tokio::Behaviour,
 }
 
 /// Commands sent from a [`Network`] handle to the swarm task.
@@ -230,6 +233,10 @@ impl Network {
         let keypair = identity::Keypair::ed25519_from_bytes(&mut seed_bytes)
             .map_err(|e| NetError::Build(e.to_string()))?;
         let local_peer_id = keypair.public().to_peer_id();
+        // Built outside the `with_behaviour` closure (which must be infallible)
+        // so its `io::Result` can still propagate through `NetError::Build`.
+        let mdns_behaviour = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
+            .map_err(|e| NetError::Build(e.to_string()))?;
 
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -253,6 +260,7 @@ impl Network {
                     dcutr: dcutr::Behaviour::new(peer_id),
                     autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
                     upnp: upnp::tokio::Behaviour::default(),
+                    mdns: mdns_behaviour,
                 }
             })
             .map_err(|e| NetError::Build(e.to_string()))?
@@ -554,12 +562,55 @@ impl Network {
         root: Hash,
         provider: PeerId,
         into: &Store,
+        on_progress: impl FnMut(usize, usize),
+    ) -> Result<Manifest, NetError> {
+        self.download_multi_with_progress(root, &[provider], into, on_progress).await
+    }
+
+    /// Like [`Network::download`], but spreads the work across several
+    /// providers: the manifest comes from whichever responds first, and each
+    /// chunk is fetched from a provider chosen round-robin, falling back to
+    /// the others if that one fails or doesn't have it, before giving up on
+    /// that chunk. Each provider is credited a receipt only for the bytes it
+    /// actually served.
+    pub async fn download_multi(
+        &self,
+        root: Hash,
+        providers: &[PeerId],
+        into: &Store,
+    ) -> Result<Manifest, NetError> {
+        self.download_multi_with_progress(root, providers, into, |_, _| {}).await
+    }
+
+    /// [`Network::download_multi`] with progress reporting; see
+    /// [`Network::download_with_progress`].
+    pub async fn download_multi_with_progress(
+        &self,
+        root: Hash,
+        providers: &[PeerId],
+        into: &Store,
         mut on_progress: impl FnMut(usize, usize),
     ) -> Result<Manifest, NetError> {
         /// Chunk requests kept in flight at once. Hides per-request latency.
         const PARALLEL: usize = 16;
 
-        let manifest = self.get_manifest(provider, root).await?;
+        if providers.is_empty() {
+            return Err(NetError::NoProviders);
+        }
+
+        // Manifest: whichever provider answers first, tried in order.
+        let mut manifest = None;
+        let mut last_err = NetError::NoProviders;
+        for &p in providers {
+            match self.get_manifest(p, root).await {
+                Ok(m) => {
+                    manifest = Some(m);
+                    break;
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        let manifest = manifest.ok_or(last_err)?;
         // get_manifest already validated the chunk list against the root, so a
         // cheap per-chunk content-hash check is sufficient below.
 
@@ -578,29 +629,39 @@ impl Network {
 
         // Fetch concurrently, but store + verify each chunk AS it arrives so we
         // never hold more than a handful of chunks in memory (large content).
-        let mut stream = futures::stream::iter(missing)
-            .map(|(i, hash)| async move {
-                let bytes = self
-                    .fetch_chunk(provider, hash)
-                    .await?
-                    .ok_or(NetError::MissingChunk(hash))?;
-                Ok::<(usize, Vec<u8>), NetError>((i, bytes))
+        // Each chunk starts at a round-robin provider (spreading load evenly)
+        // and falls back to the rest, in order, before failing that chunk.
+        let n = providers.len();
+        let mut stream = futures::stream::iter(missing.into_iter().enumerate())
+            .map(|(slot, (i, hash))| async move {
+                let mut last_err = NetError::MissingChunk(hash);
+                for k in 0..n {
+                    let p = providers[(slot + k) % n];
+                    match self.fetch_chunk(p, hash).await {
+                        Ok(Some(bytes)) => return Ok::<(usize, Vec<u8>, PeerId), NetError>((i, bytes, p)),
+                        Ok(None) => last_err = NetError::MissingChunk(hash),
+                        Err(e) => last_err = e,
+                    }
+                }
+                Err(last_err)
             })
             .buffer_unordered(PARALLEL);
 
-        let mut fetched_bytes: u64 = 0;
+        let mut fetched_bytes: HashMap<PeerId, u64> = HashMap::new();
         while let Some(result) = stream.next().await {
-            let (i, bytes) = result?;
+            let (i, bytes, from) = result?;
             if !manifest.chunk_hash_ok(i, &bytes) {
                 return Err(NetError::BadChunk);
             }
-            fetched_bytes += bytes.len() as u64;
+            *fetched_bytes.entry(from).or_insert(0) += bytes.len() as u64;
             into.put(&bytes)?;
             done += 1;
             on_progress(done, total);
         }
-        if fetched_bytes > 0 {
-            let _ = self.submit_receipt(provider, fetched_bytes).await;
+        for (peer, bytes) in fetched_bytes {
+            if bytes > 0 {
+                let _ = self.submit_receipt(peer, bytes).await;
+            }
         }
         Ok(manifest)
     }
@@ -804,6 +865,10 @@ impl EventLoop {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Upnp(event)) => match event {
                 upnp::Event::NewExternalAddr(addr) => {
+                    // Without this, UPnP finds the mapped address but nothing
+                    // ever announces it — relay's own reservation-usability
+                    // gotcha, applies here too.
+                    self.swarm.add_external_address(addr.clone());
                     eprintln!("upnp: mapped a public address via the router: {addr}");
                 }
                 upnp::Event::GatewayNotFound => {
@@ -813,9 +878,31 @@ impl EventLoop {
                     eprintln!("upnp: gateway has no public IP (CGNAT?) — needs relay/hole-punch");
                 }
                 upnp::Event::ExpiredExternalAddr(addr) => {
+                    self.swarm.remove_external_address(&addr);
                     eprintln!("upnp: external address expired: {addr}");
                 }
             },
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(event)) => match event {
+                mdns::Event::Discovered(found) => {
+                    for (peer_id, addr) in found {
+                        // Route through Kademlia (so find_providers/get_record can
+                        // use it) and dial directly (same LAN, should connect fast).
+                        self.swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                        let _ = self.swarm.dial(addr);
+                    }
+                }
+                // Addresses just age out of libp2p-mdns's own table; nothing here
+                // depends on pruning them from Kademlia's on our side.
+                mdns::Event::Expired(_) => {}
+            },
+            // Only once every connection to this peer is gone (it could have
+            // more than one) — and only the transient per-connection
+            // bookkeeping, never `ledger`: reputation is meant to persist and
+            // travel across reconnects, not reset on disconnect.
+            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                self.rep_peers.remove(&peer_id);
+                self.receipts_pulled_from.remove(&peer_id);
+            }
             _ => {}
         }
     }
