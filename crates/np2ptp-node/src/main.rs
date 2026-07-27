@@ -448,6 +448,11 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
     let all = flags.contains_key("all");
     let manifests = np2ptp_node::collect_serve_manifests(&pos, all, Path::new(&store_dir))?;
+    // Registry write doesn't touch the network — do it here, before the
+    // runtime spins up, instead of inside the async task.
+    for m in &manifests {
+        np2ptp_node::register_manifest(Path::new(&store_dir), m)?;
+    }
     let store = Store::open(&store_dir)?;
     // Persist identity per store dir: restarting `serve` on the same --store
     // keeps the same peer id, so providers already found (DHT, tracker, a
@@ -493,7 +498,6 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
         net.listen(listen.parse()?).await?;
         for m in &manifests {
             net.provide(m).await?;
-            np2ptp_node::register_manifest(Path::new(&store_dir), m)?;
         }
         let peer = net.local_peer_id();
 
@@ -513,11 +517,13 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
                 println!("peer id: {peer} (no listen address yet)");
             } else {
                 println!("direct fetch:");
-                for a in &addrs {
-                    println!("  np2ptp fetch {} --peer {a}/p2p/{peer}", manifests[0].uri());
-                }
-                if !no_tracker {
-                    println!("or, once announced, just: np2ptp fetch {}   (peers found via the tracker)", manifests[0].uri());
+                for m in &manifests {
+                    for a in &addrs {
+                        println!("  np2ptp fetch {} --peer {a}/p2p/{peer}", m.uri());
+                    }
+                    if !no_tracker {
+                        println!("or, once announced, just: np2ptp fetch {}   (peers found via the tracker)", m.uri());
+                    }
                 }
             }
         }
@@ -834,10 +840,11 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// `http(s)://` URL you don't have yet — downloaded via a real BitTorrent
 /// swarm first.
 fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (pos, flags) = parse(args, &["--data", "--store", "--relay"]);
+    let (pos, flags) = parse(args, &["--data", "--store", "--relay", "--out"]);
     let input = *pos.first().ok_or("torrent: missing <file.torrent|magnet:...>")?;
     let data_dir = flags.get("data").cloned();
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
+    let out_dir = flags.get("out").map(|s| s.as_str());
     let no_copy = flags.contains_key("no-copy");
     let no_relay = flags.contains_key("no-relay");
     let relay_override = flags.get("relay").cloned();
@@ -874,7 +881,7 @@ fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
             (Some(meta), Some(data_dir)) => {
                 np2ptp_bridge::resolve_or_convert_local(&net, &store, &meta, Path::new(data_dir), no_copy).await?
             }
-            _ => fetch_remote_torrent(&net, &store, input, no_copy).await?,
+            _ => fetch_remote_torrent(&net, &store, input, no_copy, out_dir.map(Path::new)).await?,
         };
 
         if json {
@@ -908,8 +915,9 @@ async fn fetch_remote_torrent(
     store: &Store,
     input: &str,
     no_copy: bool,
+    out_dir: Option<&Path>,
 ) -> Result<np2ptp_bridge::Outcome, Box<dyn Error>> {
-    Ok(np2ptp_bridge::resolve_or_convert_remote(net, store, input, no_copy).await?)
+    Ok(np2ptp_bridge::resolve_or_convert_remote(net, store, input, no_copy, out_dir).await?)
 }
 
 #[cfg(not(feature = "librqbit"))]
@@ -918,6 +926,7 @@ async fn fetch_remote_torrent(
     _store: &Store,
     _input: &str,
     _no_copy: bool,
+    _out_dir: Option<&Path>,
 ) -> Result<np2ptp_bridge::Outcome, Box<dyn Error>> {
     Err("torrent: fetching a magnet/torrent you don't already have needs the 'librqbit' \
          feature (rebuild with `cargo build --features librqbit`), or pass --data <dir> \

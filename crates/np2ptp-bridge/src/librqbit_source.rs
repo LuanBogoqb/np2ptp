@@ -18,11 +18,27 @@ use librqbit::{AddTorrent, AddTorrentOptions, Session};
 use np2ptp_net::Network;
 use np2ptp_store::Store;
 use sha1::{Digest, Sha1};
+use std::path::{Path, PathBuf};
 
 use crate::{parse_torrent_file, resolve_or_convert_local, BridgeError, Outcome};
 
 fn source_err(e: impl std::fmt::Display) -> BridgeError {
     BridgeError::Source(e.to_string())
+}
+
+pub(crate) fn bridge_download_dir(store_root: &Path, input: &str, out_dir: Option<&Path>) -> PathBuf {
+    match out_dir {
+        Some(d) => d.to_path_buf(),
+        None => store_root.join(".np2ptp-bridge-downloads").join(hex::encode(Sha1::digest(input.as_bytes()))),
+    }
+}
+
+#[test]
+fn out_dir_overrides_default_location() {
+    let def = bridge_download_dir(Path::new("/s"), "magnet:x", None);
+    assert!(def.starts_with("/s"));
+    let custom = bridge_download_dir(Path::new("/s"), "magnet:x", Some(Path::new("/games/x")));
+    assert_eq!(custom, Path::new("/games/x"));
 }
 
 /// Fetch `input` (a magnet link, a path to a `.torrent` file, or an
@@ -38,9 +54,9 @@ pub async fn resolve_or_convert_remote(
     store: &Store,
     input: &str,
     no_copy: bool,
+    out_dir: Option<&Path>,
 ) -> Result<Outcome, BridgeError> {
-    let key = hex::encode(Sha1::digest(input.as_bytes()));
-    let download_dir = store.root().join(".np2ptp-bridge-downloads").join(&key);
+    let download_dir = bridge_download_dir(&store.root(), input, out_dir);
     let session_dir = store.root().join(".np2ptp-bridge-librqbit-session");
     std::fs::create_dir_all(&download_dir).map_err(|e| source_err(format!("creating download dir: {e}")))?;
     std::fs::create_dir_all(&session_dir).map_err(|e| source_err(format!("creating session dir: {e}")))?;
