@@ -67,12 +67,29 @@ pub const MAX_SUMS_BYTES: u64 = 1024 * 1024;
 const WORKER_JOIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Time that must still be left on the deadline before the swap phase is
-/// dispatched. See `run_update`: a dispatched swap always runs to completion,
-/// so it is only ever started when there is room for it to finish.
+/// dispatched.
+///
+/// This is a *courtesy* margin, not a guarantee: a 256 MiB re-hash plus
+/// `sync_all` on a slow disk takes longer than five seconds, so a dispatched
+/// swap can and does outlive the deadline. What actually keeps that safe is the
+/// `swap_dispatched` `AtomicBool` in `run_update`, which stops the timeout path
+/// from deleting `<exe>.new` under a swap that is still renaming. The reserve
+/// only avoids *starting* a swap when the deadline is already effectively gone.
 const SWAP_RESERVE: Duration = Duration::from_secs(5);
 
-/// A `.new` younger than this may belong to another instance's in-flight
-/// update, so startup cleanup leaves it alone.
+/// Smallest `timeout` [`check_and_update`] accepts. The swap is only dispatched
+/// with [`SWAP_RESERVE`] still on the clock, so anything at or below that can
+/// never install; on top of it, an asset download needs real seconds. A caller
+/// under this floor is refused up front instead of downloading, verifying and
+/// then reporting [`UpdateError::Timeout`].
+///
+/// 30s = [`SWAP_RESERVE`] plus 25s of network floor, which is also what the
+/// daemon's auto-update path passes. Raising it invalidates callers, so raise
+/// [`SWAP_RESERVE`] and this together or not at all.
+pub const MIN_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A `.new` or `.old` younger than this may belong to another instance's
+/// in-flight update, so startup cleanup leaves it alone.
 const STALE_STAGING_AGE: Duration = Duration::from_secs(3600);
 
 /// Hosts an update may be fetched from. Explicit list, no wildcards except the
@@ -80,6 +97,17 @@ const STALE_STAGING_AGE: Duration = Duration::from_secs(3600);
 /// assets from `objects.githubusercontent.com` and (newer) from
 /// `release-assets.githubusercontent.com`, and redirects there from
 /// `github.com`. Everything else is refused.
+///
+/// DELIBERATE OMISSION: GitHub's legacy release CDN,
+/// `github-production-release-asset-*.s3.amazonaws.com`, is **not** allowed and
+/// a redirect there is refused by design. Matching it needs a wildcard under
+/// `s3.amazonaws.com`, and any rule loose enough to cover the changing bucket
+/// prefix is loose enough to cover somebody else's bucket on the same domain —
+/// an attacker-controlled host inside our allowlist. Current releases redirect
+/// to `objects.githubusercontent.com` / `release-assets.githubusercontent.com`,
+/// which are listed. If GitHub ever falls back to the S3 host, self-update
+/// fails closed with [`UpdateError::UntrustedHost`] naming it, and the fix is to
+/// add the *exact* bucket host here, not a wildcard.
 const ALLOWED_HOSTS: &[&str] = &[
     "github.com",
     "www.github.com",
@@ -99,6 +127,19 @@ pub enum UpdateError {
     NoAsset,
     #[error("update timed out")]
     Timeout,
+    /// The caller's `timeout` is too small for the swap gate to ever be
+    /// satisfiable, so no run with it could install anything. Returned before
+    /// any network work happens.
+    #[error(
+        "update timeout of {given_secs}s is too short to ever install: at least \
+         {minimum_secs}s is required (the swap phase is only dispatched with \
+         {reserve_secs}s still left on the deadline)"
+    )]
+    TimeoutTooShort {
+        given_secs: u64,
+        minimum_secs: u64,
+        reserve_secs: u64,
+    },
     /// Verification failed for *any* reason. The download has been deleted and
     /// the current binary is untouched.
     #[error("downloaded binary failed verification against the pinned signer")]
@@ -437,8 +478,11 @@ fn verify_pinned_signer(path: &Path) -> Result<(), UpdateError> {
         Err(status) if is_transient_verify_status(status) => Err(UpdateError::Io(
             std::io::Error::other(format!(
                 "could not read {} to verify its signature (status 0x{status:08X}); \
-                 another process — most likely an antivirus scanner — is holding the \
-                 file. This is not a signature failure; the update was not applied.",
+                 the signature could not be read at all. Most likely another process \
+                 — an antivirus scanner — is holding the file, but a truncated or \
+                 crafted PE whose security directory the trust provider cannot parse \
+                 reports the same way. Either way nothing was verified and the update \
+                 was not applied.",
                 path.display()
             )),
         )),
@@ -569,11 +613,25 @@ fn signer_thumbprint_from_msg(
 
 /// Check GitHub for a newer release and, if there is one, install it.
 ///
-/// `timeout` bounds the whole operation (metadata + download + verification).
+/// `timeout` bounds the whole operation (metadata + download + verification)
+/// and must be at least [`MIN_UPDATE_TIMEOUT`]: the swap is only dispatched
+/// while [`SWAP_RESERVE`] is still on the deadline, so a shorter timeout makes
+/// that gate unsatisfiable and *every* run would download, verify and then
+/// throw the result away. That case is refused here, before any network work,
+/// as [`UpdateError::TimeoutTooShort`] rather than as a late
+/// [`UpdateError::Timeout`].
+///
 /// On success with `updated == true` the new binary is in place and the old one
 /// is next to it as `<exe>.old`; the running process image is never touched, so
 /// the update takes effect on the next start.
 pub fn check_and_update(timeout: Duration) -> Result<UpdateReport, UpdateError> {
+    if timeout < MIN_UPDATE_TIMEOUT {
+        return Err(UpdateError::TimeoutTooShort {
+            given_secs: timeout.as_secs(),
+            minimum_secs: MIN_UPDATE_TIMEOUT.as_secs(),
+            reserve_secs: SWAP_RESERVE.as_secs(),
+        });
+    }
     // A dedicated thread with its own runtime: callers may already be inside a
     // tokio runtime, where `block_on` would panic.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -643,14 +701,30 @@ async fn run_update(
         // github.com to any host on earth, which turns `is_github_url` on the
         // asset URL into decoration: the API answer picks the first URL, the
         // attacker picks the last. The chain stays short *and* stays on GitHub.
+        //
+        // SECURITY: both refusals are `attempt.error(..)`, never `stop()`.
+        // `stop()` is not a refusal: reqwest hands the 30x back as the `Ok`
+        // response, and `error_for_status` does not reject 3xx — so the
+        // *redirect response body* would become the download (empty body =>
+        // `BadSignature`, hostile body => `BadSignature`), and the untrusted
+        // host would never be named. `error(..)` fails the request and carries
+        // the offending host in the message.
+        //
+        // The budget is 3 followed hops: `previous()` starts with the *initial*
+        // URL rather than a redirection, so three hops is `len() >= 4`.
         .https_only(true)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 3 {
-                attempt.stop()
-            } else if is_github_url(attempt.url().as_str()) {
+            let url = attempt.url().clone();
+            if attempt.previous().len() >= 4 {
+                attempt.error(format!(
+                    "refusing to follow more than 3 redirects for an update (next hop: {url})"
+                ))
+            } else if is_github_url(url.as_str()) {
                 attempt.follow()
             } else {
-                attempt.stop()
+                attempt.error(format!(
+                    "refusing to follow an update redirect to a non-GitHub host: {url}"
+                ))
             }
         }))
         .build()?;
@@ -719,7 +793,12 @@ async fn run_update(
     // dispatched with barely any deadline left keeps renaming after the caller
     // has already been told `Timeout` — and the timeout's cleanup would be
     // deleting `<exe>.new` around the same renames. Bail out *before*
-    // dispatching instead: a swap that starts always gets to finish.
+    // dispatching instead.
+    //
+    // This gate is only reachable when the run genuinely ran out of time:
+    // `check_and_update` refuses a `timeout` below `MIN_UPDATE_TIMEOUT` up
+    // front, so it can no longer be unsatisfiable at t=0 and no caller can end
+    // up downloading and verifying on every run only to be told `Timeout` here.
     if deadline.saturating_duration_since(Instant::now()) < SWAP_RESERVE {
         let _ = fs::remove_file(&download);
         return Err(UpdateError::Timeout);
@@ -828,16 +907,23 @@ fn write_staging(download: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
 ///
 /// SECURITY: the download was capped in flight, but this reads the file *again*
 /// off disk, and between the write and the read someone with write access next
-/// to the exe can have replaced it with something enormous. `fs::read`
-/// pre-allocates from the file's size, so an unchecked read-back is a
-/// one-syscall OOM.
+/// to the exe can have replaced it with something enormous. Stat-then-`fs::read`
+/// is not enough: the stat only removes the over-large *pre-allocation*, while
+/// `read_to_end` itself has no ceiling, so a file grown after the stat (or one
+/// whose size lies, like a pipe or a device planted at that name) is still
+/// buffered whole. The read is therefore bounded by the reader — `take(cap + 1)`
+/// — and anything that reaches `cap + 1` bytes is refused.
 #[cfg(not(windows))]
 fn read_capped(path: &Path) -> Result<Vec<u8>, UpdateError> {
-    let len = fs::metadata(path)?.len();
-    if len > MAX_DOWNLOAD_BYTES {
+    use std::io::Read;
+
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    (&file).take(MAX_DOWNLOAD_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_DOWNLOAD_BYTES {
         return Err(UpdateError::TooLarge(MAX_DOWNLOAD_BYTES));
     }
-    Ok(fs::read(path)?)
+    Ok(buf)
 }
 
 /// Windows: pinned Authenticode signer. Elsewhere: the release's `SHA256SUMS`.
@@ -905,6 +991,18 @@ fn old_path(exe: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+// SECURITY: `swap_in` only re-verifies under `cfg(windows)` and `cfg(unix)`. A
+// target matching neither would rename an unverified download onto `<exe>` with
+// `expected_sha256` never looked at, so it must not build at all. Structural,
+// not a runtime check that a future edit can slip past.
+#[cfg(not(any(windows, unix)))]
+compile_error!(
+    "np2ptp self-update has no verified swap path for this target: `swap_in` only \
+     re-verifies on windows (Authenticode pin) and unix (SHA-256 of the staged fd). \
+     Add a verifying arm for this target before enabling it; renaming an unverified \
+     download into place is not an option."
+);
+
 /// Move the verified download into place: rename the running exe out of the way
 /// (Windows allows renaming a running image, not overwriting it), then rename
 /// the download in. If the second rename fails, put the original back.
@@ -921,6 +1019,13 @@ fn old_path(exe: &Path) -> PathBuf {
 /// thing renamed: `renameat2`/`linkat`-from-fd on unix, `WinVerifyTrust` plus
 /// `SetFileInformationByHandle` rename-by-handle on Windows. Follow-up, not
 /// here — but the window is not Windows-only and never was.
+///
+/// SECURITY: fail-closed by construction. The body re-verifies under
+/// `cfg(windows)` (Authenticode pin) and under `cfg(unix)` (SHA-256 over the
+/// open fd) and has no third arm — on a target that is neither, the renames
+/// would run with nothing verified and `expected_sha256` unused. The
+/// `compile_error!` above this function makes that unbuildable rather than
+/// leaving it to whoever adds the target.
 fn swap_in(exe: &Path, download: &Path, expected_sha256: &str) -> Result<(), UpdateError> {
     #[cfg(windows)]
     {
@@ -931,19 +1036,38 @@ fn swap_in(exe: &Path, download: &Path, expected_sha256: &str) -> Result<(), Upd
     {
         use std::os::unix::fs::PermissionsExt;
 
-        // Everything below works off one open file description, so the bytes
-        // that are hashed and the inode that is chmod'ed are the same object —
-        // path-based `fs::set_permissions` would also follow a symlink swapped
-        // in under `<exe>.new` and chmod whatever it points at.
+        // SECURITY: `<exe>.new` must be a regular file, not a link. Holding one
+        // open file description only guarantees that the bytes hashed and the
+        // inode chmod'ed are the same object; it does **not** make the rename
+        // below safe, because `fs::File::open` follows symlinks and the rename
+        // still names the path. Without this check, an attacker who plants a
+        // symlink at `<exe>.new` between verification and the swap gets *their*
+        // file hashed (so the digest check passes), their inode chmod'ed, and
+        // then the **link itself** renamed onto `<exe>` — the published binary
+        // becomes a symlink into a file they can keep mutating afterwards.
+        // Rejecting the link is not atomic with the open, and does not close the
+        // residual TOCTOU window described above; it removes the class where the
+        // thing being published is a redirection rather than the bytes verified.
+        if fs::symlink_metadata(download)?.file_type().is_symlink() {
+            return Err(UpdateError::BadSignature);
+        }
         let file = fs::File::open(download)?;
-        let len = file.metadata()?.len();
-        if len > MAX_DOWNLOAD_BYTES {
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(UpdateError::BadSignature);
+        }
+        if meta.len() > MAX_DOWNLOAD_BYTES {
             return Err(UpdateError::TooLarge(MAX_DOWNLOAD_BYTES));
         }
         let on_disk = {
             use std::io::Read;
-            let mut buf = Vec::with_capacity(len as usize);
+            let mut buf = Vec::with_capacity(meta.len() as usize);
             (&file).take(MAX_DOWNLOAD_BYTES + 1).read_to_end(&mut buf)?;
+            // The stat above only bounds the allocation; the file can grow
+            // between it and the read, so the cap is enforced on what landed.
+            if buf.len() as u64 > MAX_DOWNLOAD_BYTES {
+                return Err(UpdateError::TooLarge(MAX_DOWNLOAD_BYTES));
+            }
             buf
         };
         // Fails closed: an empty `expected_sha256` (nothing verified it) can
@@ -989,27 +1113,48 @@ fn swap_in(exe: &Path, download: &Path, expected_sha256: &str) -> Result<(), Upd
 
 /// Best-effort delete of the leftovers an update can strand next to the exe:
 /// the previous binary (`.old`) and an unverified staged download (`.new`,
-/// possible after a crash or a timeout). Safe to call at every startup; errors
-/// (still locked, already gone) are ignored.
+/// possible after a crash or a timeout). **Both** are age-gated by
+/// [`STALE_STAGING_AGE`], so a leftover another instance is currently using is
+/// left alone. Safe to call at every startup; errors (still locked, already
+/// gone) are ignored.
 pub fn cleanup_old_binary() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = fs::remove_file(old_path(&exe));
-        // Nothing in this process verified that file, so it does not get to
-        // stay and be reused — but only once it is old enough to be junk.
-        //
-        // CORRECTNESS: a second np2ptp instance may be mid-update right now,
-        // and deleting its staging file under it breaks that update (worst
-        // case, between `swap_in`'s two renames, leaving no `<exe>` at all).
-        // A `.new` still being written is seconds old; one left by a crash is
-        // not. Unreadable mtime => leave it: the next start will try again.
-        let staging = staging_path(&exe);
-        let stale = fs::metadata(&staging)
-            .and_then(|m| m.modified())
-            .map(|t| t.elapsed().map(|age| age > STALE_STAGING_AGE).unwrap_or(false))
-            .unwrap_or(false);
-        if stale {
-            let _ = fs::remove_file(&staging);
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+
+    // CORRECTNESS: a second np2ptp instance may be mid-update right now, and
+    // deleting *either* leftover under it breaks that update. `.new` is the
+    // obvious one; `.old` is the same race seen from the other side — between
+    // `swap_in`'s two renames the running binary has already been moved to
+    // `.old`, so deleting it there makes B's second rename fail, B's rollback
+    // rename fail too, and leaves `RollbackFailed` pointing at a path that no
+    // longer exists with no working binary anywhere. Both get the same age gate.
+    // A file another instance is actively using is seconds old; one left by a
+    // crash is not. Unreadable mtime => leave it, the next start tries again.
+    let stale = |path: &Path| {
+        let Ok(modified) = fs::metadata(path).and_then(|m| m.modified()) else {
+            return false;
+        };
+        match modified.elapsed() {
+            Ok(age) => age > STALE_STAGING_AGE,
+            // mtime in the future: clock skew, or a file planted with a bogus
+            // timestamp precisely so `elapsed()` errors and the age gate never
+            // fires. Treating that as "not stale" leaves the leftover pinned
+            // forever, so future-dated is junk by definition — no live instance
+            // writes a timestamp ahead of the clock it is reading.
+            Err(_) => true,
         }
+    };
+
+    let old = old_path(&exe);
+    if stale(&old) {
+        let _ = fs::remove_file(&old);
+    }
+    // Nothing in this process verified the staged file, so it does not get to
+    // stay and be reused — but only once it is old enough to be junk.
+    let staging = staging_path(&exe);
+    if stale(&staging) {
+        let _ = fs::remove_file(&staging);
     }
 }
 
@@ -1188,6 +1333,17 @@ mod tests {
             EXPECTED_SIGNER_THUMBPRINT,
             &EXPECTED_SIGNER_THUMBPRINT[..10]
         ));
+    }
+
+    #[test]
+    fn too_short_a_timeout_is_refused_before_any_network_work() {
+        // The swap gate needs SWAP_RESERVE left on the deadline, so a timeout
+        // under the floor could only ever download, verify and throw it away.
+        assert!(matches!(
+            check_and_update(Duration::from_secs(1)),
+            Err(UpdateError::TimeoutTooShort { .. })
+        ));
+        assert!(MIN_UPDATE_TIMEOUT > SWAP_RESERVE);
     }
 
     #[test]
