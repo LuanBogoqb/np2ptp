@@ -21,14 +21,19 @@
 //!
 //! What is verified is the file **on disk** under `<exe>.new`, which is created
 //! fresh (never through a symlink, never reusing an existing file) and fsynced
-//! before the rename. See the `SECURITY:` comments on
-//! `verified_signer_thumbprint`, `write_staging` and `swap_in` for the
-//! remaining Windows time-of-check/time-of-use window and the open question
-//! about `WTD_HASH_ONLY_FLAG`.
+//! before the rename. Both platforms re-verify that file immediately before the
+//! rename, so the time-of-check/time-of-use window is microseconds rather than
+//! a network round trip — but it is **not zero on either platform**, because
+//! the rename still names a path and not the verified handle. See the
+//! `SECURITY:` comments on `verified_signer_thumbprint`, `write_staging` and
+//! `swap_in` for that residual window and the open question about
+//! `WTD_HASH_ONLY_FLAG`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -52,9 +57,23 @@ pub const SUMS_ASSET: &str = "SHA256SUMS";
 /// endless body to eat the machine's RAM.
 pub const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
 
+/// `SHA256SUMS` is a handful of `<64 hex>  <name>` lines. It does not get to
+/// share the binary's 256 MiB budget: a hostile or broken mirror answering the
+/// checksum request with a huge body would otherwise be buffered in full.
+pub const MAX_SUMS_BYTES: u64 = 1024 * 1024;
+
 /// Slack given to the update worker on top of its own timeout before the
 /// caller stops waiting for it and returns [`UpdateError::Timeout`].
 const WORKER_JOIN_GRACE: Duration = Duration::from_secs(10);
+
+/// Time that must still be left on the deadline before the swap phase is
+/// dispatched. See `run_update`: a dispatched swap always runs to completion,
+/// so it is only ever started when there is room for it to finish.
+const SWAP_RESERVE: Duration = Duration::from_secs(5);
+
+/// A `.new` younger than this may belong to another instance's in-flight
+/// update, so startup cleanup leaves it alone.
+const STALE_STAGING_AGE: Duration = Duration::from_secs(3600);
 
 /// Hosts an update may be fetched from. Explicit list, no wildcards except the
 /// `*.github.com` suffix rule in [`is_github_url`]: GitHub serves release
@@ -91,10 +110,11 @@ pub enum UpdateError {
     /// Both the swap-in rename *and* the rollback rename failed: the original
     /// binary is only reachable under its `.old` name. Loud on purpose.
     #[error(
-        "UPDATE FAILED AND ROLLBACK FAILED: the working binary is now at {0} — \
-         rename it back to the original name by hand before running np2ptp again"
+        "UPDATE FAILED AND ROLLBACK FAILED: the working binary is now at {path} — \
+         rename it back to the original name by hand before running np2ptp again \
+         (the swap failed with: {cause})"
     )]
-    RollbackFailed(String),
+    RollbackFailed { path: String, cause: String },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("update worker failed")]
@@ -266,7 +286,7 @@ pub fn verify_sha256(bytes: &[u8], sums_body: &str, asset_name: &str) -> Result<
 // ----------------------------------------------------------- Windows pinning
 
 /// The signer certificate's SHA-1 thumbprint, but only if the file's
-/// Authenticode signature still matches its bytes. `None` for unsigned or
+/// Authenticode signature still matches its bytes. `Err` for unsigned or
 /// tampered files.
 ///
 /// `WTD_HASH_ONLY_FLAG` makes `WinVerifyTrust` check signature/hash integrity
@@ -275,6 +295,10 @@ pub fn verify_sha256(bytes: &[u8], sums_body: &str, asset_name: &str) -> Result<
 /// that hasn't imported it. Reading the embedded certificate *without* the
 /// `WinVerifyTrust` call would be worthless: it returns metadata even for a
 /// file whose content no longer matches the signature.
+///
+/// `Err(status)` carries the raw `WinVerifyTrust` return so the caller can tell
+/// "this file is not signed by the pinned key" (a security verdict) apart from
+/// "this file could not be read right now" (an operational failure).
 ///
 // SECURITY: OPEN QUESTION — `WTD_HASH_ONLY_FLAG`. It is not settled here
 // whether the flag still verifies the PKCS#7 signature over the
@@ -288,7 +312,7 @@ pub fn verify_sha256(bytes: &[u8], sums_body: &str, asset_name: &str) -> Result<
 // trusted in production. Do not treat this function as authenticating until
 // then. Left as-is deliberately; tracked outside this module.
 #[cfg(windows)]
-fn verified_signer_thumbprint(path: &Path) -> Option<String> {
+fn verified_signer_thumbprint(path: &Path) -> Result<String, i32> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
 
@@ -347,10 +371,79 @@ fn verified_signer_thumbprint(path: &Path) -> Option<String> {
         );
     }
     if status != 0 {
-        return None;
+        return Err(status);
     }
 
-    signer_thumbprint(&wide)
+    signer_thumbprint(&wide).ok_or(NO_SIGNER_STATUS)
+}
+
+/// Not a Win32 status: "the trust call succeeded but no signer certificate came
+/// out of the file". Always a real verification failure, never transient.
+#[cfg(windows)]
+const NO_SIGNER_STATUS: i32 = i32::MIN;
+
+#[cfg(windows)]
+const HRESULT_ACCESS_DENIED: i32 = 0x8007_0005u32 as i32;
+#[cfg(windows)]
+const HRESULT_SHARING_VIOLATION: i32 = 0x8007_0020u32 as i32;
+#[cfg(windows)]
+const HRESULT_LOCK_VIOLATION: i32 = 0x8007_0021u32 as i32;
+/// `CRYPT_E_FILE_ERROR` — "an error occurred while reading or writing to a
+/// file". What the trust provider reports when it cannot open the image at all.
+#[cfg(windows)]
+const CRYPT_E_FILE_ERROR: i32 = 0x8009_2003u32 as i32;
+
+/// Statuses that mean "could not read the file", not "the file is untrusted".
+///
+/// A freshly written `.exe` is exactly what an on-access antivirus scanner
+/// grabs on close, and while it holds the file `WinVerifyTrust` cannot open it.
+/// The bare Win32 codes are listed alongside the `HRESULT_FROM_WIN32` forms
+/// because the trust provider is not consistent about wrapping them.
+#[cfg(windows)]
+fn is_transient_verify_status(status: i32) -> bool {
+    matches!(
+        status,
+        HRESULT_ACCESS_DENIED
+            | HRESULT_SHARING_VIOLATION
+            | HRESULT_LOCK_VIOLATION
+            | CRYPT_E_FILE_ERROR
+            | 5   // ERROR_ACCESS_DENIED
+            | 32  // ERROR_SHARING_VIOLATION
+            | 33 // ERROR_LOCK_VIOLATION
+    )
+}
+
+/// The pin check, retried once over a transient read failure.
+///
+/// SECURITY: a mismatched or missing thumbprint is [`UpdateError::BadSignature`]
+/// on the first try, no retry, no second chance. Only an *IO-flavoured* status
+/// is retried, and if it persists the result is [`UpdateError::Io`] — reporting
+/// "failed verification against the pinned signer" for a file an AV scanner had
+/// open would be a false accusation, and would train people to ignore the one
+/// error in this module that always means tampering. Either way the update
+/// still fails closed.
+#[cfg(windows)]
+fn verify_pinned_signer(path: &Path) -> Result<(), UpdateError> {
+    match verified_signer_thumbprint(path) {
+        Ok(thumb) if hex_eq(&thumb, EXPECTED_SIGNER_THUMBPRINT) => return Ok(()),
+        Ok(_) => return Err(UpdateError::BadSignature),
+        Err(status) if is_transient_verify_status(status) => {}
+        Err(_) => return Err(UpdateError::BadSignature),
+    }
+    std::thread::sleep(Duration::from_millis(750));
+    match verified_signer_thumbprint(path) {
+        Ok(thumb) if hex_eq(&thumb, EXPECTED_SIGNER_THUMBPRINT) => Ok(()),
+        Ok(_) => Err(UpdateError::BadSignature),
+        Err(status) if is_transient_verify_status(status) => Err(UpdateError::Io(
+            std::io::Error::other(format!(
+                "could not read {} to verify its signature (status 0x{status:08X}); \
+                 another process — most likely an antivirus scanner — is holding the \
+                 file. This is not a signature failure; the update was not applied.",
+                path.display()
+            )),
+        )),
+        Err(_) => Err(UpdateError::BadSignature),
+    }
 }
 
 /// The `X509Certificate.CreateFromSignedFile` half of the C# original: pull the
@@ -491,14 +584,27 @@ pub fn check_and_update(timeout: Duration) -> Result<UpdateReport, UpdateError> 
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
+                // Set once `swap_in` has been handed to the blocking pool. A
+                // `spawn_blocking` task cannot be cancelled, so from that
+                // moment on the swap owns `<exe>.new` and runs to completion
+                // even though the awaiting future is gone.
+                let flag = Arc::new(AtomicBool::new(false));
                 rt.block_on(async move {
-                    match tokio::time::timeout(timeout, run_update(timeout)).await {
+                    match tokio::time::timeout(timeout, run_update(timeout, flag.clone())).await {
                         Ok(result) => result,
                         Err(_) => {
                             // The cancelled future may have left `<exe>.new`
                             // staged; an unverified file never survives a run.
-                            if let Ok(exe) = std::env::current_exe() {
-                                let _ = fs::remove_file(staging_path(&exe));
+                            //
+                            // SECURITY/CORRECTNESS: unless a swap is already
+                            // running. Deleting `.new` under a live `swap_in`
+                            // can race its two renames and leave *no* `<exe>`
+                            // at all. A detached swap keeps the file; startup
+                            // `cleanup_old_binary` reaps it later.
+                            if !flag.load(Ordering::SeqCst) {
+                                if let Ok(exe) = std::env::current_exe() {
+                                    let _ = fs::remove_file(staging_path(&exe));
+                                }
                             }
                             Err(UpdateError::Timeout)
                         }
@@ -522,17 +628,31 @@ pub fn check_and_update(timeout: Duration) -> Result<UpdateReport, UpdateError> 
     }
 }
 
-async fn run_update(timeout: Duration) -> Result<UpdateReport, UpdateError> {
+async fn run_update(
+    timeout: Duration,
+    swap_dispatched: Arc<AtomicBool>,
+) -> Result<UpdateReport, UpdateError> {
+    let deadline = Instant::now() + timeout;
     let current = env!("CARGO_PKG_VERSION").to_string();
 
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(timeout)
-        // SECURITY: no plaintext fallback, and a bounded redirect chain. Every
-        // URL is host-checked before it is requested, but a redirect can still
-        // move the final hop, so keep the chain short.
+        // SECURITY: no plaintext fallback, and every hop is host-checked — not
+        // just the first one. `Policy::limited` would follow a redirect from
+        // github.com to any host on earth, which turns `is_github_url` on the
+        // asset URL into decoration: the API answer picks the first URL, the
+        // attacker picks the last. The chain stays short *and* stays on GitHub.
         .https_only(true)
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                attempt.stop()
+            } else if is_github_url(attempt.url().as_str()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .build()?;
 
     let release: Release = client
@@ -568,7 +688,7 @@ async fn run_update(timeout: Duration) -> Result<UpdateReport, UpdateError> {
         return Err(UpdateError::UntrustedHost(asset_url));
     }
 
-    let bytes = download_capped(&client, &asset_url).await?;
+    let bytes = download_capped(&client, &asset_url, MAX_DOWNLOAD_BYTES).await?;
     if bytes.is_empty() {
         return Err(UpdateError::BadSignature);
     }
@@ -587,21 +707,35 @@ async fn run_update(timeout: Duration) -> Result<UpdateReport, UpdateError> {
 
     // From here on, every failure deletes the download before returning.
     let verified = verify_download(&client, &release, &download, &asset_name).await;
-    if let Err(err) = verified {
+    let expected_sha256 = match verified {
+        Ok(digest) => digest,
+        Err(err) => {
+            let _ = fs::remove_file(&download);
+            return Err(err);
+        }
+    };
+
+    // CORRECTNESS: `spawn_blocking` cannot be cancelled, so a swap that is
+    // dispatched with barely any deadline left keeps renaming after the caller
+    // has already been told `Timeout` — and the timeout's cleanup would be
+    // deleting `<exe>.new` around the same renames. Bail out *before*
+    // dispatching instead: a swap that starts always gets to finish.
+    if deadline.saturating_duration_since(Instant::now()) < SWAP_RESERVE {
         let _ = fs::remove_file(&download);
-        return Err(err);
+        return Err(UpdateError::Timeout);
     }
+    swap_dispatched.store(true, Ordering::SeqCst);
 
     let swapped = {
         let (exe, download) = (exe.clone(), download.clone());
-        tokio::task::spawn_blocking(move || swap_in(&exe, &download)).await
+        tokio::task::spawn_blocking(move || swap_in(&exe, &download, &expected_sha256)).await
     };
     match swapped {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             // Leave the staged binary in place only when it is the user's way
             // back: a failed rollback means `<exe>` is gone.
-            if !matches!(err, UpdateError::RollbackFailed(_)) {
+            if !matches!(err, UpdateError::RollbackFailed { .. }) {
                 let _ = fs::remove_file(&download);
             }
             return Err(err);
@@ -619,45 +753,31 @@ async fn run_update(timeout: Duration) -> Result<UpdateReport, UpdateError> {
     })
 }
 
-/// GET `url`, refusing bodies over [`MAX_DOWNLOAD_BYTES`].
+/// GET `url`, refusing bodies over `cap` bytes.
 ///
 /// SECURITY: `Content-Length` is a hint from the other side, so the declared
 /// length is only an early exit — the streamed bytes are counted as they land
 /// and the transfer is cut the moment it crosses the cap. `bytes()` would
-/// happily buffer an endless body into RAM.
-async fn download_capped(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, UpdateError> {
+/// happily buffer an endless body into RAM. The cap is per-call so a small
+/// resource ([`MAX_SUMS_BYTES`]) is not billed against the binary's budget.
+async fn download_capped(
+    client: &reqwest::Client,
+    url: &str,
+    cap: u64,
+) -> Result<Vec<u8>, UpdateError> {
     let mut resp = client.get(url).send().await?.error_for_status()?;
-    if resp.content_length().is_some_and(|n| n > MAX_DOWNLOAD_BYTES) {
-        return Err(UpdateError::TooLarge(MAX_DOWNLOAD_BYTES));
+    if resp.content_length().is_some_and(|n| n > cap) {
+        return Err(UpdateError::TooLarge(cap));
     }
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await? {
-        if body.len() as u64 + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
-            return Err(UpdateError::TooLarge(MAX_DOWNLOAD_BYTES));
+        if body.len() as u64 + chunk.len() as u64 > cap {
+            return Err(UpdateError::TooLarge(cap));
         }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
 }
-
-/// `O_NOFOLLOW`, spelled out because `libc` is not a dependency of this crate.
-/// Same value on Linux/Android for every arch the project targets; the BSD and
-/// mips numbers are here so a port doesn't silently lose the flag.
-#[cfg(unix)]
-const O_NOFOLLOW: i32 = if cfg!(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly"
-)) {
-    0x0100
-} else if cfg!(any(target_arch = "mips", target_arch = "mips64")) {
-    0o100000
-} else {
-    0o400000
-};
 
 /// `FILE_FLAG_OPEN_REPARSE_POINT`: open the reparse point itself instead of
 /// following it.
@@ -669,10 +789,16 @@ const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 /// SECURITY: three things at once.
 /// * The unlink first means a leftover `.new` from a crashed or timed-out run
 ///   is never written into or partially reused.
-/// * `create_new` + `O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT` means a
-///   symlink, junction or pre-created file planted next to the exe by another
-///   user makes the open **fail** instead of redirecting our write into a file
-///   they control (and whose mode/ACL they chose).
+/// * `create_new` (`O_EXCL`) is the symlink defense on unix: `O_CREAT|O_EXCL`
+///   fails on an existing path *including* a dangling or live symlink, so a
+///   symlink or pre-created file planted next to the exe by another user makes
+///   the open **fail** instead of redirecting our write into a file they
+///   control (and whose mode/ACL they chose). Windows additionally opens the
+///   reparse point itself. There is deliberately no hand-written `O_NOFOLLOW`
+///   here: its value is per-arch (`0o400000` on most Linux, `0o100000` on
+///   powerpc, different again on sparc/alpha/BSD) and a table that guesses
+///   wrong silently passes a *different* flag. Adding it back means taking the
+///   `libc` dependency and using `libc::O_NOFOLLOW`, nothing less.
 /// * `sync_all` before the rename: `rename` orders metadata, not data, so
 ///   without it a power cut can leave a correctly-named binary full of zeroes.
 fn write_staging(download: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
@@ -686,11 +812,6 @@ fn write_staging(download: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
 
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(O_NOFOLLOW);
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -703,24 +824,42 @@ fn write_staging(download: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
     Ok(())
 }
 
+/// Read `path`, refusing anything over [`MAX_DOWNLOAD_BYTES`].
+///
+/// SECURITY: the download was capped in flight, but this reads the file *again*
+/// off disk, and between the write and the read someone with write access next
+/// to the exe can have replaced it with something enormous. `fs::read`
+/// pre-allocates from the file's size, so an unchecked read-back is a
+/// one-syscall OOM.
+#[cfg(not(windows))]
+fn read_capped(path: &Path) -> Result<Vec<u8>, UpdateError> {
+    let len = fs::metadata(path)?.len();
+    if len > MAX_DOWNLOAD_BYTES {
+        return Err(UpdateError::TooLarge(MAX_DOWNLOAD_BYTES));
+    }
+    Ok(fs::read(path)?)
+}
+
 /// Windows: pinned Authenticode signer. Elsewhere: the release's `SHA256SUMS`.
-/// Every failure path here is [`UpdateError::BadSignature`].
+/// Every failure path here is [`UpdateError::BadSignature`] except an
+/// unreadable file, which is [`UpdateError::Io`].
+///
+/// Returns the verified SHA-256 of the staged file (empty on Windows, where the
+/// Authenticode pin is the check), so `swap_in` can re-verify the exact same
+/// digest immediately before the rename without re-fetching `SHA256SUMS`.
 async fn verify_download(
     client: &reqwest::Client,
     release: &Release,
     download: &Path,
     asset_name: &str,
-) -> Result<(), UpdateError> {
+) -> Result<String, UpdateError> {
     #[cfg(windows)]
     {
         let _ = (client, release, asset_name);
         let path = download.to_path_buf();
-        tokio::task::spawn_blocking(move || match verified_signer_thumbprint(&path) {
-            Some(thumb) if hex_eq(&thumb, EXPECTED_SIGNER_THUMBPRINT) => Ok(()),
-            _ => Err(UpdateError::BadSignature),
-        })
-        .await
-        .map_err(|_| UpdateError::Worker)?
+        tokio::task::spawn_blocking(move || verify_pinned_signer(&path).map(|()| String::new()))
+            .await
+            .map_err(|_| UpdateError::Worker)?
     }
     #[cfg(not(windows))]
     {
@@ -734,7 +873,7 @@ async fn verify_download(
         if !is_github_url(&sums_url) {
             return Err(UpdateError::UntrustedHost(sums_url));
         }
-        let sums = download_capped(client, &sums_url)
+        let sums = download_capped(client, &sums_url, MAX_SUMS_BYTES)
             .await
             .map_err(|_| UpdateError::BadSignature)?;
         let sums = String::from_utf8_lossy(&sums).into_owned();
@@ -746,10 +885,11 @@ async fn verify_download(
         // replace `<exe>.new`. Verifying the buffer would bless a file nobody
         // ever looked at.
         let path = download.to_path_buf();
-        let on_disk = tokio::task::spawn_blocking(move || fs::read(&path))
+        let on_disk = tokio::task::spawn_blocking(move || read_capped(&path))
             .await
             .map_err(|_| UpdateError::Worker)??;
-        verify_sha256(&on_disk, &sums, asset_name)
+        verify_sha256(&on_disk, &sums, asset_name)?;
+        Ok(sha256_hex(&on_disk))
     }
 }
 
@@ -768,30 +908,63 @@ fn old_path(exe: &Path) -> PathBuf {
 /// Move the verified download into place: rename the running exe out of the way
 /// (Windows allows renaming a running image, not overwriting it), then rename
 /// the download in. If the second rename fails, put the original back.
-fn swap_in(exe: &Path, download: &Path) -> Result<(), UpdateError> {
+///
+/// `expected_sha256` is the digest `verify_download` confirmed; it is empty on
+/// Windows, where the Authenticode pin is re-run instead.
+///
+/// SECURITY: TOCTOU mitigation, on **both** platforms. The verification above
+/// named a *path* and this rename names that path again — nothing ties the two
+/// calls to the same file, so anyone able to write next to the exe can swap
+/// `<exe>.new` in between. Re-verifying immediately before the rename shrinks
+/// the window from "one HTTP round trip" to microseconds, at the cost of one
+/// cheap local check. Closing it outright needs the *verified handle* to be the
+/// thing renamed: `renameat2`/`linkat`-from-fd on unix, `WinVerifyTrust` plus
+/// `SetFileInformationByHandle` rename-by-handle on Windows. Follow-up, not
+/// here — but the window is not Windows-only and never was.
+fn swap_in(exe: &Path, download: &Path, expected_sha256: &str) -> Result<(), UpdateError> {
     #[cfg(windows)]
     {
-        // SECURITY: TOCTOU mitigation. The verification above named a *path*
-        // and this rename names that path again — nothing ties the two calls to
-        // the same file, so anyone able to write next to the exe can swap
-        // `<exe>.new` in between. Re-running the pin check immediately before
-        // the rename shrinks the window from "one HTTP round trip" to
-        // microseconds, at the cost of one cheap local verify. Closing it
-        // outright needs the *verified handle* to be the thing renamed, which
-        // `WinVerifyTrust` (path-based) plus `SetFileInformationByHandle`
-        // rename-by-handle would have to be plumbed for — follow-up, not here.
-        match verified_signer_thumbprint(download) {
-            Some(thumb) if hex_eq(&thumb, EXPECTED_SIGNER_THUMBPRINT) => {}
-            _ => return Err(UpdateError::BadSignature),
-        }
+        let _ = expected_sha256;
+        verify_pinned_signer(download)?;
     }
     #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Everything below works off one open file description, so the bytes
+        // that are hashed and the inode that is chmod'ed are the same object —
+        // path-based `fs::set_permissions` would also follow a symlink swapped
+        // in under `<exe>.new` and chmod whatever it points at.
+        let file = fs::File::open(download)?;
+        let len = file.metadata()?.len();
+        if len > MAX_DOWNLOAD_BYTES {
+            return Err(UpdateError::TooLarge(MAX_DOWNLOAD_BYTES));
+        }
+        let on_disk = {
+            use std::io::Read;
+            let mut buf = Vec::with_capacity(len as usize);
+            (&file).take(MAX_DOWNLOAD_BYTES + 1).read_to_end(&mut buf)?;
+            buf
+        };
+        // Fails closed: an empty `expected_sha256` (nothing verified it) can
+        // never match a real digest, and a mismatch is a swapped file.
+        if expected_sha256.is_empty() || !hex_eq(&sha256_hex(&on_disk), expected_sha256) {
+            return Err(UpdateError::BadSignature);
+        }
+
         // Reapply the *current* binary's mode rather than a hardcoded 0o755: a
-        // deployment that ships the binary 0o700, setgid, or owned by a service
-        // account must not be quietly widened by an update.
-        let mode = fs::metadata(exe)?.permissions();
-        fs::set_permissions(download, mode)?;
+        // deployment that ships the binary 0o700 or owned by a service account
+        // must not be quietly widened by an update.
+        //
+        // SECURITY: setuid/setgid are masked off. If the running binary is
+        // setuid root, carrying that bit over would hand root to a file this
+        // process just pulled off the network — the pin says "GitHub published
+        // it", not "it is safe to run as another user". A deployment that
+        // really wants setuid re-sets it deliberately, after the update.
+        let mode = fs::metadata(exe)?.permissions().mode() & 0o7777 & !0o6000;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.sync_all()?;
+        drop(file);
     }
 
     let old = old_path(exe);
@@ -800,8 +973,13 @@ fn swap_in(exe: &Path, download: &Path) -> Result<(), UpdateError> {
     if let Err(err) = fs::rename(download, exe) {
         if fs::rename(&old, exe).is_err() {
             // Both renames failed: `<exe>` no longer exists and the only
-            // working binary is the `.old` copy. Say so, loudly, by name.
-            return Err(UpdateError::RollbackFailed(old.display().to_string()));
+            // working binary is the `.old` copy. Say so, loudly, by name — and
+            // keep the error that started it, or the report says the rollback
+            // broke without saying what the swap tripped over.
+            return Err(UpdateError::RollbackFailed {
+                path: old.display().to_string(),
+                cause: err.to_string(),
+            });
         }
         let _ = fs::remove_file(download);
         return Err(UpdateError::Io(err));
@@ -817,8 +995,21 @@ pub fn cleanup_old_binary() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = fs::remove_file(old_path(&exe));
         // Nothing in this process verified that file, so it does not get to
-        // stay and be reused.
-        let _ = fs::remove_file(staging_path(&exe));
+        // stay and be reused — but only once it is old enough to be junk.
+        //
+        // CORRECTNESS: a second np2ptp instance may be mid-update right now,
+        // and deleting its staging file under it breaks that update (worst
+        // case, between `swap_in`'s two renames, leaving no `<exe>` at all).
+        // A `.new` still being written is seconds old; one left by a crash is
+        // not. Unreadable mtime => leave it: the next start will try again.
+        let staging = staging_path(&exe);
+        let stale = fs::metadata(&staging)
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().map(|age| age > STALE_STAGING_AGE).unwrap_or(false))
+            .unwrap_or(false);
+        if stale {
+            let _ = fs::remove_file(&staging);
+        }
     }
 }
 
