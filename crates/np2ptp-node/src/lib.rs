@@ -21,6 +21,11 @@ use std::path::{Path, PathBuf};
 use np2ptp_core::{Hash, Manifest, ManifestError};
 use np2ptp_store::{Store, StoreError};
 
+pub mod serve_set;
+pub mod daemon;
+
+pub use serve_set::{collect_serve_manifests, register_manifest};
+
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     #[error(transparent)]
