@@ -7,8 +7,8 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use np2ptp_sim::{
-    dedup, fec_cost, freeride, permanence, receipt_bootstraps_trust, DedupResult, FecCostResult,
-    FreerideResult, PermanenceResult, ReceiptTrustResult,
+    dedup, fec_cost, freeride, multi_serve, permanence, receipt_bootstraps_trust, DedupResult,
+    FecCostResult, FreerideResult, MultiServeResult, PermanenceResult, ReceiptTrustResult,
 };
 
 struct Results {
@@ -19,6 +19,7 @@ struct Results {
     freeride_on: FreerideResult,
     receipt_trust: ReceiptTrustResult,
     fec: FecCostResult,
+    multi_serve: MultiServeResult,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -33,6 +34,7 @@ async fn main() {
         freeride_on: freeride(true).await,
         receipt_trust: receipt_bootstraps_trust().await,
         fec: fec_cost().await,
+        multi_serve: multi_serve().await,
     };
 
     print_console(&r);
@@ -64,6 +66,9 @@ fn print_console(r: &Results) {
         b(r.receipt_trust.cold_peer_completed), b(r.receipt_trust.vouched_peer_completed));
     println!("[5] FEC cost ({} bytes): chunk {} ms vs FEC {} ms",
         r.fec.size, r.fec.chunk_ms, r.fec.fec_ms);
+    println!("[6] Multi-manifest serve: first reconstructed = {}, second reconstructed = {}, providers = {}/{}",
+        b(r.multi_serve.first_reconstructed), b(r.multi_serve.second_reconstructed),
+        r.multi_serve.first_providers, r.multi_serve.second_providers);
 }
 
 fn build_csv(r: &Results) -> String {
@@ -80,6 +85,10 @@ fn build_csv(r: &Results) -> String {
     s.push_str(&format!("fec,size_bytes,{}\n", r.fec.size));
     s.push_str(&format!("fec,chunk_ms,{}\n", r.fec.chunk_ms));
     s.push_str(&format!("fec,fec_ms,{}\n", r.fec.fec_ms));
+    s.push_str(&format!("multi_serve,first_reconstructed,{}\n", r.multi_serve.first_reconstructed as u8));
+    s.push_str(&format!("multi_serve,second_reconstructed,{}\n", r.multi_serve.second_reconstructed as u8));
+    s.push_str(&format!("multi_serve,first_providers,{}\n", r.multi_serve.first_providers));
+    s.push_str(&format!("multi_serve,second_providers,{}\n", r.multi_serve.second_providers));
     s
 }
 
@@ -106,7 +115,9 @@ fn build_markdown(r: &Results) -> String {
          | Receipt-bootstrapped trust | cold peer (no receipt) completes | **{}** |\n\
          | Receipt-bootstrapped trust | vouched peer (receipt) completes | **{}** |\n\
          | FEC cost ({} bytes) | chunk download | **{} ms** |\n\
-         | FEC cost ({} bytes) | FEC (RaptorQ) download | **{} ms** |\n\n\
+         | FEC cost ({} bytes) | FEC (RaptorQ) download | **{} ms** |\n\
+         | Multi-manifest serve (one seed, two contents) | both reconstruct byte-for-byte | **{}** / **{}** |\n\
+         | Multi-manifest serve (one seed, two contents) | providers found per root | **{}** / **{}** |\n\n\
          ## Interpretation\n\n\
          - **Dedup** - content-defined chunking lets a re-shared, lightly-edited copy reuse\n  \
            most of its chunks, so storage/bandwidth scale with the *change*, not the file size.\n\
@@ -120,7 +131,10 @@ fn build_markdown(r: &Results) -> String {
            not memoryless tit-for-tat.\n\
          - **FEC cost** - with symbol batching and decode-once, erasure-coded download\n  \
            ~matches plain chunk download while adding any-*k*-of-*n* resilience. (Build in\n  \
-           `release`; RaptorQ's GF(256) math is far slower in debug.)\n\n\
+           `release`; RaptorQ's GF(256) math is far slower in debug.)\n\
+         - **Multi-manifest serve** - a single node can serve several distinct pieces of\n  \
+           content at once; a fetching peer reconstructs each byte-for-byte and the DHT\n  \
+           tracks providership per content root independently.\n\n\
          Raw values are in `results.csv` next to this file.\n",
         r.dedup.unique_chunks_stored,
         r.dedup.total_chunks,
@@ -135,5 +149,9 @@ fn build_markdown(r: &Results) -> String {
         r.fec.chunk_ms,
         r.fec.size,
         r.fec.fec_ms,
+        b(r.multi_serve.first_reconstructed),
+        b(r.multi_serve.second_reconstructed),
+        r.multi_serve.first_providers,
+        r.multi_serve.second_providers,
     )
 }
