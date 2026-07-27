@@ -10,7 +10,9 @@
 //! separate `[[bin]]` crate target and its `cmd_*` fns are private, so this
 //! module talks to the same lower-level APIs `main.rs` does instead):
 //!  - `fetch`     -> tracker peer discovery (reimplemented below — see the
-//!    `tracker_*` note) + `Network::download_multi_with_progress`, then
+//!    `tracker_*` note), unioned with the peers this node is already connected
+//!    to (so a `dial`ed peer is fetchable with no tracker at all, and a dead
+//!    tracker is a `warn`, not a failed fetch) + `Network::download_multi_with_progress`, then
 //!    `Store::export_to_with_progress` / `export_tree_to_dir_with_progress`
 //!    (mirrors `cmd_fetch`/`cmd_get`'s `write_output_with_progress`).
 //!  - `convert`   -> torrent+data form: `np2ptp_bridge::resolve_or_convert_local`.
@@ -23,7 +25,8 @@
 //!    tracker announce loop (same 120s cadence as `cmd_serve`'s), tracked in a
 //!    `HashMap<Hash, JoinHandle<()>>`.
 //!  - `unprovide` -> abort that task + `Network::unprovide`.
-//!  - `status`    -> `connected_peers` + the provided-roots map + `ledger_totals`.
+//!  - `status`    -> `connected_peers` + the provided-roots map + `ledger_totals`
+//!    + this node's `peer_id`/`addrs` (same pair the `ready` event carries).
 //!  - `dial`      -> not a `proto::Op` variant yet (adding one means touching
 //!    `proto.rs`, a third file outside this task's budget) — handled here via a
 //!    raw `serde_json::Value` fallback keyed on `"cmd":"dial"`. Folding it into
@@ -71,6 +74,10 @@ use proto::{event_error, event_progress, event_ready, event_result, parse_reques
 const DEFAULT_LISTEN: &str = "/ip4/0.0.0.0/udp/0/quic-v1";
 /// Cadence for a `provide`d root's tracker announce loop — matches `cmd_serve`.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(120);
+/// How long [`listen_addrs`] waits for the swarm to report a bound address
+/// before giving up (polls × interval — 2s total).
+const LISTEN_ADDR_POLLS: usize = 40;
+const LISTEN_ADDR_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Configuration for [`run_daemon`]. `relay`/`tracker` are already resolved by
 /// the caller (env override, `--relay`/`--tracker` flags, or the built-in
@@ -115,6 +122,62 @@ fn handle_line(line: &str, tx: &mpsc::UnboundedSender<String>) -> Option<Request
 
 fn event_warn(message: &str) -> String {
     json!({"event": "warn", "message": message}).to_string()
+}
+
+/// `/p2p/<peer>`-suffixed string forms of `addrs` (idempotent: an address that
+/// already carries the suffix is left alone). That suffix is what makes an
+/// address directly dialable — it names who to expect at the other end.
+fn addr_strs_with_peer(addrs: &[Multiaddr], peer: PeerId) -> Vec<String> {
+    let suffix = format!("/p2p/{peer}");
+    addrs
+        .iter()
+        .map(|a| {
+            let s = a.to_string();
+            if s.ends_with(&suffix) {
+                s
+            } else {
+                format!("{s}{suffix}")
+            }
+        })
+        .collect()
+}
+
+/// This node's dialable addresses, `/p2p/`-suffixed.
+///
+/// Polled rather than read once: `Network::listen` returns as soon as the
+/// listener is *registered*, but the bound addresses only reach the swarm's
+/// listener set a few ms later, when it processes `NewListenAddr` — reading
+/// immediately would report an empty list on a node that is in fact listening.
+/// Bounded by [`LISTEN_ADDR_POLLS`], so a box with no usable interface gets an
+/// empty `addrs` array instead of a daemon that never says `ready`.
+async fn listen_addrs(net: &Network) -> Vec<String> {
+    for _ in 0..LISTEN_ADDR_POLLS {
+        let addrs = net.listeners().await.unwrap_or_default();
+        if !addrs.is_empty() {
+            return addr_strs_with_peer(&addrs, net.local_peer_id());
+        }
+        tokio::time::sleep(LISTEN_ADDR_POLL_INTERVAL).await;
+    }
+    Vec::new()
+}
+
+/// [`proto::event_ready`] plus this node's `peer_id` and listen `addrs`.
+///
+/// An embedder (Hydra) has to be able to tell a second node where this one is
+/// without a tracker in the loop, and `ready` is the only event it is
+/// guaranteed to see. Built by merging into the `proto` line rather than
+/// re-spelling it here, so the base shape stays owned by `proto`; falls back to
+/// the bare line if that (self-produced) JSON somehow doesn't re-parse.
+fn ready_line(version: &str, peer: PeerId, addrs: &[String]) -> String {
+    let base = event_ready(version);
+    match serde_json::from_str::<serde_json::Value>(&base) {
+        Ok(serde_json::Value::Object(mut obj)) => {
+            obj.insert("peer_id".to_string(), json!(peer.to_string()));
+            obj.insert("addrs".to_string(), json!(addrs));
+            serde_json::Value::Object(obj).to_string()
+        }
+        _ => base,
+    }
 }
 
 /// Runs the daemon until `shutdown` is requested (the `shutdown` op) or stdin
@@ -173,7 +236,8 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let _ = out_tx.send(event_ready(env!("CARGO_PKG_VERSION")));
+    let addrs = listen_addrs(&net).await;
+    let _ = out_tx.send(ready_line(env!("CARGO_PKG_VERSION"), net.local_peer_id(), &addrs));
 
     if cfg.auto_update {
         // Best-effort, silent on success/failure beyond stderr — the daemon's
@@ -322,16 +386,36 @@ async fn run_fetch(id: u64, uri: &str, out: &str, ctx: &Ctx) -> Result<serde_jso
             .root,
     };
 
-    let candidates = tracker_get_peers(&ctx.tracker, root).await?;
-    if candidates.is_empty() {
-        return Err("no peers found on the tracker for this content".to_string());
-    }
-    for (_, addrs) in &candidates {
-        for addr in addrs {
-            let _ = ctx.net.dial(addr.clone()).await;
+    // Tracker first, but never fatally: an embedder that dialed its peer itself
+    // (the `dial` op), or runs with no reachable tracker at all, must still be
+    // able to fetch. A tracker failure is a `warn`; peers we already hold a
+    // connection to are folded in as candidates, and
+    // `download_multi_with_progress` skips whichever of them turns out not to
+    // have the content.
+    let mut providers: Vec<PeerId> = Vec::new();
+    match tracker_get_peers(&ctx.tracker, root).await {
+        Ok(candidates) => {
+            for (peer, addrs) in &candidates {
+                for addr in addrs {
+                    let _ = ctx.net.dial(addr.clone()).await;
+                }
+                providers.push(*peer);
+            }
+        }
+        Err(e) => {
+            let _ = ctx.tx.send(event_warn(&format!("tracker lookup failed: {e}")));
         }
     }
-    let providers: Vec<PeerId> = candidates.iter().map(|(p, _)| *p).collect();
+    for peer in ctx.net.connected_peers().await.unwrap_or_default() {
+        if !providers.contains(&peer) {
+            providers.push(peer);
+        }
+    }
+    if providers.is_empty() {
+        return Err("no peers to fetch from: none on the tracker for this content, and \
+                    none connected (dial one first)"
+            .to_string());
+    }
 
     let tx = ctx.tx.clone();
     let manifest = ctx
@@ -473,7 +557,11 @@ async fn run_provide(nptp: &str, ctx: &Ctx) -> Result<serde_json::Value, String>
 }
 
 async fn run_unprovide(root: &str, ctx: &Ctx) -> Result<serde_json::Value, String> {
-    let root_hash = Hash::from_hex(root).map_err(|e| e.to_string())?;
+    // Both forms accepted: bare hex, or the `np2ptp:<hex>` URI that every
+    // `provide`/`status`/`fetch` result hands back — feeding our own output
+    // straight back in has to work.
+    let hex = root.strip_prefix("np2ptp:").unwrap_or(root);
+    let root_hash = Hash::from_hex(hex).map_err(|e| e.to_string())?;
     if let Some(handle) = ctx.announces.lock().await.remove(&root_hash) {
         handle.abort();
     }
@@ -486,8 +574,11 @@ async fn run_status(ctx: &Ctx) -> Result<serde_json::Value, String> {
     let provided: Vec<String> =
         ctx.announces.lock().await.keys().map(|h| format!("np2ptp:{}", h.to_hex())).collect();
     let ledger = ctx.net.ledger_totals().await.map_err(|e| e.to_string())?;
+    let listeners = ctx.net.listeners().await.unwrap_or_default();
     Ok(json!({
         "peers": peers.len(),
+        "peer_id": ctx.net.local_peer_id().to_string(),
+        "addrs": addr_strs_with_peer(&listeners, ctx.net.local_peer_id()),
         "provided": provided,
         "ledger": {
             "served_to_us": ledger.served_to_us,
@@ -542,18 +633,7 @@ struct PeerEntry {
 }
 
 async fn tracker_announce(tracker: &str, cid: Hash, peer: PeerId, addrs: &[Multiaddr]) -> Result<(), String> {
-    let suffix = format!("/p2p/{peer}");
-    let addr_strs: Vec<String> = addrs
-        .iter()
-        .map(|a| {
-            let s = a.to_string();
-            if s.ends_with(&suffix) {
-                s
-            } else {
-                format!("{s}{suffix}")
-            }
-        })
-        .collect();
+    let addr_strs = addr_strs_with_peer(addrs, peer);
     let body = json!({
         "cid": cid.to_hex(),
         "peer": peer.to_string(),
@@ -615,6 +695,27 @@ mod tests {
         let req = handle_line(r#"{"id":1,"cmd":"status"}"#, &tx);
         assert!(req.is_some());
         assert!(rx.try_recv().is_err()); // nothing sent — caller executes the op
+    }
+
+    #[test]
+    fn peer_suffix_is_idempotent() {
+        let peer: PeerId = "12D3KooWSzXtDVLLFf2avw9bpcMCRsE7JvbdQNEcd45MKuRsGmyR".parse().unwrap();
+        let bare: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap();
+        let suffixed: Multiaddr = format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{peer}").parse().unwrap();
+        let out = addr_strs_with_peer(&[bare, suffixed], peer);
+        assert_eq!(out[0], out[1]);
+        assert!(out[0].ends_with(&format!("/p2p/{peer}")));
+    }
+
+    #[test]
+    fn ready_carries_peer_id_and_addrs() {
+        let peer: PeerId = "12D3KooWSzXtDVLLFf2avw9bpcMCRsE7JvbdQNEcd45MKuRsGmyR".parse().unwrap();
+        let line = ready_line("9.9.9", peer, &["/ip4/127.0.0.1/udp/1/quic-v1".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["event"], "ready");
+        assert_eq!(v["version"], "9.9.9");
+        assert_eq!(v["peer_id"], peer.to_string());
+        assert_eq!(v["addrs"][0], "/ip4/127.0.0.1/udp/1/quic-v1");
     }
 
     #[test]
