@@ -26,7 +26,6 @@ serde_json = "1"
 crab_nat = "0.7"
 netdev = "0.31"
 getrandom = "0.2"
-sha2 = "0.10"
 
 [features]
 librqbit = ["np2ptp-bridge/librqbit"]
@@ -36,6 +35,3 @@ sha1 = "0.10"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_WinTrust", "Win32_Security_Cryptography"] }

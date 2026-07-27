@@ -14,8 +14,7 @@ having to drive one CLI process per operation. Concretely:
 3. The relay and tracker endpoints are not hardcoded to one deployment.
 4. A persistent process owns the store, the identity and the network, and
    takes commands over a stream instead of being restarted for each one.
-5. The binary can update itself, with the same signature pinning the GUI
-   already uses.
+5. (withdrawn, see Patch 5)
 
 The first embedder is a game launcher, but nothing in this design is specific
 to one. That work lives in its own repository.
@@ -90,36 +89,14 @@ source file). Implementation is a refactor: extract the `cmd_*` bodies into
 functions taking a progress callback (several already do), then the daemon
 loop dispatches to them.
 
-### Patch 5: self-update (ported from np2ptp-gui's BinaryManager)
+### Patch 5: withdrawn
 
-Added 2026-07-27 by Luan's request: bring np2ptp-gui's update system
-(integrity verification + automatic update at startup) to the np2ptp binary
-itself.
+A self-update path was built here and then removed. Keeping a binary current
+belongs to whatever application bundles it, which is how `np2ptp-gui` already
+works: the app checks the release, verifies the download against the pinned
+signing certificate, and swaps the binary it owns. Putting that inside
+np2ptp meant an embedder could pin and verify a binary that then rewrote
+itself, which defeats the point of pinning it.
 
-**The ported recipe** (from `np2ptp-gui/src/Np2ptpGui/Services/BinaryManager.cs`):
+The design notes for the embedder-side implementation moved with it.
 
-- Latest GitHub release → download the platform asset
-  (`np2ptp-windows-x86_64.exe` / linux equivalent).
-- **Integrity:** on Windows, the downloaded exe's Authenticode signer
-  thumbprint must equal the pinned release-pipeline cert
-  (`36477BB5DCB10D2C0381A2D79533F0386C5CCACA`); mismatch → delete download,
-  keep current binary, loud error. On Linux (no Authenticode), verify against
-  the release's published `SHA256SUMS` asset instead.
-- **Version detection:** binary's own embedded version (`CARGO_PKG_VERSION`)
-  vs release tag (minus leading `v`). Unknown/unreadable → treat as "needs
-  update".
-- **Silent startup check:** bounded timeout; no internet / GitHub down /
-  timeout → keep running the binary already on disk, silently.
-- **Self-replace on Windows:** a running exe cannot be overwritten — rename
-  current exe to `np2ptp.exe.old`, write the new one in place, delete the
-  `.old` on next successful start.
-
-**Reconciliation with the 3-step rule** (golden rule 5): auto-update at
-startup of `pack`/`serve`/`fetch` would change what a Quick Start user sees
-(network calls, latency, messages) — not acceptable. Therefore:
-
-- New `np2ptp update` subcommand — manual, for everyone.
-- Automatic silent check **only at `daemon` startup** (new surface, no
-  existing UX touched), opt-out via `--no-auto-update`. Emits a
-  `{"event":"updated","from":…,"to":…}` NDJSON event when it happens, so the
-  embedder can log or surface it.

@@ -111,25 +111,6 @@ Because one process holds the identity across restarts, the reputation a
 seeder earns accumulates instead of resetting. Running several `serve`
 processes against one store cannot do that.
 
-## Staying Up to Date
-
-`np2ptp update` checks the latest GitHub release and, if it's newer, downloads
-and verifies it (Authenticode pin on Windows, `SHA256SUMS` on Linux) before
-swapping it in next to the running binary. Nothing is installed on a failed
-check: a bad signature deletes the download and leaves the current binary
-alone.
-
-```sh
-np2ptp update
-# already up to date (0.1.9)
-# or: updated 0.1.8 -> 0.1.9, restart to use it
-```
-
-`np2ptp daemon` does the same check on every start, unless you pass
-`--no-auto-update`. If it finds and installs a newer binary, it tells you
-about it with an `updated` event (`{"event":"updated","from":"0.1.8","to":"0.1.9"}`)
-instead of restarting itself; the new code takes effect the next time the
-daemon (or whatever embeds it) starts.
 
 ## Design in One Paragraph
 
@@ -195,10 +176,10 @@ Thumbprint: 36477BB5DCB10D2C0381A2D79533F0386C5CCACA
 The thumbprint changes whenever the certificate is renewed. The `Subject` is
 what stays stable across renewals, so treat that as the primary check.
 
-`np2ptp update` carries its own list of accepted thumbprints and refuses
-anything signed by a certificate outside it. A renewal has to be added to
-that list and shipped in a release signed by the outgoing certificate, so
-installed copies learn about the new one before the old one goes away.
+Applications that bundle the np2ptp binary and keep it current should pin
+this certificate and accept a list of thumbprints rather than a single one,
+so a renewal does not lock existing installs out. np2ptp does not update
+itself; that is the bundling application's job.
 
 ## License
 

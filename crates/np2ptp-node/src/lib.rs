@@ -23,7 +23,6 @@ use np2ptp_store::{Store, StoreError};
 
 pub mod serve_set;
 pub mod daemon;
-pub mod update;
 
 pub use serve_set::{collect_serve_manifests, register_manifest};
 

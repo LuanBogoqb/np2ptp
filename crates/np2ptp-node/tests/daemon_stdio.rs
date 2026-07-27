@@ -20,7 +20,6 @@
 //!    designed for) instead of hanging on an unreachable host.
 //!  - `--tracker http://127.0.0.1:1` refuses instantly; `fetch` falls back to
 //!    the peer we dialed ourselves.
-//!  - `--no-auto-update` keeps the update check off the wire.
 //!
 //! Robustness rules this file follows, so it can never wedge CI:
 //!  - one reader thread per child per stream (stdout *and* stderr), so neither
@@ -127,7 +126,6 @@ impl Daemon {
             .arg(DEAD_TRACKER)
             .arg("--relay")
             .arg(NO_RELAY)
-            .arg("--no-auto-update")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

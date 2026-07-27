@@ -2,6 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Note (2026-07-27, after execution):** Tasks 9 and 10 built a self-update
+> path inside np2ptp. That was a misreading of the requirement and has been
+> removed. Keeping the binary current belongs to the application that bundles
+> it, the way `np2ptp-gui` already does it. Those two tasks are kept below as
+> a record of what was built, not as a description of what ships.
+
 **Goal:** Land the five patches from the approved spec (`docs/superpowers/specs/2026-07-27-daemon-and-embedding-design.md`): configurable endpoints, multi-manifest serve, bridge output dir + progress, the NDJSON stdio daemon, and self-update — all additive/opt-in.
 
 **Architecture:** All work in this repo on `dev`. CLI logic lives in `crates/np2ptp-node` (binary `main.rs` + library `lib.rs`); the daemon becomes a new module there. Bridge changes live in `crates/np2ptp-bridge`. One small addition to `crates/np2ptp-net` (unprovide). Testable logic goes in library functions; `main.rs` stays thin wiring.
