@@ -27,6 +27,7 @@ np2ptp pack ./my-folder --out my-folder.nptp
 
 # Make it available. Works behind CGNAT or a closed router port:
 # it detects that and falls back to a public relay on its own.
+# (serve takes several .nptp files at once, or --all for everything you've packed)
 np2ptp serve my-folder.nptp
 
 # On the other side: download, verifying every chunk against a Merkle root

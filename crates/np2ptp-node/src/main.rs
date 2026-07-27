@@ -445,9 +445,9 @@ fn udp_port(addr: &Multiaddr) -> Option<u16> {
 /// and announce it on the DHT until interrupted.
 fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
     let (pos, flags) = parse(args, &["--store", "--listen", "--tracker", "--public", "--relay", "--choke-threshold"]);
-    let file = *pos.first().ok_or("serve: missing <file.nptp>")?;
-    let manifest = Manifest::from_nptp(&fs::read(file)?)?;
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
+    let all = flags.contains_key("all");
+    let manifests = np2ptp_node::collect_serve_manifests(&pos, all, Path::new(&store_dir))?;
     let store = Store::open(&store_dir)?;
     // Persist identity per store dir: restarting `serve` on the same --store
     // keeps the same peer id, so providers already found (DHT, tracker, a
@@ -491,16 +491,21 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
         }
         net.listen(listen.parse()?).await?;
-        net.provide(&manifest).await?;
+        for m in &manifests {
+            net.provide(m).await?;
+            np2ptp_node::register_manifest(Path::new(&store_dir), m)?;
+        }
         let peer = net.local_peer_id();
 
         if !json {
-            println!(
-                "serving {} ({} files, {} chunks)",
-                manifest.uri(),
-                manifest.files.len(),
-                manifest.chunks.len()
-            );
+            for m in &manifests {
+                println!(
+                    "serving {} ({} files, {} chunks)",
+                    m.uri(),
+                    m.files.len(),
+                    m.chunks.len()
+                );
+            }
         }
         let addrs = wait_for_listeners(&net).await;
         if !json {
@@ -509,10 +514,10 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
             } else {
                 println!("direct fetch:");
                 for a in &addrs {
-                    println!("  np2ptp fetch {} --peer {a}/p2p/{peer}", manifest.uri());
+                    println!("  np2ptp fetch {} --peer {a}/p2p/{peer}", manifests[0].uri());
                 }
                 if !no_tracker {
-                    println!("or, once announced, just: np2ptp fetch {}   (peers found via the tracker)", manifest.uri());
+                    println!("or, once announced, just: np2ptp fetch {}   (peers found via the tracker)", manifests[0].uri());
                 }
             }
         }
@@ -615,8 +620,10 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
                 }
                 if !no_tracker {
                     let addrs = net.listeners().await.unwrap_or_default();
-                    if let Err(e) = tracker::announce(&tracker_url, manifest.root, peer, &addrs).await {
-                        eprintln!("  (tracker announce failed: {e})");
+                    for m in &manifests {
+                        if let Err(e) = tracker::announce(&tracker_url, m.root, peer, &addrs).await {
+                            eprintln!("  (tracker announce failed: {e})");
+                        }
                     }
                 }
             } else {
@@ -645,9 +652,11 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
                             addrs.push(ext);
                         }
                     }
-                    if let Err(e) = tracker::announce(&tracker_url, manifest.root, peer, &addrs).await {
-                        if !json {
-                            eprintln!("  (tracker announce failed: {e})");
+                    for m in &manifests {
+                        if let Err(e) = tracker::announce(&tracker_url, m.root, peer, &addrs).await {
+                            if !json {
+                                eprintln!("  (tracker announce failed: {e})");
+                            }
                         }
                     }
                 }
