@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use np2ptp_core::{Hash, Manifest};
 use np2ptp_net::{peer_id_from_multiaddr, Multiaddr, Network, PeerId};
+use np2ptp_node::daemon::{run_daemon, DaemonConfig};
 use np2ptp_node::{download_with_progress, read_dir_paths, StoreSource};
 use np2ptp_store::Store;
 
@@ -59,6 +60,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("fetch") => cmd_fetch(&args[1..]),
         Some("relay") => cmd_relay(&args[1..]),
         Some("torrent") => cmd_torrent(&args[1..]),
+        Some("daemon") => cmd_daemon(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(())
@@ -949,6 +951,34 @@ async fn fetch_remote_torrent(
         .into())
 }
 
+/// Run as a persistent NDJSON stdio node: one JSON request per stdin line,
+/// JSON events back on stdout. See `np2ptp_node::daemon` for the wire
+/// protocol (fetch/convert/torrent/provide/unprovide/status/dial/shutdown).
+fn cmd_daemon(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let (_pos, flags) = parse(args, &["--store", "--relay", "--tracker"]);
+    let store_dir = flags.get("store").cloned().unwrap_or_else(|| DEFAULT_STORE.to_string());
+    let relay = Some(flags.get("relay").cloned().unwrap_or_else(default_relay));
+    let tracker_url = flags.get("tracker").cloned().unwrap_or_else(tracker::default_tracker);
+    let auto_update = !flags.contains_key("no-auto-update");
+
+    // Persist identity per store dir, same as `cmd_serve`/`cmd_torrent`: restarting
+    // the daemon on the same --store keeps the same peer id, so the reputation
+    // ledger and choke mechanism (which key off peer id) accumulate across runs
+    // instead of resetting every start. Store::open first so the directory exists
+    // before load_or_create_seed writes identity.key under it.
+    Store::open(&store_dir)?;
+    let identity_seed = load_or_create_seed(&format!("{store_dir}/identity.key"))?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_daemon(DaemonConfig {
+        store_dir,
+        relay,
+        tracker: tracker_url,
+        auto_update,
+        identity_seed,
+    }))
+}
+
 fn print_usage() {
     eprintln!(
         "np2ptp — New Peer-To-Peer Transfer Protocol (prototype)\n\n\
@@ -959,7 +989,8 @@ fn print_usage() {
          \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay] [--choke-threshold <bytes>]\n\
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\
-         \x20 np2ptp torrent <file.torrent|magnet:...> [--data <dir>] [--store <dir>] [--out <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\n\
+         \x20 np2ptp torrent <file.torrent|magnet:...> [--data <dir>] [--store <dir>] [--out <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\
+         \x20 np2ptp daemon [--store <dir>] [--relay <multiaddr>] [--tracker <url>] [--no-auto-update]   (persistent NDJSON stdio node)\n\n\
          NOTES:\n\
          \x20 'pack' is the linker: chunks a file/folder into a store and writes a .nptp file.\n\
          \x20 --no-copy references the input in place instead of copying its chunks into the\n\
