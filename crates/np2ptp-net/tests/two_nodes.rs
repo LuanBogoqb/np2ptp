@@ -275,6 +275,51 @@ async fn discovers_provider_via_dht() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unprovide_stops_discovery() {
+    let seed_dir = TmpDir::new();
+    let seed_store = Store::open(seed_dir.path()).unwrap();
+    let manifest = seed_store.ingest(&sample(80_000, 12), None).unwrap();
+    let root = manifest.root;
+
+    let seed = Network::spawn(seed_store, Some([12u8; 32])).unwrap();
+    seed.listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .await
+        .unwrap();
+    let seed_addr = first_listen_addr(&seed).await;
+    let seed_peer = seed.local_peer_id();
+    seed.provide(&manifest).await.unwrap();
+
+    let client_dir = TmpDir::new();
+    let client = Network::spawn(Store::open(client_dir.path()).unwrap(), Some([13u8; 32])).unwrap();
+    client.add_peer(seed_peer, seed_addr.clone()).await.unwrap();
+    client.dial(seed_addr).await.unwrap();
+
+    // First confirm normal discovery, same as `discovers_provider_via_dht`.
+    let mut found = Vec::new();
+    for _ in 0..100 {
+        found = client.find_providers(root).await.unwrap();
+        if found.contains(&seed_peer) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(found.contains(&seed_peer), "DHT should reveal the seed as a provider");
+
+    // Now unprovide: the seed's provider record must eventually disappear.
+    seed.unprovide(root).await.unwrap();
+    let mut gone = false;
+    for _ in 0..100 {
+        let found = client.find_providers(root).await.unwrap();
+        if !found.contains(&seed_peer) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "seed should no longer be listed as a provider after unprovide");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connected_peers_and_ledger_totals_reflect_a_transfer() {
     let seed_dir = TmpDir::new();
     let seed_store = Store::open(seed_dir.path()).unwrap();

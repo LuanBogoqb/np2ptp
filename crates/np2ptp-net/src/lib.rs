@@ -177,6 +177,7 @@ enum Command {
     AddPeer { peer: PeerId, addr: Multiaddr },
     AddExternalAddress { addr: Multiaddr },
     Provide { root: Hash, manifest_bytes: Vec<u8> },
+    Unprovide { root: Hash },
     FindProviders { root: Hash, reply: oneshot::Sender<Vec<PeerId>> },
     Request { peer: PeerId, request: Request, reply: oneshot::Sender<Result<Response, NetError>> },
     SetChokeThreshold { threshold: i64 },
@@ -344,6 +345,14 @@ impl Network {
     pub async fn provide(&self, manifest: &Manifest) -> Result<(), NetError> {
         let manifest_bytes = manifest.to_nptp().map_err(|_| NetError::BadManifest)?;
         self.send(Command::Provide { root: manifest.root, manifest_bytes }).await
+    }
+
+    /// Stop announcing that this node serves `root`'s content. Removes the DHT
+    /// provider record so `find_providers` no longer surfaces this node for it.
+    /// Local chunk serving is not gated by this — a peer who already knows us
+    /// can still fetch the content directly.
+    pub async fn unprovide(&self, root: Hash) -> Result<(), NetError> {
+        self.send(Command::Unprovide { root }).await
     }
 
     /// Set the choke threshold: a peer is refused chunks once its reputation
@@ -782,6 +791,10 @@ impl EventLoop {
                 self.provided.insert(root, manifest_bytes);
                 let key = kad::RecordKey::new(root.as_bytes());
                 let _ = self.swarm.behaviour_mut().kad.start_providing(key);
+            }
+            Command::Unprovide { root } => {
+                let key = kad::RecordKey::new(root.as_bytes());
+                self.swarm.behaviour_mut().kad.stop_providing(&key);
             }
             Command::FindProviders { root, reply } => {
                 let key = kad::RecordKey::new(root.as_bytes());
