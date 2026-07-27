@@ -95,16 +95,16 @@ np2ptp daemon --store ~/.np2ptp
 // in:
 {"id":1,"cmd":"fetch","uri":"np2ptp:abc...","out":"./downloads/game"}
 // out:
-{"event":"ready","version":"0.1.8","peer_id":"12D3KooWSzXt...","addrs":["/ip4/192.168.1.10/tcp/4001"]}
+{"event":"ready","version":"0.1.9","peer_id":"12D3KooWSzXt...","addrs":["/ip4/192.168.1.10/udp/54321/quic-v1/p2p/12D3Koo..."]}
 {"id":1,"event":"progress","op":"fetch","done":42,"total":900}
 {"id":1,"event":"result","ok":true,"root":"np2ptp:abc..."}
 ```
 
 Other commands: `convert` (bridge a downloaded torrent, or pack a folder),
-`torrent` (download over BitTorrent and bridge it on the way in), `provide`
-and `unprovide` to start and stop seeding without a restart, `status`, and
-`shutdown`. Every event carries the `id` of the request it belongs to, so
-several operations can run at once. A malformed line gets an error event and
+`torrent` (download over BitTorrent and bridge it on the way in), `dial`
+(connect directly to a peer's multiaddr), `provide` and `unprovide` to start
+and stop seeding without a restart, `status`, and `shutdown`. Results, progress events, and errors carry the `id` of the request they belong to, while warnings are not tied to a specific request, allowing
+several operations to run at once. A malformed line gets an error event and
 the daemon keeps going.
 
 Because one process holds the identity across restarts, the reputation a
@@ -194,6 +194,11 @@ Thumbprint: 36477BB5DCB10D2C0381A2D79533F0386C5CCACA
 
 The thumbprint changes whenever the certificate is renewed. The `Subject` is
 what stays stable across renewals, so treat that as the primary check.
+
+`np2ptp update` carries its own list of accepted thumbprints and refuses
+anything signed by a certificate outside it. A renewal has to be added to
+that list and shipped in a release signed by the outgoing certificate, so
+installed copies learn about the new one before the old one goes away.
 
 ## License
 

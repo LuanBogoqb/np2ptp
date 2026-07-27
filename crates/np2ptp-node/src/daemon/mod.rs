@@ -353,6 +353,11 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // Reap a leftover `.old`/`.new` from a previous run, same as `cmd_update`:
+    // the design is that the `.old` copy dies on the next successful start, and
+    // a daemon-only embedder never runs `cmd_update` to do it.
+    crate::update::cleanup_old_binary();
+
     let addrs = listen_addrs(&net).await;
     let _ = out_tx.send(ready_line(env!("CARGO_PKG_VERSION"), net.local_peer_id(), &addrs));
 
@@ -534,13 +539,20 @@ async fn run_fetch(id: u64, uri: &str, out: &str, ctx: &Ctx) -> Result<serde_jso
     // `download_multi_with_progress` skips whichever of them turns out not to
     // have the content.
     let mut providers: Vec<PeerId> = Vec::new();
+    let mut discovered: Vec<PeerId> = Vec::new();
     match tracker_get_peers(&ctx.http, &ctx.tracker, root).await {
         Ok(candidates) => {
             for (peer, addrs) in &candidates {
                 for addr in addrs {
+                    // `add_peer` before `dial`: request-response needs a known
+                    // address for the peer or it fails the pending request with
+                    // `NoAddresses`, and `dial` returns as soon as the dial is
+                    // *initiated* — well before the QUIC handshake lands.
+                    let _ = ctx.net.add_peer(*peer, addr.clone()).await;
                     let _ = ctx.net.dial(addr.clone()).await;
                 }
                 providers.push(*peer);
+                discovered.push(*peer);
             }
         }
         Err(e) => {
@@ -558,14 +570,45 @@ async fn run_fetch(id: u64, uri: &str, out: &str, ctx: &Ctx) -> Result<serde_jso
             .to_string());
     }
 
+    // Freshly dialed peers are not connected yet. Wait for one of them, the
+    // same 60 x 50ms shape `cmd_fetch` uses, so the first download attempt is
+    // not spent on a connection that is still handshaking.
+    if !discovered.is_empty() {
+        for _ in 0..60 {
+            let connected = ctx.net.connected_peers().await.unwrap_or_default();
+            if discovered.iter().any(|p| connected.contains(p)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // Retry with backoff on top of the settle wait: a transient `NoAddresses`
+    // or a connection that dropped mid-handshake must not turn into the
+    // operation's terminal error on the first try. No extra events — the
+    // retries are invisible, the op still ends in exactly one terminal event.
     let mut prog = progress_sender(ctx.tx.clone(), id, "fetch");
-    let manifest = ctx
-        .net
-        .download_multi_with_progress(root, &providers, &ctx.store, |done, total| {
-            prog(done as u64, total as u64);
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut manifest = None;
+    let mut last_err = String::new();
+    for attempt in 0..5u32 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(50 << (attempt - 1))).await;
+        }
+        match ctx
+            .net
+            .download_multi_with_progress(root, &providers, &ctx.store, |done, total| {
+                prog(done as u64, total as u64);
+            })
+            .await
+        {
+            Ok(m) => {
+                manifest = Some(m);
+                break;
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    let manifest = manifest.ok_or(last_err)?;
 
     // Export re-reads and re-verifies every chunk — fully synchronous,
     // GB-scale work. Run on an async worker it would stall the libp2p swarm

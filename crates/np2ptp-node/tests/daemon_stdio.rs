@@ -37,9 +37,6 @@ use serde_json::{json, Value};
 /// Whole-test budget. Every blocking wait is bounded by it, so the worst case is
 /// a loud failure at ~90s, never a hung test runner.
 const TEST_BUDGET: Duration = Duration::from_secs(90);
-/// Sub-budget for "the two daemons should have connected by now".
-const CONNECT_BUDGET: Duration = Duration::from_secs(30);
-/// A multiaddr that cannot parse — makes the daemon skip its relay dial.
 const NO_RELAY: &str = "/np2ptp-test/no-relay";
 /// Port 1 on loopback: nothing listens, so the connection is refused at once.
 const DEAD_TRACKER: &str = "http://127.0.0.1:1";
@@ -425,26 +422,11 @@ fn daemon_provides_and_a_second_daemon_fetches_it_over_stdio() {
     let dialed = b.wait_result(&dl, 100);
     assert_eq!(dialed["addr"], dial_addr.as_str());
 
-    // `dial` only *starts* the connection (the swarm answers as soon as the
-    // attempt is queued), so poll status until the connection is actually up
-    // before asking for content.
-    let connect_dl = Deadline::new(CONNECT_BUDGET.min(dl.remaining()));
-    let mut probe_id = 101;
-    loop {
-        b.send(json!({"id": probe_id, "cmd": "status"}));
-        let st = b.wait_result(&dl, probe_id);
-        if st["peers"].as_u64().unwrap_or(0) >= 1 {
-            break;
-        }
-        assert!(
-            !connect_dl.expired(),
-            "TIMEOUT: B never connected to A at {dial_addr} within {CONNECT_BUDGET:?}\n{}\n{}",
-            b.dump(),
-            a.dump()
-        );
-        std::thread::sleep(Duration::from_millis(200));
-        probe_id += 1;
-    }
+    // Deliberately NOT waiting for the connection here. `dial` only starts it
+    // (the swarm answers as soon as the attempt is queued), so fetching right
+    // away is the racy case an embedder will hit first. The daemon owns the
+    // settle and retry; polling status until peers >= 1 first would hide a
+    // regression in it, which is exactly what it did once already.
 
     // --- two concurrent fetches, different ids ------------------------------
     let out1 = dir.path().join("fetched-one.bin");

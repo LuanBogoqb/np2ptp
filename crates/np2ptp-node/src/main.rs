@@ -1052,7 +1052,7 @@ fn print_usage() {
          \x20 np2ptp pack  <input> [--out <file.nptp>] [--store <dir>] [--name <name>] [--no-copy]\n\
          \x20 np2ptp info  <file.nptp>\n\
          \x20 np2ptp get   <file.nptp> --source <store-dir> [--store <dir>] [--out <output>]\n\
-         \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay] [--choke-threshold <bytes>]\n\
+         \x20 np2ptp serve <file.nptp>... [--all] [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay] [--choke-threshold <bytes>]\n\
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\
          \x20 np2ptp torrent <file.torrent|magnet:...> [--data <dir>] [--store <dir>] [--out <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\

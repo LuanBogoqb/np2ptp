@@ -4,7 +4,7 @@
 //!
 //! * **Windows** — the downloaded `.exe` must carry an Authenticode signature
 //!   whose hash still matches the file's bytes *and* whose signer certificate's
-//!   SHA-1 thumbprint equals [`EXPECTED_SIGNER_THUMBPRINT`]. np2ptp is signed
+//!   SHA-1 thumbprint is one of [`ACCEPTED_SIGNER_THUMBPRINTS`]. np2ptp is signed
 //!   with a self-signed certificate, so chain-of-trust validation is skipped
 //!   (`WTD_HASH_ONLY_FLAG`) — otherwise every machine that hasn't imported that
 //!   certificate rejects a genuinely untampered file. Ported from np2ptp-gui's
@@ -38,8 +38,40 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-/// Signer certificate pinned for Windows builds (SHA-1 thumbprint, hex).
-pub const EXPECTED_SIGNER_THUMBPRINT: &str = "36477BB5DCB10D2C0381A2D79533F0386C5CCACA";
+/// Signer certificates pinned for Windows builds (SHA-1 thumbprints, hex).
+///
+/// A download is accepted when its signer thumbprint matches **any** entry,
+/// compared case-insensitively. More than one entry is not a weakening: it is
+/// the only way a certificate can ever be replaced without stranding installs.
+///
+/// ROTATION — the order matters, and getting it wrong bricks self-update for
+/// every existing install:
+///
+/// 1. ADD the new certificate's thumbprint to this list, keeping the old one.
+/// 2. Ship that change in a release still signed with the **OLD** certificate.
+///    Already-installed binaries only trust the old one, so this is the release
+///    they can accept; installing it is what teaches them the new thumbprint.
+/// 3. Wait until that release is widely installed. Only then start signing with
+///    the new certificate.
+/// 4. Only after the new-certificate releases are widely installed may the old
+///    thumbprint be REMOVED.
+///
+/// Signing with a new certificate before step 2 has landed, or removing the old
+/// thumbprint early, makes every legitimate release look like tampering to
+/// everyone who has not updated yet — and they cannot update, because updating
+/// is exactly what fails. The only way out is a manual reinstall.
+pub const ACCEPTED_SIGNER_THUMBPRINTS: &[&str] = &["36477BB5DCB10D2C0381A2D79533F0386C5CCACA"];
+
+/// True when `thumb` matches one of the pinned signer certificates.
+///
+/// SECURITY: fails closed — an empty allowlist accepts nothing, and each
+/// comparison is the full-length constant-ish [`hex_eq`], never a prefix.
+#[cfg(any(windows, test))]
+fn is_accepted_signer(thumb: &str) -> bool {
+    ACCEPTED_SIGNER_THUMBPRINTS
+        .iter()
+        .any(|pinned| hex_eq(thumb, pinned))
+}
 
 /// GitHub API endpoint for the newest published release.
 pub const LATEST_RELEASE_URL: &str =
@@ -466,14 +498,14 @@ fn is_transient_verify_status(status: i32) -> bool {
 #[cfg(windows)]
 fn verify_pinned_signer(path: &Path) -> Result<(), UpdateError> {
     match verified_signer_thumbprint(path) {
-        Ok(thumb) if hex_eq(&thumb, EXPECTED_SIGNER_THUMBPRINT) => return Ok(()),
+        Ok(thumb) if is_accepted_signer(&thumb) => return Ok(()),
         Ok(_) => return Err(UpdateError::BadSignature),
         Err(status) if is_transient_verify_status(status) => {}
         Err(_) => return Err(UpdateError::BadSignature),
     }
     std::thread::sleep(Duration::from_millis(750));
     match verified_signer_thumbprint(path) {
-        Ok(thumb) if hex_eq(&thumb, EXPECTED_SIGNER_THUMBPRINT) => Ok(()),
+        Ok(thumb) if is_accepted_signer(&thumb) => Ok(()),
         Ok(_) => Err(UpdateError::BadSignature),
         Err(status) if is_transient_verify_status(status) => Err(UpdateError::Io(
             std::io::Error::other(format!(
@@ -1319,20 +1351,51 @@ mod tests {
 
     #[test]
     fn thumbprint_compare_is_case_insensitive_but_exact() {
-        assert!(hex_eq(
-            EXPECTED_SIGNER_THUMBPRINT,
-            &EXPECTED_SIGNER_THUMBPRINT.to_lowercase()
-        ));
-        assert!(!hex_eq(EXPECTED_SIGNER_THUMBPRINT, ""));
-        assert!(!hex_eq(
-            EXPECTED_SIGNER_THUMBPRINT,
-            "36477BB5DCB10D2C0381A2D79533F0386C5CCAC9"
-        ));
+        let pinned = ACCEPTED_SIGNER_THUMBPRINTS[0];
+        assert!(hex_eq(pinned, &pinned.to_lowercase()));
+        assert!(!hex_eq(pinned, ""));
+        assert!(!hex_eq(pinned, "36477BB5DCB10D2C0381A2D79533F0386C5CCAC9"));
         // A prefix must not pass.
-        assert!(!hex_eq(
-            EXPECTED_SIGNER_THUMBPRINT,
-            &EXPECTED_SIGNER_THUMBPRINT[..10]
+        assert!(!hex_eq(pinned, &pinned[..10]));
+    }
+
+    #[test]
+    fn every_pinned_thumbprint_is_accepted_case_insensitively() {
+        assert!(!ACCEPTED_SIGNER_THUMBPRINTS.is_empty());
+        for pinned in ACCEPTED_SIGNER_THUMBPRINTS {
+            assert!(is_accepted_signer(pinned));
+            assert!(is_accepted_signer(&pinned.to_lowercase()));
+            assert!(is_accepted_signer(&pinned.to_uppercase()));
+        }
+    }
+
+    #[test]
+    fn a_later_entry_in_the_allowlist_is_accepted() {
+        // Rotation puts the incoming certificate beside the outgoing one, so a
+        // match must not depend on being first.
+        let list = [
+            "36477BB5DCB10D2C0381A2D79533F0386C5CCACA",
+            "AABBCCDDEEFF00112233445566778899AABBCCDD",
+        ];
+        let hit = |thumb: &str| list.iter().any(|pinned| hex_eq(thumb, pinned));
+        assert!(hit(list[1]));
+        assert!(hit(&list[1].to_lowercase()));
+        assert!(!hit("AABBCCDDEEFF00112233445566778899AABBCCDE"));
+    }
+
+    #[test]
+    fn an_unknown_thumbprint_fails_closed() {
+        assert!(!is_accepted_signer(""));
+        assert!(!is_accepted_signer(
+            "0000000000000000000000000000000000000000"
         ));
+        // A prefix of a pinned entry must not pass either.
+        assert!(!is_accepted_signer(&ACCEPTED_SIGNER_THUMBPRINTS[0][..10]));
+        // Nothing is accepted when nothing is pinned.
+        let empty: &[&str] = &[];
+        assert!(!empty
+            .iter()
+            .any(|pinned| hex_eq(ACCEPTED_SIGNER_THUMBPRINTS[0], pinned)));
     }
 
     #[test]

@@ -406,7 +406,7 @@ fn sha256sums_verification() {
 ```
 
 - [ ] **Step 2: Fail, then implement the pure parts.** Asset/tag/SHA logic first, all unit-tested.
-- [ ] **Step 3: Implement the effectful parts.** GitHub API (`/repos/LuanBogoqb/np2ptp/releases/latest`, `User-Agent` header required). Thumbprint fn behind `#[cfg(windows)]`: port `AuthenticodeVerifier` from np2ptp-gui (`E:\Repos\np2ptp-gui\src\Np2ptpGui\Services\AuthenticodeVerifier.cs` — read it first; it extracts the signer cert's SHA-1 thumbprint WITHOUT requiring chain trust, which is what sidesteps the known WinVerifyTrust self-signed issue. Mirror that exact call sequence). Verification failure ⇒ delete download, `UpdateError::BadSignature`, current binary untouched. Swap via `std::fs::rename` (same volume, atomic-enough) then write.
+- [ ] **Step 3: Implement the effectful parts.** GitHub API (`/repos/LuanBogoqb/np2ptp/releases/latest`, `User-Agent` header required). Thumbprint fn behind `#[cfg(windows)]`: port `AuthenticodeVerifier` from np2ptp-gui (read it first; it extracts the signer cert's SHA-1 thumbprint WITHOUT requiring chain trust, which is what sidesteps the known WinVerifyTrust self-signed issue. Mirror that exact call sequence). Verification failure ⇒ delete download, `UpdateError::BadSignature`, current binary untouched. Swap via `std::fs::rename` (same volume, atomic-enough) then write.
 - [ ] **Step 4:** `cargo test -p np2ptp-node update` + clippy (run clippy for both `--target` families if cross-checking isn't possible: at minimum Windows locally).
 - [ ] **Step 5: Commit** — `feat: self-update with pinned-signer verification (ported from np2ptp-gui BinaryManager)`
 
@@ -421,7 +421,7 @@ fn sha256sums_verification() {
 - Consumes: Task 9's `check_and_update`, `cleanup_old_binary`; Task 6's `event_result` (a `{"event":"updated","from":…,"to":…}` line uses the same emitters — add `pub fn event_updated(from: &str, to: &str) -> String` to proto in this task).
 
 - [ ] **Step 1:** `cmd_update`: call `check_and_update(Duration::from_secs(120))`, print `updated 0.1.8 -> 0.1.9, restart to use it` or `already up to date (0.1.8)`. `--json` variant emits one result line. On BadSignature print the full refusal reason (security copy: write it normal, explicit).
-- [ ] **Step 2:** Daemon startup (before `ready`): `cleanup_old_binary()`; if `cfg.auto_update`, `check_and_update(Duration::from_secs(15))` — silent on any failure (np2ptp-gui's `TryCheckForUpdateSilentlyAsync` semantics), emit `event_updated` iff updated. Note in README: the daemon updates the binary on disk; the *new* code runs on next daemon start (the embedder owns restarts — document, don't auto-restart).
+- [ ] **Step 2:** Daemon startup (before `ready`): `cleanup_old_binary()`; if `cfg.auto_update`, `check_and_update(Duration::from_secs(30))` — silent on any failure (np2ptp-gui's `TryCheckForUpdateSilentlyAsync` semantics), emit `event_updated` iff updated. Note in README: the daemon updates the binary on disk; the *new* code runs on next daemon start (the embedder owns restarts — document, don't auto-restart).
 - [ ] **Step 3:** Tests: golden-ish unit for the two CLI output strings (function returning the message given an `UpdateReport`); daemon path covered by making auto_update=false the Task 8 test default (assert no `updated` event) — the positive path is manual (next release) since it needs a real newer release.
 - [ ] **Step 4:** `cargo test --workspace` + clippy 0.
 - [ ] **Step 5: Commit** — `feat: np2ptp update subcommand + opt-out auto-update at daemon startup`

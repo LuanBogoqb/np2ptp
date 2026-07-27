@@ -91,7 +91,7 @@ jobs:
       - name: Checksum the assets
         run: |
           cd dist
-          sha256sum * > SHA256SUMS
+          sha256sum np2ptp-* > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create release

@@ -1,12 +1,17 @@
-//! 3-step golden invariant: pack -> get -> serve, run through the real
-//! `np2ptp` binary, with stdout compared against goldens captured from the
-//! pre-patch binary. Only the content hash (unpredictable, content-addressed)
-//! and the TmpDir's absolute path prefix are normalized (to `<HASH>` and
-//! `<TMP>`); file names, byte counts and file counts are known from the
-//! fixture and asserted literally. The chunk count is not independently
-//! known (it depends on the chunker), so it is captured from the pack line
-//! and then asserted to reappear identically in the serve and get lines —
-//! catching a swapped/wrong count that a blanket `<N>` placeholder could not.
+//! 4-step golden invariant: pack -> get -> serve -> fetch, run through the
+//! real `np2ptp` binary, with stdout compared against goldens captured from
+//! the pre-patch binary. Only the content hash (unpredictable,
+//! content-addressed), the TmpDir's absolute path prefix, and (for serve's
+//! `direct fetch:` hint lines) the peer multiaddr are normalized (to
+//! `<HASH>`, `<TMP>` and `<ADDR>`); file names, byte counts and file counts
+//! are known from the fixture and asserted literally. The chunk count is not
+//! independently known (it depends on the chunker), so it is captured from
+//! the pack line and then asserted to reappear identically in the serve and
+//! get lines — catching a swapped/wrong count that a blanket `<N>`
+//! placeholder could not. `fetch` is covered too, dialing a real local peer
+//! (the `serve` process from the previous step) over the address parsed out
+//! of its own `direct fetch:` hint — so a Quick Start command change to that
+//! third step, or a restructuring of the hint block, breaks this gate.
 //!
 //! UPDATING THESE GOLDENS REQUIRES LUAN'S SIGN-OFF (golden rule 5).
 //!
@@ -67,6 +72,20 @@ fn normalize_hashes(s: &str) -> String {
         }
     }
     out
+}
+
+/// Replace the multiaddr after `--peer ` in a `direct fetch:` hint line
+/// (e.g. `/ip4/127.0.0.1/udp/51234/quic-v1/p2p/12D3Koo...`) with `<ADDR>` —
+/// the address varies per machine and per run, but the literal words and
+/// structure around it do not.
+fn normalize_peer_addr(line: &str) -> String {
+    match line.find("--peer ") {
+        Some(idx) => {
+            let prefix_end = idx + "--peer ".len();
+            format!("{}<ADDR>", &line[..prefix_end])
+        }
+        None => line.to_string(),
+    }
 }
 
 /// Replace the TmpDir's own absolute path prefix with `<TMP>`, leaving the
@@ -194,9 +213,21 @@ fn pack_get_serve_output_matches_the_frozen_golden_shape() {
     assert_eq!(get_lines, get_golden, "raw stdout was:\n{get_stdout}");
     assert_eq!(std::fs::read(&restored).unwrap(), data, "restored bytes must match the original input");
 
-    // Step 3: serve, offline (--no-tracker --no-relay), read its first stdout
-    // line then SIGKILL — the process would otherwise run forever.
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
+    // Step 3: serve, offline (--no-tracker --no-relay). Read stdout lines
+    // until the "serving" line and the full "direct fetch:" hint block have
+    // both been printed (bounded by a deadline that panics rather than
+    // hanging), keeping the process alive via the guard below — step 4
+    // needs it as a real peer to dial, and the guard's Drop SIGKILLs it on
+    // every exit path, including a panic from an assertion in between.
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
         .arg("serve")
         .arg(&nptp)
         .arg("--store")
@@ -206,24 +237,104 @@ fn pack_get_serve_output_matches_the_frozen_golden_shape() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    let mut guard = ChildGuard(child);
 
-    let stdout = child.stdout.take().unwrap();
+    let stdout = guard.0.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use std::io::{BufRead, BufReader};
-        if let Some(Ok(line)) = BufReader::new(stdout).lines().next() {
-            let _ = tx.send(line);
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
         }
     });
-    let first_line = rx.recv_timeout(std::time::Duration::from_secs(60));
-    let _ = child.kill();
-    let _ = child.wait();
-    let first_line = first_line.expect("serve did not print a line within 60s");
 
-    let serve_line = normalize_line(&first_line, dir.path());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut raw_lines = Vec::new();
+    let mut loopback_addr = None;
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(std::time::Duration::from_millis(300)) {
+            Ok(line) => {
+                if loopback_addr.is_none() && line.contains("--peer") && line.contains("/ip4/127.0.0.1/") {
+                    loopback_addr = Some(
+                        line.split_whitespace()
+                            .skip_while(|w| *w != "--peer")
+                            .nth(1)
+                            .expect("no --peer address in direct-fetch hint line")
+                            .to_string(),
+                    );
+                }
+                raw_lines.push(line);
+            }
+            Err(_) if loopback_addr.is_some() => break, // quiet period: the hint block is done.
+            Err(_) => {}
+        }
+    }
+    let loopback_addr = loopback_addr.unwrap_or_else(|| {
+        panic!(
+            "serve never printed a loopback (127.0.0.1) direct-fetch hint within 60s; saw:\n{}",
+            raw_lines.join("\n")
+        )
+    });
+
+    let serve_lines: Vec<String> = raw_lines.iter().map(|l| normalize_line(l, dir.path())).collect();
     assert_eq!(
-        serve_line,
+        serve_lines[0],
         format!("serving np2ptp:<HASH> ({} files, {} chunks)", files_count, chunks_count),
-        "raw line was: {first_line:?}"
+        "raw lines were:\n{}",
+        raw_lines.join("\n")
+    );
+    assert_eq!(serve_lines[1], "direct fetch:", "raw lines were:\n{}", raw_lines.join("\n"));
+    let hint_lines = &serve_lines[2..];
+    assert!(
+        !hint_lines.is_empty(),
+        "expected at least one direct-fetch hint line; raw lines were:\n{}",
+        raw_lines.join("\n")
+    );
+    for hint in hint_lines {
+        assert_eq!(
+            normalize_peer_addr(hint),
+            "  np2ptp fetch np2ptp:<HASH> --peer <ADDR>",
+            "unexpected direct-fetch hint line shape: {hint:?}"
+        );
+    }
+
+    // Step 4: fetch, over a real local peer — the serve process above, still
+    // running, is that peer. Dial it with the loopback address parsed from
+    // its own hint line, into a second, disjoint store, then byte-compare
+    // the restored file against the original input.
+    let fetch_store = dir.path().join("fetch-store");
+    let fetched = dir.path().join("f3.bin");
+    let fetch_output = std::process::Command::new(env!("CARGO_BIN_EXE_np2ptp"))
+        .arg("fetch")
+        .arg(&nptp)
+        .arg("--peer")
+        .arg(&loopback_addr)
+        .arg("--store")
+        .arg(&fetch_store)
+        .arg("--out")
+        .arg(&fetched)
+        .output()
+        .unwrap();
+    drop(guard);
+
+    assert!(
+        fetch_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&fetch_output.stderr)
+    );
+    let fetch_stdout = String::from_utf8(fetch_output.stdout).unwrap();
+    let fetch_lines = normalized_lines(&fetch_stdout, dir.path());
+    let fetch_golden = vec![format!(
+        "fetched np2ptp:<HASH> ({} bytes) -> {}",
+        data.len(),
+        tmp_path(&fetched, dir.path())
+    )];
+    assert_eq!(fetch_lines, fetch_golden, "raw stdout was:\n{fetch_stdout}");
+    assert_eq!(
+        std::fs::read(&fetched).unwrap(),
+        data,
+        "fetched bytes must match the original input"
     );
 }

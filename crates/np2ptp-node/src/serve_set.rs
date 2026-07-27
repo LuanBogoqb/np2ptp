@@ -34,20 +34,15 @@ pub fn collect_serve_manifests(
     store_dir: &Path,
 ) -> Result<Vec<Manifest>, NodeError> {
     if all && !paths.is_empty() {
-        // TODO(deferred, needs NodeError variant — see fix report): this should
-        // be NodeError::InvalidUsage, not Io. Io is a placeholder so the error
-        // still surfaces (as "io: ...") without touching lib.rs.
-        return Err(NodeError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "serve: --all and explicit paths are mutually exclusive",
-        )));
+        return Err(NodeError::InvalidUsage(
+            "serve: --all and explicit paths are mutually exclusive".into(),
+        ));
     }
     if !all {
         if paths.is_empty() {
-            return Err(NodeError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "serve: no manifest given (pass a .nptp path or --all)",
-            )));
+            return Err(NodeError::InvalidUsage(
+                "serve: no manifest given (pass a .nptp path or --all)".into(),
+            ));
         }
         let mut out = Vec::with_capacity(paths.len());
         for p in paths {
@@ -64,19 +59,35 @@ pub fn collect_serve_manifests(
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("nptp") {
-                let bytes = fs::read(&path)?;
-                out.push(Manifest::from_nptp(&bytes)?);
+                // A concurrent daemon unprovide can delete this file between
+                // read_dir and here, or a partially-written registration can
+                // fail to decode. Either way, skip it and keep serving the
+                // rest instead of aborting the whole `--all` run.
+                let bytes = match fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        eprintln!("serve --all: skipping {} (removed concurrently): {}", path.display(), e);
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                match Manifest::from_nptp(&bytes) {
+                    Ok(m) => out.push(m),
+                    Err(e) => {
+                        eprintln!("serve --all: skipping {} (failed to decode): {}", path.display(), e);
+                        continue;
+                    }
+                }
             }
         }
     }
     if out.is_empty() {
-        return Err(NodeError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
+        return Err(NodeError::InvalidUsage(
             format!(
                 "serve --all: no registered manifests in {}",
                 dir.display()
             ),
-        )));
+        ));
     }
     Ok(out)
 }

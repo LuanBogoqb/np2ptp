@@ -35,6 +35,8 @@ pub enum NodeError {
     Manifest(#[from] ManifestError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    InvalidUsage(String),
     #[error("source does not have chunk {0}")]
     MissingChunk(Hash),
     #[error("chunk {index} from source failed verification against the manifest root")]
