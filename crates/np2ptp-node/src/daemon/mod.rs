@@ -653,7 +653,6 @@ async fn run_convert(
                 };
                 let result =
                     store.ingest_tree_files_no_copy_with_progress(&files, name, &mut on_progress);
-                drop(on_progress);
                 result.map(|m| (m, chunks_new)).map_err(|e| e.to_string())
             })
             .await

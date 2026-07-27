@@ -20,6 +20,7 @@ use std::time::Duration;
 use np2ptp_core::{Hash, Manifest};
 use np2ptp_net::{peer_id_from_multiaddr, Multiaddr, Network, PeerId};
 use np2ptp_node::daemon::{run_daemon, DaemonConfig};
+use np2ptp_node::update;
 use np2ptp_node::{download_with_progress, read_dir_paths, StoreSource};
 use np2ptp_store::Store;
 
@@ -61,6 +62,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("relay") => cmd_relay(&args[1..]),
         Some("torrent") => cmd_torrent(&args[1..]),
         Some("daemon") => cmd_daemon(&args[1..]),
+        Some("update") => cmd_update(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(())
@@ -987,6 +989,62 @@ fn cmd_daemon(args: &[String]) -> Result<(), Box<dyn Error>> {
     }))
 }
 
+/// Formats a completed update check for the plain (non-`--json`) CLI mode.
+/// Pure so the two message shapes are unit-testable without touching the
+/// network.
+fn update_message(report: &update::UpdateReport) -> String {
+    if report.updated {
+        format!("updated {} -> {}, restart to use it", report.from, report.to)
+    } else {
+        format!("already up to date ({})", report.from)
+    }
+}
+
+/// Check GitHub for a newer release and install it if there is one. Reuses
+/// the daemon's startup logic (`update::check_and_update`); unlike the
+/// daemon's silent auto-update, this reports the outcome and, on any error
+/// (network, verification, timeout), exits non-zero.
+fn cmd_update(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let (_pos, flags) = parse(args, &[]);
+    let json = flags.contains_key("json");
+
+    // Reap a leftover `.old`/`.new` from a previous run before checking, same
+    // as the daemon does at startup.
+    update::cleanup_old_binary();
+
+    let report = update::check_and_update(Duration::from_secs(120)).map_err(|e| {
+        if matches!(e, update::UpdateError::BadSignature) {
+            // Security copy: written out in full, not abbreviated — this is
+            // the one failure that always means the download did not match
+            // what was expected, and the person reading it needs to know
+            // nothing was installed.
+            Box::<dyn Error>::from(
+                "update refused: the downloaded binary failed signature verification against \
+                 the pinned signer. The download has been deleted and the current binary was \
+                 left untouched — nothing was installed. If this keeps happening, do not retry \
+                 blindly; it means either the release was tampered with or the signer changed."
+            )
+        } else {
+            Box::<dyn Error>::from(e)
+        }
+    })?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event":"result","op":"update","ok":true,
+                "updated": report.updated,
+                "from": report.from,
+                "to": report.to,
+            })
+        );
+    } else {
+        println!("{}", update_message(&report));
+    }
+    Ok(())
+}
+
 fn print_usage() {
     eprintln!(
         "np2ptp — New Peer-To-Peer Transfer Protocol (prototype)\n\n\
@@ -998,7 +1056,8 @@ fn print_usage() {
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\
          \x20 np2ptp torrent <file.torrent|magnet:...> [--data <dir>] [--store <dir>] [--out <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\
-         \x20 np2ptp daemon [--store <dir>] [--relay <multiaddr> | --no-relay] [--tracker <url>] [--no-auto-update]   (persistent NDJSON stdio node)\n\n\
+         \x20 np2ptp daemon [--store <dir>] [--relay <multiaddr> | --no-relay] [--tracker <url>] [--no-auto-update]   (persistent NDJSON stdio node)\n\
+         \x20 np2ptp update [--json]   (check GitHub for a newer release and install it)\n\n\
          NOTES:\n\
          \x20 'pack' is the linker: chunks a file/folder into a store and writes a .nptp file.\n\
          \x20 --no-copy references the input in place instead of copying its chunks into the\n\
@@ -1014,4 +1073,29 @@ fn print_usage() {
          \x20 further chunks. Off by default; 0 is the strictest setting.\n\
          \x20 Default store dir: {DEFAULT_STORE}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_message_reports_the_new_version() {
+        let report = update::UpdateReport {
+            updated: true,
+            from: "0.1.8".to_string(),
+            to: "0.1.9".to_string(),
+        };
+        assert_eq!(update_message(&report), "updated 0.1.8 -> 0.1.9, restart to use it");
+    }
+
+    #[test]
+    fn update_message_reports_already_current() {
+        let report = update::UpdateReport {
+            updated: false,
+            from: "0.1.9".to_string(),
+            to: "0.1.9".to_string(),
+        };
+        assert_eq!(update_message(&report), "already up to date (0.1.9)");
+    }
 }

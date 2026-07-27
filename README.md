@@ -95,8 +95,8 @@ np2ptp daemon --store ~/.np2ptp
 // in:
 {"id":1,"cmd":"fetch","uri":"np2ptp:abc...","out":"./downloads/game"}
 // out:
-{"event":"ready","version":"0.1.8"}
-{"id":1,"event":"progress","op":"fetch","chunks_done":42,"chunks_total":900}
+{"event":"ready","version":"0.1.8","peer_id":"12D3KooWSzXt...","addrs":["/ip4/192.168.1.10/tcp/4001"]}
+{"id":1,"event":"progress","op":"fetch","done":42,"total":900}
 {"id":1,"event":"result","ok":true,"root":"np2ptp:abc..."}
 ```
 
@@ -110,6 +110,26 @@ the daemon keeps going.
 Because one process holds the identity across restarts, the reputation a
 seeder earns accumulates instead of resetting. Running several `serve`
 processes against one store cannot do that.
+
+## Staying Up to Date
+
+`np2ptp update` checks the latest GitHub release and, if it's newer, downloads
+and verifies it (Authenticode pin on Windows, `SHA256SUMS` on Linux) before
+swapping it in next to the running binary. Nothing is installed on a failed
+check: a bad signature deletes the download and leaves the current binary
+alone.
+
+```sh
+np2ptp update
+# already up to date (0.1.9)
+# or: updated 0.1.8 -> 0.1.9, restart to use it
+```
+
+`np2ptp daemon` does the same check on every start, unless you pass
+`--no-auto-update`. If it finds and installs a newer binary, it tells you
+about it with an `updated` event (`{"event":"updated","from":"0.1.8","to":"0.1.9"}`)
+instead of restarting itself; the new code takes effect the next time the
+daemon (or whatever embeds it) starts.
 
 ## Design in One Paragraph
 
