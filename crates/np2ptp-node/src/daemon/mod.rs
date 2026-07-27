@@ -112,7 +112,6 @@ pub struct DaemonConfig {
     pub store_dir: String,
     pub relay: Option<String>,
     pub tracker: String,
-    pub auto_update: bool,
     /// Persisted per `--store` by the caller (mirrors `cmd_serve`/`cmd_torrent`'s
     /// `identity.key`), so the daemon keeps the same peer id across restarts.
     pub identity_seed: [u8; 32],
@@ -353,30 +352,8 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Reap a leftover `.old`/`.new` from a previous run, same as `cmd_update`:
-    // the design is that the `.old` copy dies on the next successful start, and
-    // a daemon-only embedder never runs `cmd_update` to do it.
-    crate::update::cleanup_old_binary();
-
     let addrs = listen_addrs(&net).await;
     let _ = out_tx.send(ready_line(env!("CARGO_PKG_VERSION"), net.local_peer_id(), &addrs));
-
-    if cfg.auto_update {
-        // Auto-update stays on by default, but the swap is never invisible: a
-        // binary that changed under the embedder gets announced on the protocol
-        // (`updated`, with from/to) so it can react — restart, re-handshake,
-        // log it — instead of only finding out from stderr.
-        let tx = out_tx.clone();
-        tokio::task::spawn_blocking(move || match crate::update::check_and_update(Duration::from_secs(30)) {
-            Ok(report) if report.updated => {
-                let _ = tx.send(
-                    json!({"event": "updated", "from": report.from, "to": report.to}).to_string(),
-                );
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("auto-update check failed: {e}"),
-        });
-    }
 
     let ctx = Ctx {
         net,
