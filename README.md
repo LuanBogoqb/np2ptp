@@ -83,6 +83,34 @@ a child process and a line parser. Details in
 [Usage Examples](docs/EXAMPLES.md#non-interactive-usage---json), which also
 covers the public Rust API.
 
+For an app that stays open, `np2ptp daemon` is the better fit. One long-lived
+process owns the store, the identity, and the network connection, and takes
+commands as JSON lines on stdin:
+
+```sh
+np2ptp daemon --store ~/.np2ptp
+```
+
+```jsonc
+// in:
+{"id":1,"cmd":"fetch","uri":"np2ptp:abc...","out":"./downloads/game"}
+// out:
+{"event":"ready","version":"0.1.8"}
+{"id":1,"event":"progress","op":"fetch","chunks_done":42,"chunks_total":900}
+{"id":1,"event":"result","ok":true,"root":"np2ptp:abc..."}
+```
+
+Other commands: `convert` (bridge a downloaded torrent, or pack a folder),
+`torrent` (download over BitTorrent and bridge it on the way in), `provide`
+and `unprovide` to start and stop seeding without a restart, `status`, and
+`shutdown`. Every event carries the `id` of the request it belongs to, so
+several operations can run at once. A malformed line gets an error event and
+the daemon keeps going.
+
+Because one process holds the identity across restarts, the reputation a
+seeder earns accumulates instead of resetting. Running several `serve`
+processes against one store cannot do that.
+
 ## Design in One Paragraph
 
 Do not reinvent the plumbing. Build on `rust-libp2p` (QUIC transport,
