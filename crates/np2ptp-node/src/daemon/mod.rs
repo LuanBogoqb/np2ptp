@@ -23,8 +23,12 @@
 //!    `fetch_remote_torrent` fallback).
 //!  - `provide`   -> `Network::provide` + `register_manifest` + a per-root
 //!    tracker announce loop (same 120s cadence as `cmd_serve`'s), tracked in a
-//!    `HashMap<Hash, JoinHandle<()>>`.
-//!  - `unprovide` -> abort that task + `Network::unprovide`.
+//!    `HashMap<Hash, JoinHandle<()>>`. Takes a `.nptp` path **or** an
+//!    `np2ptp:<hex>` root already in `<store>/manifests/` (what `convert`
+//!    hands back), so convert -> provide is a closed loop inside the daemon.
+//!  - `unprovide` -> abort that task + `Network::unprovide` + drop the
+//!    `<store>/manifests/<root>.nptp` registry entry (else `serve --all`
+//!    resurrects it).
 //!  - `status`    -> `connected_peers` + the provided-roots map + `ledger_totals`
 //!    + this node's `peer_id`/`addrs` (same pair the `ready` event carries).
 //!  - `dial`      -> not a `proto::Op` variant yet (adding one means touching
@@ -74,6 +78,28 @@ use proto::{event_error, event_progress, event_ready, event_result, parse_reques
 const DEFAULT_LISTEN: &str = "/ip4/0.0.0.0/udp/0/quic-v1";
 /// Cadence for a `provide`d root's tracker announce loop — matches `cmd_serve`.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(120);
+/// Floor between two `warn`s from one root's announce loop: a tracker that is
+/// down stays down for a while, and one line every two minutes per root is
+/// noise the embedder has to parse.
+const ANNOUNCE_WARN_INTERVAL: Duration = Duration::from_secs(600);
+/// Whole-request budget for every tracker HTTP call. Without it a tracker that
+/// accepts the connection and never answers hangs the op forever — and an op
+/// that never finishes never emits its terminal event.
+const TRACKER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap on a tracker response body, so a hostile/broken tracker can't make
+/// us buffer unbounded.
+const TRACKER_MAX_BODY: usize = 4 * 1024 * 1024;
+/// Minimum gap between two `progress` events of one op. The out channel is
+/// unbounded, so an un-throttled per-chunk callback lets a slow reader grow the
+/// queue without bound. Terminal events (`result`/`error`) are never throttled.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// Longest request line accepted on stdin. A stream with no newline in it would
+/// otherwise buffer until the process runs out of memory.
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// How long shutdown waits for the writer to drain before exiting anyway —
+/// in-flight ops hold their own `Ctx` clone, and a big `fetch` must not turn
+/// `shutdown` into a several-minute wait.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// How long [`listen_addrs`] waits for the swarm to report a bound address
 /// before giving up (polls × interval — 2s total).
 const LISTEN_ADDR_POLLS: usize = 40;
@@ -101,27 +127,63 @@ struct Ctx {
     store: Arc<Store>,
     store_dir: String,
     tracker: String,
+    /// One shared HTTP client for every tracker call — built with
+    /// [`TRACKER_TIMEOUT`] so no tracker request can hang an op forever.
+    http: reqwest::Client,
     tx: mpsc::UnboundedSender<String>,
     announces: Arc<AsyncMutex<HashMap<Hash, JoinHandle<()>>>>,
     shutdown: Arc<Notify>,
 }
 
 /// Parses one NDJSON line and, on failure, sends an `error` event straight to
-/// `tx` (id `0` — a line that didn't parse into a `Request` has no id we can
-/// trust). Pure otherwise: no `Network`, no I/O beyond the channel send, so
-/// it's unit-testable without any networking spun up.
+/// `tx`. Pure otherwise: no `Network`, no I/O beyond the channel send, so it's
+/// unit-testable without any networking spun up.
 fn handle_line(line: &str, tx: &mpsc::UnboundedSender<String>) -> Option<Request> {
     match parse_request(line) {
         Ok(req) => Some(req),
         Err(e) => {
-            let _ = tx.send(event_error(0, &e));
+            let _ = tx.send(event_error(raw_id(line), &e));
             None
         }
     }
 }
 
+/// The `id` of a line that failed request validation. A line can be valid JSON
+/// carrying a perfectly good id and still be a bad *request* (`{"id":7,
+/// "cmd":"fetch"}` with no `out`) — reporting id `0` there would leave the
+/// embedder's pending id 7 waiting forever for a terminal event. `0` is the
+/// fallback for a line that isn't JSON at all, where there is no id to trust.
+fn raw_id(line: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|x| x.as_u64()))
+        .unwrap_or(0)
+}
+
 fn event_warn(message: &str) -> String {
     json!({"event": "warn", "message": message}).to_string()
+}
+
+/// A `progress` sink that drops updates arriving less than
+/// [`PROGRESS_INTERVAL`] apart. The completion update (`done >= total`) always
+/// goes out, so a fast op still reports at least once.
+fn progress_sender(
+    tx: mpsc::UnboundedSender<String>,
+    id: u64,
+    op: &'static str,
+) -> impl FnMut(u64, u64) {
+    let mut last: Option<std::time::Instant> = None;
+    move |done, total| {
+        let now = std::time::Instant::now();
+        let due = match last {
+            None => true,
+            Some(t) => now.duration_since(t) >= PROGRESS_INTERVAL,
+        };
+        if done >= total || due {
+            last = Some(now);
+            let _ = tx.send(event_progress(id, op, done, total));
+        }
+    }
 }
 
 /// `/p2p/<peer>`-suffixed string forms of `addrs` (idempotent: an address that
@@ -163,7 +225,7 @@ async fn listen_addrs(net: &Network) -> Vec<String> {
 
 /// [`proto::event_ready`] plus this node's `peer_id` and listen `addrs`.
 ///
-/// An embedder (Hydra) has to be able to tell a second node where this one is
+/// An embedder has to be able to tell a second node where this one is
 /// without a tracker in the loop, and `ready` is the only event it is
 /// guaranteed to see. Built by merging into the `proto` line rather than
 /// re-spelling it here, so the base shape stays owned by `proto`; falls back to
@@ -190,27 +252,81 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<(), Box<dyn Error>> {
     // per-request tasks never interleave a partial line. `println!` happens
     // *only* here.
     let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+    // Requested by the writer when stdout dies, and by the `shutdown` op.
+    let shutdown = Arc::new(Notify::new());
+    let writer_shutdown = shutdown.clone();
     let writer = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
         let mut out_rx = out_rx;
+        let stdout = std::io::stdout();
+        let mut sink = stdout.lock();
         while let Some(line) = out_rx.blocking_recv() {
-            println!("{line}");
+            // `println!` *panics* on a closed pipe: the writer task would die,
+            // its error would be swallowed by the `let _ = writer.await` below,
+            // and the daemon would keep doing work nobody can read. Write
+            // explicitly instead and ask for shutdown when the reader is gone.
+            let wrote = sink
+                .write_all(line.as_bytes())
+                .and_then(|()| sink.write_all(b"\n"))
+                .and_then(|()| sink.flush());
+            if wrote.is_err() {
+                writer_shutdown.notify_one();
+                out_rx.close();
+                break;
+            }
         }
     });
 
     // Blocking stdin read on a plain thread, forwarded into the async loop —
     // see the module doc's "deliberate deviations" note for why this isn't
     // `tokio::io::stdin()`.
+    //
+    // The overflow reporter is a *weak* sender on purpose: a strong clone held
+    // by this thread (which lives until stdin EOF) would keep the writer's
+    // channel open past shutdown.
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<String>();
+    let overflow_tx = out_tx.downgrade();
     std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::stdin().lock().lines() {
-            match line {
-                Ok(l) => {
-                    if in_tx.send(l).is_err() {
-                        break;
-                    }
-                }
+        use std::io::{BufRead, Read};
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            buf.clear();
+            // Bounded read: `lines()` would buffer a newline-less stream until
+            // the process runs out of memory.
+            let read = (&mut reader).take(MAX_LINE_BYTES as u64 + 1).read_until(b'\n', &mut buf);
+            match read {
+                Ok(0) => break, // EOF
+                Ok(_) => {}
                 Err(_) => break,
+            }
+            if buf.len() > MAX_LINE_BYTES && !buf.ends_with(b"\n") {
+                if let Some(tx) = overflow_tx.upgrade() {
+                    let _ = tx.send(event_error(
+                        0,
+                        &format!("request line exceeds {MAX_LINE_BYTES} bytes — dropped"),
+                    ));
+                }
+                // Discard the rest of the oversized line so the next parse
+                // starts on a real request boundary.
+                let mut skip: Vec<u8> = Vec::new();
+                let ended = loop {
+                    skip.clear();
+                    match (&mut reader).take(MAX_LINE_BYTES as u64).read_until(b'\n', &mut skip) {
+                        Ok(0) | Err(_) => break false,
+                        Ok(_) if skip.ends_with(b"\n") => break true,
+                        Ok(_) => continue,
+                    }
+                };
+                if !ended {
+                    break;
+                }
+                continue;
+            }
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            if in_tx.send(line).is_err() {
+                break;
             }
         }
     });
@@ -220,6 +336,7 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<(), Box<dyn Error>> {
     // instance for its own chunk serving; op handlers share a second one.
     let net = Network::spawn(Store::open(&cfg.store_dir)?, Some(cfg.identity_seed))?;
     let store = Arc::new(Store::open(&cfg.store_dir)?);
+    let http = reqwest::Client::builder().timeout(TRACKER_TIMEOUT).build()?;
 
     net.listen(DEFAULT_LISTEN.parse()?).await?;
 
@@ -240,13 +357,19 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<(), Box<dyn Error>> {
     let _ = out_tx.send(ready_line(env!("CARGO_PKG_VERSION"), net.local_peer_id(), &addrs));
 
     if cfg.auto_update {
-        // Best-effort, silent on success/failure beyond stderr — the daemon's
-        // stdout protocol has no event for this in the Task 7/8 contract, and
-        // inventing one here would mean guessing at what Task 8 expects.
-        tokio::task::spawn_blocking(|| {
-            if let Err(e) = crate::update::check_and_update(Duration::from_secs(30)) {
-                eprintln!("auto-update check failed: {e}");
+        // Auto-update stays on by default, but the swap is never invisible: a
+        // binary that changed under the embedder gets announced on the protocol
+        // (`updated`, with from/to) so it can react — restart, re-handshake,
+        // log it — instead of only finding out from stderr.
+        let tx = out_tx.clone();
+        tokio::task::spawn_blocking(move || match crate::update::check_and_update(Duration::from_secs(30)) {
+            Ok(report) if report.updated => {
+                let _ = tx.send(
+                    json!({"event": "updated", "from": report.from, "to": report.to}).to_string(),
+                );
             }
+            Ok(_) => {}
+            Err(e) => eprintln!("auto-update check failed: {e}"),
         });
     }
 
@@ -255,9 +378,10 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<(), Box<dyn Error>> {
         store,
         store_dir: cfg.store_dir,
         tracker: cfg.tracker,
+        http,
         tx: out_tx.clone(),
         announces: Arc::new(AsyncMutex::new(HashMap::new())),
-        shutdown: Arc::new(Notify::new()),
+        shutdown,
     };
 
     loop {
@@ -271,7 +395,14 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<(), Box<dyn Error>> {
                 }
                 if let Some(v) = dial_fallback_value(line) {
                     let ctx = ctx.clone();
-                    tokio::spawn(async move { dispatch_dial(v, ctx).await });
+                    let dial_id = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
+                    tokio::spawn(async move {
+                        let tx = ctx.tx.clone();
+                        // Same panic guard `execute` uses — see there.
+                        if tokio::spawn(async move { dispatch_dial(v, ctx).await }).await.is_err() {
+                            let _ = tx.send(event_error(dial_id, "internal error"));
+                        }
+                    });
                     continue;
                 }
                 if let Some(req) = handle_line(line, &ctx.tx) {
@@ -283,11 +414,16 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<(), Box<dyn Error>> {
     }
 
     // Every in-flight task holds its own clone of `out_tx`; dropping this one
-    // just lets the writer's channel close once they finish, instead of
-    // cutting them off.
+    // lets the writer's channel close once they finish, instead of cutting
+    // them off — but only up to [`SHUTDOWN_GRACE`]. Waiting unconditionally
+    // would make `shutdown` during a multi-GB `fetch` block until that fetch
+    // ended, which is not a shutdown.
     drop(ctx);
     drop(out_tx);
-    let _ = writer.await;
+    tokio::select! {
+        _ = writer => {}
+        _ = tokio::time::sleep(SHUTDOWN_GRACE) => {}
+    }
     Ok(())
 }
 
@@ -327,15 +463,20 @@ async fn dispatch_dial(v: serde_json::Value, ctx: Ctx) {
 /// Runs one request's op and reports its outcome (`result` or `error`) to
 /// `ctx.tx`. Isolated in its own `tokio::spawn`'d task by the caller so a slow
 /// or stuck op never blocks other in-flight requests.
+///
+/// The op itself runs in a *nested* task so the contract — exactly one terminal
+/// event per id, never zero — survives a panic inside it (an `unwrap` deep in
+/// store/bridge code, a client that fails to build). Without the guard the
+/// daemon lives on while that one id gets no event at all and its caller waits
+/// forever.
 async fn execute(id: u64, op: Op, ctx: Ctx) {
-    match run_op(id, op, &ctx).await {
-        Ok(fields) => {
-            let _ = ctx.tx.send(event_result(id, fields));
-        }
-        Err(e) => {
-            let _ = ctx.tx.send(event_error(id, &e));
-        }
-    }
+    let tx = ctx.tx.clone();
+    let line = match tokio::spawn(async move { run_op(id, op, &ctx).await }).await {
+        Ok(Ok(fields)) => event_result(id, fields),
+        Ok(Err(e)) => event_error(id, &e),
+        Err(_) => event_error(id, "internal error"),
+    };
+    let _ = tx.send(line);
 }
 
 async fn run_op(id: u64, op: Op, ctx: &Ctx) -> Result<serde_json::Value, String> {
@@ -393,7 +534,7 @@ async fn run_fetch(id: u64, uri: &str, out: &str, ctx: &Ctx) -> Result<serde_jso
     // `download_multi_with_progress` skips whichever of them turns out not to
     // have the content.
     let mut providers: Vec<PeerId> = Vec::new();
-    match tracker_get_peers(&ctx.tracker, root).await {
+    match tracker_get_peers(&ctx.http, &ctx.tracker, root).await {
         Ok(candidates) => {
             for (peer, addrs) in &candidates {
                 for addr in addrs {
@@ -417,19 +558,31 @@ async fn run_fetch(id: u64, uri: &str, out: &str, ctx: &Ctx) -> Result<serde_jso
             .to_string());
     }
 
-    let tx = ctx.tx.clone();
+    let mut prog = progress_sender(ctx.tx.clone(), id, "fetch");
     let manifest = ctx
         .net
         .download_multi_with_progress(root, &providers, &ctx.store, |done, total| {
-            let _ = tx.send(event_progress(id, "fetch", done as u64, total as u64));
+            prog(done as u64, total as u64);
         })
         .await
         .map_err(|e| e.to_string())?;
 
+    // Export re-reads and re-verifies every chunk — fully synchronous,
+    // GB-scale work. Run on an async worker it would stall the libp2p swarm
+    // sharing that pool (including the chunk serving other peers are waiting
+    // on), so it goes to the blocking pool instead.
+    let store = ctx.store.clone();
+    let out_path = out.to_string();
+    let export_manifest = manifest.clone();
     let tx = ctx.tx.clone();
-    let dest = write_output_to(&ctx.store, &manifest, out, |done, total| {
-        let _ = tx.send(event_progress(id, "fetch", done as u64, total as u64));
-    })?;
+    let dest = tokio::task::spawn_blocking(move || {
+        let mut prog = progress_sender(tx, id, "fetch");
+        write_output_to(&store, &export_manifest, &out_path, |done, total| {
+            prog(done as u64, total as u64);
+        })
+    })
+    .await
+    .map_err(|_| "internal error: export task failed".to_string())??;
 
     Ok(json!({
         "root": manifest.uri(),
@@ -453,6 +606,13 @@ async fn run_convert(
                 np2ptp_bridge::resolve_or_convert_local(&ctx.net, &ctx.store, &meta, Path::new(&data_dir), false)
                     .await
                     .map_err(|e| e.to_string())?;
+            // Register so the root this result hands back can be `provide`d
+            // (and survives into `serve --all`). The bridge's own `net.provide`
+            // leaves no registry entry and no announce loop, so without this
+            // the converted content is invisible to both `status` and the
+            // tracker — a dead end for the convert -> seed flow.
+            crate::register_manifest(Path::new(&ctx.store_dir), &outcome.manifest)
+                .map_err(|e| e.to_string())?;
             Ok(json!({
                 "root": outcome.manifest.uri(),
                 "converted": outcome.converted,
@@ -465,26 +625,44 @@ async fn run_convert(
         (None, None, Some(path)) => {
             let name = Path::new(&path).file_name().map(|s| s.to_string_lossy().into_owned());
             let is_dir = fs::metadata(&path).map_err(|e| e.to_string())?.is_dir();
-            let mut chunks_new = 0u64;
-            let tx = ctx.tx.clone();
-            let mut on_progress = |done: u64, total: u64, is_new: bool| {
-                if is_new {
-                    chunks_new += 1;
-                }
-                let _ = tx.send(event_progress(id, "convert", done, total));
-            };
-            let manifest = if is_dir {
+            let files: Vec<(String, PathBuf)> = if is_dir {
                 let files = crate::read_dir_paths(Path::new(&path)).map_err(|e| e.to_string())?;
-                ctx.store
-                    .ingest_tree_files_no_copy_with_progress(&files, name, &mut on_progress)
-                    .map_err(|e| e.to_string())?
+                // Same guard `cmd_pack` has: without it an empty directory
+                // yields `ok:true` and a degenerate zero-file manifest.
+                if files.is_empty() {
+                    return Err(format!("convert: directory {path} contains no files"));
+                }
+                files
             } else {
                 let file_name = name.clone().unwrap_or_else(|| "data".to_string());
-                let entry = [(file_name, PathBuf::from(&path))];
-                ctx.store
-                    .ingest_tree_files_no_copy_with_progress(&entry, name, &mut on_progress)
-                    .map_err(|e| e.to_string())?
+                vec![(file_name, PathBuf::from(&path))]
             };
+
+            // Whole-tree hashing is synchronous and unbounded — same reasoning
+            // as the export in `run_fetch`: off the async workers.
+            let store = ctx.store.clone();
+            let tx = ctx.tx.clone();
+            let (manifest, chunks_new) = tokio::task::spawn_blocking(move || {
+                let mut chunks_new = 0u64;
+                let mut prog = progress_sender(tx, id, "convert");
+                let mut on_progress = |done: u64, total: u64, is_new: bool| {
+                    if is_new {
+                        chunks_new += 1;
+                    }
+                    prog(done, total);
+                };
+                let result =
+                    store.ingest_tree_files_no_copy_with_progress(&files, name, &mut on_progress);
+                drop(on_progress);
+                result.map(|m| (m, chunks_new)).map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|_| "internal error: convert task failed".to_string())??;
+
+            // Convert -> seed, closed: `provide` accepts this result's root
+            // because the manifest is now in the store's registry.
+            crate::register_manifest(Path::new(&ctx.store_dir), &manifest)
+                .map_err(|e| e.to_string())?;
             Ok(json!({
                 "root": manifest.uri(),
                 "chunks_total": manifest.chunks.len(),
@@ -501,10 +679,7 @@ async fn run_convert(
 
 #[cfg(feature = "librqbit")]
 async fn run_torrent(id: u64, input: &str, out: Option<&str>, ctx: &Ctx) -> Result<serde_json::Value, String> {
-    let tx = ctx.tx.clone();
-    let mut on_progress = |done: u64, total: u64| {
-        let _ = tx.send(event_progress(id, "torrent", done, total));
-    };
+    let mut on_progress = progress_sender(ctx.tx.clone(), id, "torrent");
     let outcome = np2ptp_bridge::resolve_or_convert_remote(
         &ctx.net,
         &ctx.store,
@@ -533,17 +708,48 @@ async fn run_torrent(_id: u64, input: &str, out: Option<&str>, ctx: &Ctx) -> Res
         .to_string())
 }
 
+/// Path of a root's entry in the store's manifest registry. Mirrors
+/// `serve_set::manifests_dir` (private there — see the module doc on why this
+/// module can't reach into the binary crate's helpers either).
+fn registry_path(store_dir: &str, root: Hash) -> PathBuf {
+    Path::new(store_dir).join("manifests").join(format!("{}.nptp", root.to_hex()))
+}
+
+/// `provide`'s argument: a `.nptp` file path, **or** an `np2ptp:<hex>` root
+/// resolved from the store's registry.
+///
+/// The root form is what makes convert -> provide work: the daemon's `convert`
+/// hands back a root, not a file, so a path-only `provide` would leave content
+/// converted through the daemon impossible to seed through the daemon.
+fn load_provide_manifest(target: &str, store_dir: &str) -> Result<Manifest, String> {
+    let Some(hex) = target.strip_prefix("np2ptp:") else {
+        let bytes = fs::read(target).map_err(|e| e.to_string())?;
+        return Manifest::from_nptp(&bytes).map_err(|e| e.to_string());
+    };
+    let root = Hash::from_hex(hex).map_err(|e| e.to_string())?;
+    let path = registry_path(store_dir, root);
+    let bytes = fs::read(&path).map_err(|e| {
+        format!(
+            "provide {target}: no manifest registered at {} ({e}) — convert it, or provide it \
+             once by .nptp path, first",
+            path.display()
+        )
+    })?;
+    Manifest::from_nptp(&bytes).map_err(|e| e.to_string())
+}
+
 async fn run_provide(nptp: &str, ctx: &Ctx) -> Result<serde_json::Value, String> {
-    let bytes = fs::read(nptp).map_err(|e| e.to_string())?;
-    let manifest = Manifest::from_nptp(&bytes).map_err(|e| e.to_string())?;
+    let manifest = load_provide_manifest(nptp, &ctx.store_dir)?;
     ctx.net.provide(&manifest).await.map_err(|e| e.to_string())?;
     crate::register_manifest(Path::new(&ctx.store_dir), &manifest).map_err(|e| e.to_string())?;
 
     let root = manifest.root;
     let handle = {
         let tracker = ctx.tracker.clone();
+        let http = ctx.http.clone();
         let net = ctx.net.clone();
-        tokio::spawn(async move { announce_loop(tracker, net, root).await })
+        let tx = ctx.tx.clone();
+        tokio::spawn(async move { announce_loop(tracker, http, net, root, tx).await })
     };
     if let Some(old) = ctx.announces.lock().await.insert(root, handle) {
         old.abort(); // re-`provide`ing the same root replaces its announce task
@@ -566,6 +772,17 @@ async fn run_unprovide(root: &str, ctx: &Ctx) -> Result<serde_json::Value, Strin
         handle.abort();
     }
     ctx.net.unprovide(root_hash).await.map_err(|e| e.to_string())?;
+    // Drop the registry entry too, or a later `serve --all` (which serves
+    // everything ever registered) resurrects content the user explicitly
+    // retired. Already-gone is success; anything else is worth a `warn`.
+    let path = registry_path(&ctx.store_dir, root_hash);
+    if let Err(e) = fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            let _ = ctx
+                .tx
+                .send(event_warn(&format!("could not remove {}: {e}", path.display())));
+        }
+    }
     Ok(json!({ "root": format!("np2ptp:{}", root_hash.to_hex()) }))
 }
 
@@ -591,8 +808,20 @@ async fn run_status(ctx: &Ctx) -> Result<serde_json::Value, String> {
 /// Same cadence as `cmd_serve`'s announce loop (`tokio::time::interval` fires
 /// once immediately, then every [`ANNOUNCE_INTERVAL`]). Aborted from the
 /// `HashMap` by `run_unprovide` or a replacing `run_provide`.
-async fn announce_loop(tracker: String, net: Network, root: Hash) {
+///
+/// A failing announce is reported, not swallowed: silently, the content stops
+/// being discoverable while `status.provided` keeps listing it, and the
+/// embedder has no way to know. Rate-limited to [`ANNOUNCE_WARN_INTERVAL`] so a
+/// tracker that's down for a day isn't a warn every two minutes per root.
+async fn announce_loop(
+    tracker: String,
+    http: reqwest::Client,
+    net: Network,
+    root: Hash,
+    tx: mpsc::UnboundedSender<String>,
+) {
     let mut interval = tokio::time::interval(ANNOUNCE_INTERVAL);
+    let mut last_warn: Option<std::time::Instant> = None;
     loop {
         interval.tick().await;
         let mut addrs = net.listeners().await.unwrap_or_default();
@@ -602,7 +831,21 @@ async fn announce_loop(tracker: String, net: Network, root: Hash) {
             }
         }
         let peer = net.local_peer_id();
-        let _ = tracker_announce(&tracker, root, peer, &addrs).await;
+        if let Err(e) = tracker_announce(&http, &tracker, root, peer, &addrs).await {
+            let now = std::time::Instant::now();
+            let due = match last_warn {
+                None => true,
+                Some(t) => now.duration_since(t) >= ANNOUNCE_WARN_INTERVAL,
+            };
+            if due {
+                last_warn = Some(now);
+                let _ = tx.send(event_warn(&format!(
+                    "tracker announce for np2ptp:{} failed: {e} (still provided locally, but \
+                     peers may not find it)",
+                    root.to_hex()
+                )));
+            }
+        }
     }
 }
 
@@ -632,15 +875,20 @@ struct PeerEntry {
     addr: Option<String>,
 }
 
-async fn tracker_announce(tracker: &str, cid: Hash, peer: PeerId, addrs: &[Multiaddr]) -> Result<(), String> {
+async fn tracker_announce(
+    http: &reqwest::Client,
+    tracker: &str,
+    cid: Hash,
+    peer: PeerId,
+    addrs: &[Multiaddr],
+) -> Result<(), String> {
     let addr_strs = addr_strs_with_peer(addrs, peer);
     let body = json!({
         "cid": cid.to_hex(),
         "peer": peer.to_string(),
         "addrs": addr_strs,
     });
-    reqwest::Client::new()
-        .post(format!("{tracker}/announce"))
+    http.post(format!("{tracker}/announce"))
         .json(&body)
         .send()
         .await
@@ -650,16 +898,25 @@ async fn tracker_announce(tracker: &str, cid: Hash, peer: PeerId, addrs: &[Multi
     Ok(())
 }
 
-async fn tracker_get_peers(tracker: &str, cid: Hash) -> Result<Vec<(PeerId, Vec<Multiaddr>)>, String> {
+async fn tracker_get_peers(
+    http: &reqwest::Client,
+    tracker: &str,
+    cid: Hash,
+) -> Result<Vec<(PeerId, Vec<Multiaddr>)>, String> {
     let url = format!("{tracker}/peers?cid={}", cid.to_hex());
-    let resp: PeersResp = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut response =
+        http.get(url).send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?;
+
+    // Read the body in chunks against [`TRACKER_MAX_BODY`] rather than
+    // `.json()`, which would buffer whatever the far end decides to send.
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > TRACKER_MAX_BODY {
+            return Err(format!("tracker response exceeds {TRACKER_MAX_BODY} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let resp: PeersResp = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
 
     let mut out = Vec::new();
     for entry in resp.peers {
@@ -684,9 +941,35 @@ mod tests {
     #[tokio::test]
     async fn bad_line_emits_error_and_daemon_survives() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        handle_line("not json", &tx);
+        let _ = handle_line("not json", &tx);
         let line = rx.recv().await.unwrap();
         assert!(line.contains(r#""event":"error""#));
+    }
+
+    #[tokio::test]
+    async fn valid_json_bad_request_error_keeps_the_callers_id() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let _ = handle_line(r#"{"id":7,"cmd":"fetch"}"#, &tx); // no `out`
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(v["event"], "error");
+        assert_eq!(v["id"], 7, "the pending id must get its terminal event");
+    }
+
+    #[test]
+    fn progress_is_throttled_but_completion_always_lands() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let mut prog = progress_sender(tx, 5, "fetch");
+        for done in 0..100 {
+            prog(done, 100);
+        }
+        prog(100, 100);
+        let mut lines = Vec::new();
+        while let Ok(l) = rx.try_recv() {
+            lines.push(l);
+        }
+        assert!(lines.len() <= 3, "throttle let {} events through", lines.len());
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["done"], 100);
     }
 
     #[tokio::test]

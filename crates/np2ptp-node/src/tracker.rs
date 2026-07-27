@@ -13,7 +13,7 @@ use serde::Deserialize;
 pub const DEFAULT_TRACKER: &str = "https://nptp.bogotec.uk";
 
 /// `NP2PTP_TRACKER` overrides the built-in default — additive, for embedders
-/// (e.g. the Hydra daemon); absent, behavior is identical to before.
+/// (e.g. an embedded daemon); absent, behavior is identical to before.
 pub fn default_tracker() -> String {
     std::env::var("NP2PTP_TRACKER").unwrap_or_else(|_| DEFAULT_TRACKER.to_string())
 }

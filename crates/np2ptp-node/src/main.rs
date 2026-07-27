@@ -33,7 +33,7 @@ const DEFAULT_STORE: &str = ".np2ptp-store";
 const DEFAULT_RELAY: &str = "/ip4/194.163.191.81/udp/4001/quic-v1/p2p/12D3KooWSzXtDVLLFf2avw9bpcMCRsE7JvbdQNEcd45MKuRsGmyR";
 
 /// `NP2PTP_RELAY` overrides the built-in default — additive, for embedders
-/// (e.g. the Hydra daemon); absent, behavior is identical to before.
+/// (e.g. an embedded daemon); absent, behavior is identical to before.
 fn default_relay() -> String {
     std::env::var("NP2PTP_RELAY").unwrap_or_else(|_| DEFAULT_RELAY.to_string())
 }
@@ -957,7 +957,15 @@ async fn fetch_remote_torrent(
 fn cmd_daemon(args: &[String]) -> Result<(), Box<dyn Error>> {
     let (_pos, flags) = parse(args, &["--store", "--relay", "--tracker"]);
     let store_dir = flags.get("store").cloned().unwrap_or_else(|| DEFAULT_STORE.to_string());
-    let relay = Some(flags.get("relay").cloned().unwrap_or_else(default_relay));
+    // `--no-relay` matches `serve`/`torrent`: without it an embedder that runs
+    // entirely offline (a LAN, a test rig, an embedder dialing its peers
+    // itself) still dials the public relay on every start, because
+    // `DaemonConfig::relay: None` would be unreachable from the CLI.
+    let relay = if flags.contains_key("no-relay") {
+        None
+    } else {
+        Some(flags.get("relay").cloned().unwrap_or_else(default_relay))
+    };
     let tracker_url = flags.get("tracker").cloned().unwrap_or_else(tracker::default_tracker);
     let auto_update = !flags.contains_key("no-auto-update");
 
@@ -990,7 +998,7 @@ fn print_usage() {
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\
          \x20 np2ptp torrent <file.torrent|magnet:...> [--data <dir>] [--store <dir>] [--out <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\
-         \x20 np2ptp daemon [--store <dir>] [--relay <multiaddr>] [--tracker <url>] [--no-auto-update]   (persistent NDJSON stdio node)\n\n\
+         \x20 np2ptp daemon [--store <dir>] [--relay <multiaddr> | --no-relay] [--tracker <url>] [--no-auto-update]   (persistent NDJSON stdio node)\n\n\
          NOTES:\n\
          \x20 'pack' is the linker: chunks a file/folder into a store and writes a .nptp file.\n\
          \x20 --no-copy references the input in place instead of copying its chunks into the\n\
