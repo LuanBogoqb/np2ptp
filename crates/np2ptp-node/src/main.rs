@@ -838,7 +838,7 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// e.g. what a BitTorrent client's save-path already looks like for that
 /// torrent) or, with the `librqbit` feature, a magnet link / `.torrent` /
 /// `http(s)://` URL you don't have yet — downloaded via a real BitTorrent
-/// swarm first.
+/// swarm first. `--out <dir>` overrides the default download location.
 fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
     let (pos, flags) = parse(args, &["--data", "--store", "--relay", "--out"]);
     let input = *pos.first().ok_or("torrent: missing <file.torrent|magnet:...>")?;
@@ -877,11 +877,24 @@ fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
 
         let store = Store::open(&store_dir)?;
+        let mut last_emit = std::time::Instant::now();
+        let mut on_progress = |done: u64, total: u64| {
+            if json {
+                let now = std::time::Instant::now();
+                if done == total || now.duration_since(last_emit) >= Duration::from_millis(100) {
+                    last_emit = now;
+                    println!(
+                        "{}",
+                        serde_json::json!({"event":"progress","op":"torrent","bytes_done":done,"bytes_total":total})
+                    );
+                }
+            }
+        };
         let outcome = match (local_meta, &data_dir) {
             (Some(meta), Some(data_dir)) => {
                 np2ptp_bridge::resolve_or_convert_local(&net, &store, &meta, Path::new(data_dir), no_copy).await?
             }
-            _ => fetch_remote_torrent(&net, &store, input, no_copy, out_dir.map(Path::new)).await?,
+            _ => fetch_remote_torrent(&net, &store, input, no_copy, out_dir.map(Path::new), &mut on_progress).await?,
         };
 
         if json {
@@ -916,8 +929,9 @@ async fn fetch_remote_torrent(
     input: &str,
     no_copy: bool,
     out_dir: Option<&Path>,
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<np2ptp_bridge::Outcome, Box<dyn Error>> {
-    Ok(np2ptp_bridge::resolve_or_convert_remote(net, store, input, no_copy, out_dir).await?)
+    Ok(np2ptp_bridge::resolve_or_convert_remote(net, store, input, no_copy, out_dir, on_progress).await?)
 }
 
 #[cfg(not(feature = "librqbit"))]
@@ -927,6 +941,7 @@ async fn fetch_remote_torrent(
     _input: &str,
     _no_copy: bool,
     _out_dir: Option<&Path>,
+    _on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<np2ptp_bridge::Outcome, Box<dyn Error>> {
     Err("torrent: fetching a magnet/torrent you don't already have needs the 'librqbit' \
          feature (rebuild with `cargo build --features librqbit`), or pass --data <dir> \
@@ -944,7 +959,7 @@ fn print_usage() {
          \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay] [--choke-threshold <bytes>]\n\
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\
-         \x20 np2ptp torrent <file.torrent|magnet:...> [--data <dir>] [--store <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\n\
+         \x20 np2ptp torrent <file.torrent|magnet:...> [--data <dir>] [--store <dir>] [--out <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\n\
          NOTES:\n\
          \x20 'pack' is the linker: chunks a file/folder into a store and writes a .nptp file.\n\
          \x20 --no-copy references the input in place instead of copying its chunks into the\n\

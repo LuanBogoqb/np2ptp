@@ -14,7 +14,7 @@
 //! [`crate::parse_torrent_file`], keeping one single `TorrentMeta`
 //! representation for every source.
 
-use librqbit::{AddTorrent, AddTorrentOptions, Session};
+use librqbit::{AddTorrent, AddTorrentOptions, Session, TorrentStatsState};
 use np2ptp_net::Network;
 use np2ptp_store::Store;
 use sha1::{Digest, Sha1};
@@ -45,16 +45,17 @@ fn out_dir_overrides_default_location() {
 /// `http(s)://` URL to one — see `librqbit::AddTorrent::from_cli_argument`)
 /// over BitTorrent, then convert/bridge it into NP2PTP.
 ///
-/// The download lands under `store.root()/.np2ptp-bridge-downloads/<key>`,
+/// By default, the download lands under `store.root()/.np2ptp-bridge-downloads/<key>`,
 /// keyed by a hash of `input` so retrying the same magnet/torrent resumes
-/// instead of starting over. `librqbit`'s own DHT/session state lives
-/// alongside it in `.np2ptp-bridge-librqbit-session`.
+/// instead of starting over. When `out_dir` is `Some(dir)`, downloads into `dir` instead.
+/// `librqbit`'s own DHT/session state lives alongside it in `.np2ptp-bridge-librqbit-session`.
 pub async fn resolve_or_convert_remote(
     net: &Network,
     store: &Store,
     input: &str,
     no_copy: bool,
     out_dir: Option<&Path>,
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<Outcome, BridgeError> {
     let download_dir = bridge_download_dir(&store.root(), input, out_dir);
     let session_dir = store.root().join(".np2ptp-bridge-librqbit-session");
@@ -75,7 +76,20 @@ pub async fn resolve_or_convert_remote(
         .into_handle()
         .ok_or_else(|| BridgeError::Source("torrent add returned no handle (list-only?)".into()))?;
 
-    handle.wait_until_completed().await.map_err(source_err)?;
+    // Poll instead of `wait_until_completed` so the caller sees progress as
+    // the swarm downloads, and so an error mid-download (dead swarm, disk
+    // full, etc.) surfaces immediately instead of only after a timeout.
+    loop {
+        let s = handle.stats();
+        on_progress(s.progress_bytes, s.total_bytes);
+        if matches!(s.state, TorrentStatsState::Error) {
+            return Err(source_err(s.error.unwrap_or_else(|| "torrent errored".to_string())));
+        }
+        if s.finished {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 
     let torrent_bytes = handle.with_metadata(|m| m.torrent_bytes.clone()).map_err(source_err)?;
     let meta = parse_torrent_file(&torrent_bytes)?;
