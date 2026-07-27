@@ -538,7 +538,6 @@ async fn run_fetch(id: u64, uri: &str, out: &str, ctx: &Ctx) -> Result<serde_jso
     // connection to are folded in as candidates, and
     // `download_multi_with_progress` skips whichever of them turns out not to
     // have the content.
-    let mut providers: Vec<PeerId> = Vec::new();
     let mut discovered: Vec<PeerId> = Vec::new();
     match tracker_get_peers(&ctx.http, &ctx.tracker, root).await {
         Ok(candidates) => {
@@ -551,7 +550,6 @@ async fn run_fetch(id: u64, uri: &str, out: &str, ctx: &Ctx) -> Result<serde_jso
                     let _ = ctx.net.add_peer(*peer, addr.clone()).await;
                     let _ = ctx.net.dial(addr.clone()).await;
                 }
-                providers.push(*peer);
                 discovered.push(*peer);
             }
         }
@@ -559,7 +557,32 @@ async fn run_fetch(id: u64, uri: &str, out: &str, ctx: &Ctx) -> Result<serde_jso
             let _ = ctx.tx.send(event_warn(&format!("tracker lookup failed: {e}")));
         }
     }
-    for peer in ctx.net.connected_peers().await.unwrap_or_default() {
+
+    // Settle *before* deciding there is nobody to fetch from. This runs whether
+    // or not the tracker returned anything, because the documented `dial` then
+    // `fetch` flow has an empty tracker set and a handshake still in flight:
+    // the `dial` op answers as soon as the swarm queued the attempt, and
+    // `connected_peers` only reports established connections, so a `providers`
+    // check taken right now sees zero peers and would fail the op terminally.
+    // Same 60 x 50ms shape `cmd_fetch` uses; emits no events either way.
+    let mut connected = ctx.net.connected_peers().await.unwrap_or_default();
+    for _ in 0..60 {
+        let settled = if discovered.is_empty() {
+            !connected.is_empty()
+        } else {
+            discovered.iter().any(|p| connected.contains(p))
+        };
+        if settled {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        connected = ctx.net.connected_peers().await.unwrap_or_default();
+    }
+
+    // Providers are the tracker's peers plus whoever we ended up connected to.
+    // `download_multi_with_progress` skips whichever of them lacks the content.
+    let mut providers: Vec<PeerId> = discovered.clone();
+    for peer in connected {
         if !providers.contains(&peer) {
             providers.push(peer);
         }
@@ -570,33 +593,39 @@ async fn run_fetch(id: u64, uri: &str, out: &str, ctx: &Ctx) -> Result<serde_jso
             .to_string());
     }
 
-    // Freshly dialed peers are not connected yet. Wait for one of them, the
-    // same 60 x 50ms shape `cmd_fetch` uses, so the first download attempt is
-    // not spent on a connection that is still handshaking.
-    if !discovered.is_empty() {
-        for _ in 0..60 {
-            let connected = ctx.net.connected_peers().await.unwrap_or_default();
-            if discovered.iter().any(|p| connected.contains(p)) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
     // Retry with backoff on top of the settle wait: a transient `NoAddresses`
     // or a connection that dropped mid-handshake must not turn into the
     // operation's terminal error on the first try. No extra events — the
     // retries are invisible, the op still ends in exactly one terminal event.
+    //
+    // Bounded twice: 5 attempts *and* an overall deadline, so a stale tracker
+    // entry pointing at a dead peer reports its single error in seconds rather
+    // than stalling the embedder through every attempt.
     let mut prog = progress_sender(ctx.tx.clone(), id, "fetch");
+    let mut sent_complete = false;
     let mut manifest = None;
     let mut last_err = String::new();
+    let retry_deadline = std::time::Instant::now() + Duration::from_secs(20);
     for attempt in 0..5u32 {
         if attempt > 0 {
+            if std::time::Instant::now() >= retry_deadline {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(50 << (attempt - 1))).await;
         }
         match ctx
             .net
             .download_multi_with_progress(root, &providers, &ctx.store, |done, total| {
+                // A retry that got all the way to done == total and then failed
+                // late would otherwise emit that completion progress event once
+                // per attempt; an embedder keying "finished" off progress must
+                // see it at most once per op.
+                if done == total && total > 0 {
+                    if sent_complete {
+                        return;
+                    }
+                    sent_complete = true;
+                }
                 prog(done as u64, total as u64);
             })
             .await

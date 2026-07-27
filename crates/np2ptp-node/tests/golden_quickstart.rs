@@ -251,32 +251,34 @@ fn pack_get_serve_output_matches_the_frozen_golden_shape() {
     });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut raw_lines = Vec::new();
-    let mut loopback_addr = None;
-    while std::time::Instant::now() < deadline {
+    let mut raw_lines: Vec<String> = Vec::new();
+    loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         match rx.recv_timeout(std::time::Duration::from_millis(300)) {
             Ok(line) => {
-                if loopback_addr.is_none() && line.contains("--peer") && line.contains("/ip4/127.0.0.1/") {
-                    loopback_addr = Some(
-                        line.split_whitespace()
-                            .skip_while(|w| *w != "--peer")
-                            .nth(1)
-                            .expect("no --peer address in direct-fetch hint line")
-                            .to_string(),
-                    );
+                // The first two lines are the fixed "serving ..." and "direct
+                // fetch:" header; every line after that must be a hint line.
+                // serve can print other stdout after the hint block (e.g. a
+                // NAT-PMP/PCP public-address line), so stop collecting at the
+                // first line that isn't a hint instead of waiting for a quiet
+                // gap that a slow/chatty router can fill with more output.
+                if raw_lines.len() >= 2 && !line.starts_with("  np2ptp fetch") {
+                    break;
                 }
                 raw_lines.push(line);
             }
-            Err(_) if loopback_addr.is_some() => break, // quiet period: the hint block is done.
+            Err(_) if raw_lines.len() >= 3 => break, // header + >=1 hint line, then quiet: block is done.
             Err(_) => {}
         }
     }
-    let loopback_addr = loopback_addr.unwrap_or_else(|| {
+    if raw_lines.len() < 2 {
         panic!(
-            "serve never printed a loopback (127.0.0.1) direct-fetch hint within 60s; saw:\n{}",
+            "serve did not print both the 'serving' line and the 'direct fetch:' header within 60s; saw:\n{}",
             raw_lines.join("\n")
-        )
-    });
+        );
+    }
 
     let serve_lines: Vec<String> = raw_lines.iter().map(|l| normalize_line(l, dir.path())).collect();
     assert_eq!(
@@ -299,6 +301,30 @@ fn pack_get_serve_output_matches_the_frozen_golden_shape() {
             "unexpected direct-fetch hint line shape: {hint:?}"
         );
     }
+
+    // Prefer a loopback (127.0.0.1) address to dial in step 4; fall back to
+    // any /ip4/ address serve actually advertised — a host whose listener
+    // doesn't enumerate an ip4 loopback shouldn't wait 60s and panic just
+    // because this test insists on that one specific address.
+    let mut loopback_addr = None;
+    let mut any_ip4_addr = None;
+    for line in raw_lines.iter().skip(2) {
+        let Some(idx) = line.find("--peer ") else { continue };
+        let addr = &line[idx + "--peer ".len()..];
+        if any_ip4_addr.is_none() && addr.contains("/ip4/") {
+            any_ip4_addr = Some(addr.to_string());
+        }
+        if addr.contains("/ip4/127.0.0.1/") {
+            loopback_addr = Some(addr.to_string());
+            break;
+        }
+    }
+    let loopback_addr = loopback_addr.or(any_ip4_addr).unwrap_or_else(|| {
+        panic!(
+            "serve never advertised a usable /ip4/ direct-fetch address; raw lines were:\n{}",
+            raw_lines.join("\n")
+        )
+    });
 
     // Step 4: fetch, over a real local peer — the serve process above, still
     // running, is that peer. Dial it with the loopback address parsed from

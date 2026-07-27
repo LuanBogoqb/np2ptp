@@ -6,7 +6,13 @@
 //! carried; `fetch` pulls the content back byte-for-byte; `unprovide` retires
 //! one root and leaves the other; `shutdown` ends both processes with a success
 //! exit code. Two fetches are fired concurrently with different ids to prove
-//! events stay correlated to their own request.
+//! events stay correlated to their own request; both go out in the same write
+//! as the `dial`, so they reach the daemon while the handshake is still in
+//! flight (see the comment at that step for what that does and does not prove).
+//! A third daemon asks for a fabricated root nobody packed; the unservable
+//! fetch still ends in exactly one terminal `error`, inside the deadline
+//! (mDNS makes "nothing dialed" not mean "no peers" on loopback, hence the
+//! fake root rather than a real one).
 //!
 //! No internet required, by construction:
 //!  - `--relay /np2ptp-test/no-relay` is not a parsable multiaddr, so the daemon
@@ -187,6 +193,27 @@ impl Daemon {
         let stdin = self.stdin.as_mut().unwrap_or_else(|| panic!("daemon {name}: stdin closed"));
         writeln!(stdin, "{line}").unwrap_or_else(|e| panic!("daemon {name}: write {line}: {e}"));
         stdin.flush().unwrap_or_else(|e| panic!("daemon {name}: flush {line}: {e}"));
+    }
+
+    /// Writes several requests in one `write` + `flush`, so the daemon's reader
+    /// takes them from a single chunk and dispatches them back to back. Used
+    /// where the gap between two ops must be as small as this harness can make
+    /// it.
+    fn send_batch(&mut self, reqs: &[Value]) {
+        let mut buf = String::new();
+        for req in reqs {
+            if let Some(id) = req.get("id").and_then(Value::as_u64) {
+                self.sent_ids.push(id);
+            }
+            buf.push_str(&req.to_string());
+            buf.push('\n');
+        }
+        let name = self.name;
+        let stdin = self.stdin.as_mut().unwrap_or_else(|| panic!("daemon {name}: stdin closed"));
+        stdin
+            .write_all(buf.as_bytes())
+            .unwrap_or_else(|e| panic!("daemon {name}: write batch {buf:?}: {e}"));
+        stdin.flush().unwrap_or_else(|e| panic!("daemon {name}: flush batch: {e}"));
     }
 
     /// Block for one more stdout line and log it. Panics loudly on timeout or
@@ -418,22 +445,43 @@ fn daemon_provides_and_a_second_daemon_fetches_it_over_stdio() {
         "two stores must yield two identities: {ready_b}"
     );
 
-    b.send(json!({"id": 100, "cmd": "dial", "addr": dial_addr}));
-    let dialed = b.wait_result(&dl, 100);
-    assert_eq!(dialed["addr"], dial_addr.as_str());
-
-    // Deliberately NOT waiting for the connection here. `dial` only starts it
-    // (the swarm answers as soon as the attempt is queued), so fetching right
-    // away is the racy case an embedder will hit first. The daemon owns the
-    // settle and retry; polling status until peers >= 1 first would hide a
-    // regression in it, which is exactly what it did once already.
-
-    // --- two concurrent fetches, different ids ------------------------------
+    // --- dial + two concurrent fetches, one single write --------------------
+    // The three requests go out in one `write`, deliberately: the daemon reads
+    // them from a single chunk and dispatches the fetches immediately after the
+    // dial, with the QUIC handshake to A still in flight. This mirrors the
+    // dial-then-fetch flow the README documents, where a `dial` op answers
+    // before a connection is fully established.
+    //
+    // What this test does verify:
+    //  - the `dial` op succeeds and reports the address we reached;
+    //  - a `fetch` right after a `dial` in the same batch succeeds;
+    //  - two concurrent fetches with different request ids keep their responses
+    //    separate (no id crossover);
+    //  - bytes transferred match the original content exactly.
+    //
+    // What this test does NOT verify:
+    //  - that the daemon's settle-and-retry logic in `run_fetch` actually waits
+    //    for a peer connection when that peer is not yet connected. On loopback,
+    //    np2ptp-net's mDNS runs unconditionally and discovers peer A within
+    //    milliseconds, populating connected_peers before run_fetch samples it.
+    //    This means the test passes regardless of whether the settle logic works:
+    //    a build with no settle at all could still pass by winning the discovery
+    //    race.
+    //
+    // Where settle-and-retry IS actually verified:
+    //  - Code review of daemon/mod.rs (the settle wait and retry ladder).
+    //  - Live environments: peers on different subnets, across WAN, or where
+    //    mDNS is blocked. Those are the cases where settle-and-retry matters.
     let out1 = dir.path().join("fetched-one.bin");
     let out2 = dir.path().join("fetched-two.bin");
     let (out1_s, out2_s) = (s(&out1), s(&out2));
-    b.send(json!({"id": 200, "cmd": "fetch", "uri": root1, "out": out1_s.clone()}));
-    b.send(json!({"id": 201, "cmd": "fetch", "uri": root2, "out": out2_s.clone()}));
+    b.send_batch(&[
+        json!({"id": 100, "cmd": "dial", "addr": dial_addr.clone()}),
+        json!({"id": 200, "cmd": "fetch", "uri": root1, "out": out1_s.clone()}),
+        json!({"id": 201, "cmd": "fetch", "uri": root2, "out": out2_s.clone()}),
+    ]);
+    let dialed = b.wait_result(&dl, 100);
+    assert_eq!(dialed["addr"], dial_addr.as_str());
     let fetched1 = b.wait_result(&dl, 200);
     let fetched2 = b.wait_result(&dl, 201);
 
@@ -451,6 +499,50 @@ fn daemon_provides_and_a_second_daemon_fetches_it_over_stdio() {
     // The whole point: the bytes came across intact.
     assert_eq!(std::fs::read(&out1).unwrap(), data1, "fetched content 1 differs from the original");
     assert_eq!(std::fs::read(&out2).unwrap(), data2, "fetched content 2 differs from the original");
+
+    // --- negative control: a fetch nobody on earth can serve -----------------
+    // FIX 1 moved `run_fetch`'s "no peers" bail *below* the settle wait, so the
+    // op now always spends the settle window and the retry ladder before it can
+    // fail. This proves that path still terminates: a third daemon asks for a
+    // fabricated root — 64 valid hex chars that were never packed — so no
+    // provider exists on any discovery path.
+    //
+    // Fabricated rather than "a real root with nothing dialed" because
+    // np2ptp-net runs mDNS: on loopback a fresh daemon finds A by itself, so
+    // "no tracker and no dial" is not "no peers" here. The earlier version of
+    // this control fetched successfully and proved nothing.
+    //
+    // What it pins: exactly one terminal event, an `error`, inside the shared
+    // deadline, with no output file — the settle cannot hang the op and the
+    // bounded retry ladder cannot outlive it. Which failure shape it takes (the
+    // "no peers" bail if mDNS has not landed yet, or a download failure against
+    // a peer that does not have the content) depends on discovery timing, so
+    // the message is not asserted, only that it is a non-empty error.
+    let store_c = dir.path().join("store-c");
+    let never = dir.path().join("never.bin");
+    let nobodys_root = format!("np2ptp:{}", "de1e7ed0".repeat(8));
+    let mut c = Daemon::spawn("C", &store_c);
+    c.wait_ready(&dl);
+    c.send(json!({"id": 400, "cmd": "fetch", "uri": nobodys_root, "out": s(&never)}));
+    let failed = c.wait_for(&dl, "a terminal event for id 400", |e| {
+        e["id"].as_u64() == Some(400)
+            && matches!(e["event"].as_str(), Some("result") | Some("error"))
+    });
+    assert_eq!(
+        failed["event"], "error",
+        "a fetch for a root nobody has must fail: {failed}\n{}",
+        c.dump()
+    );
+    assert_eq!(failed["ok"], false, "an error event must carry ok:false: {failed}");
+    assert!(
+        !failed["message"].as_str().unwrap_or_default().is_empty(),
+        "an error event must carry a message: {failed}"
+    );
+    assert!(!never.exists(), "a failed fetch must not leave an output file: {never:?}");
+    c.send(json!({"id": 401, "cmd": "shutdown"}));
+    c.wait_result(&dl, 401);
+    c.expect_clean_exit(&dl);
+    c.assert_ids_are_ours();
 
     // --- unprovide one root on A, the other stays ---------------------------
     a.send(json!({"id": 4, "cmd": "unprovide", "root": root1}));

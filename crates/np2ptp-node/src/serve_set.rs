@@ -54,27 +54,31 @@ pub fn collect_serve_manifests(
 
     let dir = manifests_dir(store_dir);
     let mut out = Vec::new();
+    let mut skipped = 0u64;
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("nptp") {
                 // A concurrent daemon unprovide can delete this file between
-                // read_dir and here, or a partially-written registration can
-                // fail to decode. Either way, skip it and keep serving the
-                // rest instead of aborting the whole `--all` run.
+                // read_dir and here (NotFound), or another process/AV can be
+                // holding it (PermissionDenied — a Windows sharing
+                // violation), or a partially-written registration can fail
+                // to decode. Either way, skip it and keep serving the rest
+                // instead of aborting the whole `--all` run.
                 let bytes = match fs::read(&path) {
                     Ok(b) => b,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        eprintln!("serve --all: skipping {} (removed concurrently): {}", path.display(), e);
+                    Err(e) => {
+                        eprintln!("serve --all: skipping {} (I/O error: {}): {}", path.display(), e.kind(), e);
+                        skipped += 1;
                         continue;
                     }
-                    Err(e) => return Err(e.into()),
                 };
                 match Manifest::from_nptp(&bytes) {
                     Ok(m) => out.push(m),
                     Err(e) => {
                         eprintln!("serve --all: skipping {} (failed to decode): {}", path.display(), e);
+                        skipped += 1;
                         continue;
                     }
                 }
@@ -82,12 +86,15 @@ pub fn collect_serve_manifests(
         }
     }
     if out.is_empty() {
-        return Err(NodeError::InvalidUsage(
+        return Err(NodeError::InvalidUsage(if skipped > 0 {
             format!(
-                "serve --all: no registered manifests in {}",
-                dir.display()
-            ),
-        ));
+                "serve --all: no registered manifests in {} ({} entries skipped, see warnings above)",
+                dir.display(),
+                skipped
+            )
+        } else {
+            format!("serve --all: no registered manifests in {}", dir.display())
+        }));
     }
     Ok(out)
 }
