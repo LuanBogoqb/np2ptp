@@ -70,7 +70,9 @@ pub fn event_progress(id: u64, op: &str, done: u64, total: u64) -> String {
     .to_string()
 }
 
+/// Constructs a "result" event JSON object. Fields must be a JSON object; non-objects are dropped in release, panic in debug.
 pub fn event_result(id: u64, fields: serde_json::Value) -> String {
+    debug_assert!(fields.is_object(), "event_result fields must be an object");
     let mut obj = serde_json::Map::new();
     obj.insert("id".to_string(), json!(id));
     obj.insert("event".to_string(), json!("result"));
@@ -157,6 +159,13 @@ mod tests {
         assert_eq!(v["event"], "result");
         assert_eq!(v["ok"], true);
         assert_eq!(v["nptp"], "abc");
+    }
+
+    #[test]
+    #[should_panic(expected = "event_result fields must be an object")]
+    #[cfg(debug_assertions)]
+    fn result_event_non_object_fields_debug_asserts() {
+        event_result(9, json!("not an object"));
     }
 
     #[test]
