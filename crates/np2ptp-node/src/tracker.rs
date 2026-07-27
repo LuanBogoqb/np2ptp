@@ -12,6 +12,12 @@ use serde::Deserialize;
 
 pub const DEFAULT_TRACKER: &str = "https://nptp.bogotec.uk";
 
+/// `NP2PTP_TRACKER` overrides the built-in default — additive, for embedders
+/// (e.g. the Hydra daemon); absent, behavior is identical to before.
+pub fn default_tracker() -> String {
+    std::env::var("NP2PTP_TRACKER").unwrap_or_else(|_| DEFAULT_TRACKER.to_string())
+}
+
 #[derive(Deserialize)]
 struct PeersResp {
     peers: Vec<PeerEntry>,
@@ -82,4 +88,19 @@ pub async fn get_peers(tracker: &str, cid: Hash) -> Result<Vec<(PeerId, Vec<Mult
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_tracker_env_override() {
+        // Sequential in one test: cargo runs tests in threads sharing the env.
+        std::env::remove_var("NP2PTP_TRACKER");
+        assert_eq!(default_tracker(), DEFAULT_TRACKER);
+        std::env::set_var("NP2PTP_TRACKER", "https://example.test");
+        assert_eq!(default_tracker(), "https://example.test");
+        std::env::remove_var("NP2PTP_TRACKER");
+    }
 }

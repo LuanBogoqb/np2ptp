@@ -31,6 +31,12 @@ const DEFAULT_STORE: &str = ".np2ptp-store";
 /// UPnP/NAT-PMP). Same box as `tracker::DEFAULT_TRACKER`.
 const DEFAULT_RELAY: &str = "/ip4/194.163.191.81/udp/4001/quic-v1/p2p/12D3KooWSzXtDVLLFf2avw9bpcMCRsE7JvbdQNEcd45MKuRsGmyR";
 
+/// `NP2PTP_RELAY` overrides the built-in default — additive, for embedders
+/// (e.g. the Hydra daemon); absent, behavior is identical to before.
+fn default_relay() -> String {
+    std::env::var("NP2PTP_RELAY").unwrap_or_else(|_| DEFAULT_RELAY.to_string())
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -464,7 +470,7 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
     let tracker_url = flags
         .get("tracker")
         .cloned()
-        .unwrap_or_else(|| tracker::DEFAULT_TRACKER.to_string());
+        .unwrap_or_else(tracker::default_tracker);
     let no_tracker = flags.contains_key("no-tracker");
     let json = flags.contains_key("json");
     // Arm the reputation choke: refuse chunks to any peer whose reciprocity
@@ -574,7 +580,7 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
             if !json {
                 println!("no direct/UPnP/NAT-PMP public address — falling back to public relay");
             }
-            Some(DEFAULT_RELAY.to_string())
+            Some(default_relay())
         } else {
             None
         };
@@ -690,7 +696,7 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
     let tracker_url = flags
         .get("tracker")
         .cloned()
-        .unwrap_or_else(|| tracker::DEFAULT_TRACKER.to_string());
+        .unwrap_or_else(tracker::default_tracker);
 
     // Explicit peer, if given; otherwise we discover providers via the tracker.
     let explicit: Option<(PeerId, Multiaddr)> = match flags.get("peer") {
@@ -846,7 +852,7 @@ fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
         net.listen("/ip4/0.0.0.0/udp/0/quic-v1".parse()?).await?;
 
         if !no_relay {
-            let relay_addr: Multiaddr = relay_override.unwrap_or_else(|| DEFAULT_RELAY.to_string()).parse()?;
+            let relay_addr: Multiaddr = relay_override.unwrap_or_else(default_relay).parse()?;
             if !json {
                 println!("relay: dialing {relay_addr} ...");
             }
