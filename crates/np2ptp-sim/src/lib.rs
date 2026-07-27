@@ -93,9 +93,11 @@ async fn download_until(net: &Network, root: Hash, peer: PeerId, into: &Store, t
 async fn provider_count_until(net: &Network, root: Hash, tries: usize) -> usize {
     let mut n = 0;
     for _ in 0..tries {
-        n = net.find_providers(root).await.unwrap().len();
-        if n >= 1 {
-            return n;
+        if let Ok(providers) = net.find_providers(root).await {
+            n = providers.len();
+            if n >= 1 {
+                return n;
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
