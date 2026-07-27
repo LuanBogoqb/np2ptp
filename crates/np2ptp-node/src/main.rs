@@ -19,6 +19,8 @@ use std::time::Duration;
 
 use np2ptp_core::{Hash, Manifest};
 use np2ptp_net::{peer_id_from_multiaddr, Multiaddr, Network, PeerId};
+use np2ptp_node::daemon::{run_daemon, DaemonConfig};
+use np2ptp_node::update;
 use np2ptp_node::{download_with_progress, read_dir_paths, StoreSource};
 use np2ptp_store::Store;
 
@@ -30,6 +32,12 @@ const DEFAULT_STORE: &str = ".np2ptp-store";
 /// when a `serve`r turns out to have no other reachable address (CGNAT, no
 /// UPnP/NAT-PMP). Same box as `tracker::DEFAULT_TRACKER`.
 const DEFAULT_RELAY: &str = "/ip4/194.163.191.81/udp/4001/quic-v1/p2p/12D3KooWSzXtDVLLFf2avw9bpcMCRsE7JvbdQNEcd45MKuRsGmyR";
+
+/// `NP2PTP_RELAY` overrides the built-in default — additive, for embedders
+/// (e.g. an embedded daemon); absent, behavior is identical to before.
+fn default_relay() -> String {
+    std::env::var("NP2PTP_RELAY").unwrap_or_else(|_| DEFAULT_RELAY.to_string())
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -53,6 +61,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("fetch") => cmd_fetch(&args[1..]),
         Some("relay") => cmd_relay(&args[1..]),
         Some("torrent") => cmd_torrent(&args[1..]),
+        Some("daemon") => cmd_daemon(&args[1..]),
+        Some("update") => cmd_update(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(())
@@ -439,9 +449,14 @@ fn udp_port(addr: &Multiaddr) -> Option<u16> {
 /// and announce it on the DHT until interrupted.
 fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
     let (pos, flags) = parse(args, &["--store", "--listen", "--tracker", "--public", "--relay", "--choke-threshold"]);
-    let file = *pos.first().ok_or("serve: missing <file.nptp>")?;
-    let manifest = Manifest::from_nptp(&fs::read(file)?)?;
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
+    let all = flags.contains_key("all");
+    let manifests = np2ptp_node::collect_serve_manifests(&pos, all, Path::new(&store_dir))?;
+    // Registry write doesn't touch the network — do it here, before the
+    // runtime spins up, instead of inside the async task.
+    for m in &manifests {
+        np2ptp_node::register_manifest(Path::new(&store_dir), m)?;
+    }
     let store = Store::open(&store_dir)?;
     // Persist identity per store dir: restarting `serve` on the same --store
     // keeps the same peer id, so providers already found (DHT, tracker, a
@@ -464,7 +479,7 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
     let tracker_url = flags
         .get("tracker")
         .cloned()
-        .unwrap_or_else(|| tracker::DEFAULT_TRACKER.to_string());
+        .unwrap_or_else(tracker::default_tracker);
     let no_tracker = flags.contains_key("no-tracker");
     let json = flags.contains_key("json");
     // Arm the reputation choke: refuse chunks to any peer whose reciprocity
@@ -485,16 +500,20 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
         }
         net.listen(listen.parse()?).await?;
-        net.provide(&manifest).await?;
+        for m in &manifests {
+            net.provide(m).await?;
+        }
         let peer = net.local_peer_id();
 
         if !json {
-            println!(
-                "serving {} ({} files, {} chunks)",
-                manifest.uri(),
-                manifest.files.len(),
-                manifest.chunks.len()
-            );
+            for m in &manifests {
+                println!(
+                    "serving {} ({} files, {} chunks)",
+                    m.uri(),
+                    m.files.len(),
+                    m.chunks.len()
+                );
+            }
         }
         let addrs = wait_for_listeners(&net).await;
         if !json {
@@ -502,11 +521,13 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
                 println!("peer id: {peer} (no listen address yet)");
             } else {
                 println!("direct fetch:");
-                for a in &addrs {
-                    println!("  np2ptp fetch {} --peer {a}/p2p/{peer}", manifest.uri());
-                }
-                if !no_tracker {
-                    println!("or, once announced, just: np2ptp fetch {}   (peers found via the tracker)", manifest.uri());
+                for m in &manifests {
+                    for a in &addrs {
+                        println!("  np2ptp fetch {} --peer {a}/p2p/{peer}", m.uri());
+                    }
+                    if !no_tracker {
+                        println!("or, once announced, just: np2ptp fetch {}   (peers found via the tracker)", m.uri());
+                    }
                 }
             }
         }
@@ -574,7 +595,7 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
             if !json {
                 println!("no direct/UPnP/NAT-PMP public address — falling back to public relay");
             }
-            Some(DEFAULT_RELAY.to_string())
+            Some(default_relay())
         } else {
             None
         };
@@ -609,8 +630,10 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
                 }
                 if !no_tracker {
                     let addrs = net.listeners().await.unwrap_or_default();
-                    if let Err(e) = tracker::announce(&tracker_url, manifest.root, peer, &addrs).await {
-                        eprintln!("  (tracker announce failed: {e})");
+                    for m in &manifests {
+                        if let Err(e) = tracker::announce(&tracker_url, m.root, peer, &addrs).await {
+                            eprintln!("  (tracker announce failed: {e})");
+                        }
                     }
                 }
             } else {
@@ -639,9 +662,11 @@ fn cmd_serve(args: &[String]) -> Result<(), Box<dyn Error>> {
                             addrs.push(ext);
                         }
                     }
-                    if let Err(e) = tracker::announce(&tracker_url, manifest.root, peer, &addrs).await {
-                        if !json {
-                            eprintln!("  (tracker announce failed: {e})");
+                    for m in &manifests {
+                        if let Err(e) = tracker::announce(&tracker_url, m.root, peer, &addrs).await {
+                            if !json {
+                                eprintln!("  (tracker announce failed: {e})");
+                            }
                         }
                     }
                 }
@@ -690,7 +715,7 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
     let tracker_url = flags
         .get("tracker")
         .cloned()
-        .unwrap_or_else(|| tracker::DEFAULT_TRACKER.to_string());
+        .unwrap_or_else(tracker::default_tracker);
 
     // Explicit peer, if given; otherwise we discover providers via the tracker.
     let explicit: Option<(PeerId, Multiaddr)> = match flags.get("peer") {
@@ -817,12 +842,13 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// e.g. what a BitTorrent client's save-path already looks like for that
 /// torrent) or, with the `librqbit` feature, a magnet link / `.torrent` /
 /// `http(s)://` URL you don't have yet — downloaded via a real BitTorrent
-/// swarm first.
+/// swarm first. `--out <dir>` overrides the default download location.
 fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (pos, flags) = parse(args, &["--data", "--store", "--relay"]);
+    let (pos, flags) = parse(args, &["--data", "--store", "--relay", "--out"]);
     let input = *pos.first().ok_or("torrent: missing <file.torrent|magnet:...>")?;
     let data_dir = flags.get("data").cloned();
     let store_dir = flags.get("store").map(String::as_str).unwrap_or(DEFAULT_STORE).to_string();
+    let out_dir = flags.get("out").map(|s| s.as_str());
     let no_copy = flags.contains_key("no-copy");
     let no_relay = flags.contains_key("no-relay");
     let relay_override = flags.get("relay").cloned();
@@ -846,7 +872,7 @@ fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
         net.listen("/ip4/0.0.0.0/udp/0/quic-v1".parse()?).await?;
 
         if !no_relay {
-            let relay_addr: Multiaddr = relay_override.unwrap_or_else(|| DEFAULT_RELAY.to_string()).parse()?;
+            let relay_addr: Multiaddr = relay_override.unwrap_or_else(default_relay).parse()?;
             if !json {
                 println!("relay: dialing {relay_addr} ...");
             }
@@ -855,11 +881,24 @@ fn cmd_torrent(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
 
         let store = Store::open(&store_dir)?;
+        let mut last_emit = std::time::Instant::now();
+        let mut on_progress = |done: u64, total: u64| {
+            if json {
+                let now = std::time::Instant::now();
+                if done == total || now.duration_since(last_emit) >= Duration::from_millis(100) {
+                    last_emit = now;
+                    println!(
+                        "{}",
+                        serde_json::json!({"event":"progress","op":"torrent","bytes_done":done,"bytes_total":total})
+                    );
+                }
+            }
+        };
         let outcome = match (local_meta, &data_dir) {
             (Some(meta), Some(data_dir)) => {
                 np2ptp_bridge::resolve_or_convert_local(&net, &store, &meta, Path::new(data_dir), no_copy).await?
             }
-            _ => fetch_remote_torrent(&net, &store, input, no_copy).await?,
+            _ => fetch_remote_torrent(&net, &store, input, no_copy, out_dir.map(Path::new), &mut on_progress).await?,
         };
 
         if json {
@@ -893,8 +932,10 @@ async fn fetch_remote_torrent(
     store: &Store,
     input: &str,
     no_copy: bool,
+    out_dir: Option<&Path>,
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<np2ptp_bridge::Outcome, Box<dyn Error>> {
-    Ok(np2ptp_bridge::resolve_or_convert_remote(net, store, input, no_copy).await?)
+    Ok(np2ptp_bridge::resolve_or_convert_remote(net, store, input, no_copy, out_dir, on_progress).await?)
 }
 
 #[cfg(not(feature = "librqbit"))]
@@ -903,11 +944,105 @@ async fn fetch_remote_torrent(
     _store: &Store,
     _input: &str,
     _no_copy: bool,
+    _out_dir: Option<&Path>,
+    _on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<np2ptp_bridge::Outcome, Box<dyn Error>> {
     Err("torrent: fetching a magnet/torrent you don't already have needs the 'librqbit' \
          feature (rebuild with `cargo build --features librqbit`), or pass --data <dir> \
          for content you've already downloaded"
         .into())
+}
+
+/// Run as a persistent NDJSON stdio node: one JSON request per stdin line,
+/// JSON events back on stdout. See `np2ptp_node::daemon` for the wire
+/// protocol (fetch/convert/torrent/provide/unprovide/status/dial/shutdown).
+fn cmd_daemon(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let (_pos, flags) = parse(args, &["--store", "--relay", "--tracker"]);
+    let store_dir = flags.get("store").cloned().unwrap_or_else(|| DEFAULT_STORE.to_string());
+    // `--no-relay` matches `serve`/`torrent`: without it an embedder that runs
+    // entirely offline (a LAN, a test rig, an embedder dialing its peers
+    // itself) still dials the public relay on every start, because
+    // `DaemonConfig::relay: None` would be unreachable from the CLI.
+    let relay = if flags.contains_key("no-relay") {
+        None
+    } else {
+        Some(flags.get("relay").cloned().unwrap_or_else(default_relay))
+    };
+    let tracker_url = flags.get("tracker").cloned().unwrap_or_else(tracker::default_tracker);
+    let auto_update = !flags.contains_key("no-auto-update");
+
+    // Persist identity per store dir, same as `cmd_serve`/`cmd_torrent`: restarting
+    // the daemon on the same --store keeps the same peer id, so the reputation
+    // ledger and choke mechanism (which key off peer id) accumulate across runs
+    // instead of resetting every start. Store::open first so the directory exists
+    // before load_or_create_seed writes identity.key under it.
+    Store::open(&store_dir)?;
+    let identity_seed = load_or_create_seed(&format!("{store_dir}/identity.key"))?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_daemon(DaemonConfig {
+        store_dir,
+        relay,
+        tracker: tracker_url,
+        auto_update,
+        identity_seed,
+    }))
+}
+
+/// Formats a completed update check for the plain (non-`--json`) CLI mode.
+/// Pure so the two message shapes are unit-testable without touching the
+/// network.
+fn update_message(report: &update::UpdateReport) -> String {
+    if report.updated {
+        format!("updated {} -> {}, restart to use it", report.from, report.to)
+    } else {
+        format!("already up to date ({})", report.from)
+    }
+}
+
+/// Check GitHub for a newer release and install it if there is one. Reuses
+/// the daemon's startup logic (`update::check_and_update`); unlike the
+/// daemon's silent auto-update, this reports the outcome and, on any error
+/// (network, verification, timeout), exits non-zero.
+fn cmd_update(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let (_pos, flags) = parse(args, &[]);
+    let json = flags.contains_key("json");
+
+    // Reap a leftover `.old`/`.new` from a previous run before checking, same
+    // as the daemon does at startup.
+    update::cleanup_old_binary();
+
+    let report = update::check_and_update(Duration::from_secs(120)).map_err(|e| {
+        if matches!(e, update::UpdateError::BadSignature) {
+            // Security copy: written out in full, not abbreviated — this is
+            // the one failure that always means the download did not match
+            // what was expected, and the person reading it needs to know
+            // nothing was installed.
+            Box::<dyn Error>::from(
+                "update refused: the downloaded binary failed signature verification against \
+                 the pinned signer. The download has been deleted and the current binary was \
+                 left untouched — nothing was installed. If this keeps happening, do not retry \
+                 blindly; it means either the release was tampered with or the signer changed."
+            )
+        } else {
+            Box::<dyn Error>::from(e)
+        }
+    })?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event":"result","op":"update","ok":true,
+                "updated": report.updated,
+                "from": report.from,
+                "to": report.to,
+            })
+        );
+    } else {
+        println!("{}", update_message(&report));
+    }
+    Ok(())
 }
 
 fn print_usage() {
@@ -917,10 +1052,12 @@ fn print_usage() {
          \x20 np2ptp pack  <input> [--out <file.nptp>] [--store <dir>] [--name <name>] [--no-copy]\n\
          \x20 np2ptp info  <file.nptp>\n\
          \x20 np2ptp get   <file.nptp> --source <store-dir> [--store <dir>] [--out <output>]\n\
-         \x20 np2ptp serve <file.nptp> [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay] [--choke-threshold <bytes>]\n\
+         \x20 np2ptp serve <file.nptp>... [--all] [--store <dir>] [--listen <multiaddr>] [--public <public-ip>] [--tracker <url>] [--relay <multiaddr> | --no-relay] [--choke-threshold <bytes>]\n\
          \x20 np2ptp fetch <np2ptp:ROOT | file.nptp> [--peer <multiaddr>] [--tracker <url>] [--store <dir>] [--out <output>] [--fec]\n\
          \x20 np2ptp relay [--listen <multiaddr>] [--public <public-ip>] [--key <file>]   (run on a public host)\n\
-         \x20 np2ptp torrent <file.torrent|magnet:...> [--data <dir>] [--store <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\n\
+         \x20 np2ptp torrent <file.torrent|magnet:...> [--data <dir>] [--store <dir>] [--out <dir>] [--no-copy] [--relay <multiaddr> | --no-relay] [--json]\n\
+         \x20 np2ptp daemon [--store <dir>] [--relay <multiaddr> | --no-relay] [--tracker <url>] [--no-auto-update]   (persistent NDJSON stdio node)\n\
+         \x20 np2ptp update [--json]   (check GitHub for a newer release and install it)\n\n\
          NOTES:\n\
          \x20 'pack' is the linker: chunks a file/folder into a store and writes a .nptp file.\n\
          \x20 --no-copy references the input in place instead of copying its chunks into the\n\
@@ -936,4 +1073,29 @@ fn print_usage() {
          \x20 further chunks. Off by default; 0 is the strictest setting.\n\
          \x20 Default store dir: {DEFAULT_STORE}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_message_reports_the_new_version() {
+        let report = update::UpdateReport {
+            updated: true,
+            from: "0.1.8".to_string(),
+            to: "0.1.9".to_string(),
+        };
+        assert_eq!(update_message(&report), "updated 0.1.8 -> 0.1.9, restart to use it");
+    }
+
+    #[test]
+    fn update_message_reports_already_current() {
+        let report = update::UpdateReport {
+            updated: false,
+            from: "0.1.9".to_string(),
+            to: "0.1.9".to_string(),
+        };
+        assert_eq!(update_message(&report), "already up to date (0.1.9)");
+    }
 }

@@ -32,7 +32,12 @@ shell's PATH — prefix with `$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path
    alone a whole torrent) into memory. Real content is 10s of GB.
 4. **The manifest is trusted only after** `root == requested_root` AND
    `root_is_consistent()`. `get_manifest` already does this on the network path.
-5. **Two `Store` handles on the same directory is normal** (e.g. `Network::spawn`
+5. **The 3-step flow is sacred UX.** The Quick Start (`pack` → `serve` →
+   `fetch`) must never get more complicated. Every new feature is additive and
+   opt-in: existing commands keep their behavior, output, and required
+   arguments byte-for-byte. If a patch changes what a README Quick Start user
+   types or sees, it's the wrong patch.
+6. **Two `Store` handles on the same directory is normal** (e.g. `Network::spawn`
    owns one, a caller opens a second right after) — one MUST see what the other
    just packed. `put`/`get`/`has` refresh from `packs/index` on a miss
    (`Store::refresh_pack_index`), tailing only the bytes appended since last

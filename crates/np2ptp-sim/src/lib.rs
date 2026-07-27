@@ -88,6 +88,22 @@ async fn download_until(net: &Network, root: Hash, peer: PeerId, into: &Store, t
     false
 }
 
+/// Retry a DHT provider lookup until at least one provider shows up or `tries`
+/// run out; returns the last (or first non-empty) provider count observed.
+async fn provider_count_until(net: &Network, root: Hash, tries: usize) -> usize {
+    let mut n = 0;
+    for _ in 0..tries {
+        if let Ok(providers) = net.find_providers(root).await {
+            n = providers.len();
+            if n >= 1 {
+                return n;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    n
+}
+
 // ---- scenario 1: dedup ---------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
@@ -340,6 +356,58 @@ pub async fn receipt_bootstraps_trust() -> ReceiptTrustResult {
     ReceiptTrustResult { cold_peer_completed, vouched_peer_completed }
 }
 
+// ---- scenario 6: multi-manifest serve ------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+pub struct MultiServeResult {
+    pub first_reconstructed: bool,
+    pub second_reconstructed: bool,
+    pub first_providers: usize,
+    pub second_providers: usize,
+}
+
+/// One node serves two distinct packed contents at once; a second node fetches
+/// both. Both must reconstruct byte-for-byte, and the DHT must list the seed
+/// as a provider for each root independently (one node, two manifests).
+pub async fn multi_serve() -> MultiServeResult {
+    let data_a = sample(300_000, 30);
+    let data_b = sample(500_000, 31);
+
+    let seed_dir = TmpDir::new();
+    let seed_store = Store::open(seed_dir.path()).unwrap();
+    let manifest_a = seed_store.ingest(&data_a, None).unwrap();
+    let manifest_b = seed_store.ingest(&data_b, None).unwrap();
+    let root_a = manifest_a.root;
+    let root_b = manifest_b.root;
+    let seed = Network::spawn(seed_store, None).unwrap();
+    seed.listen(QUIC_LISTEN.parse().unwrap()).await.unwrap();
+    let seed_addr = first_listen_addr(&seed).await;
+    let seed_peer = seed.local_peer_id();
+    seed.provide(&manifest_a).await.unwrap();
+    seed.provide(&manifest_b).await.unwrap();
+
+    let peer_dir = TmpDir::new();
+    let peer = Network::spawn(Store::open(peer_dir.path()).unwrap(), None).unwrap();
+    let peer_store = Store::open(peer_dir.path()).unwrap();
+    peer.dial(seed_addr).await.unwrap();
+
+    let got_a = download_until(&peer, root_a, seed_peer, &peer_store, 200).await;
+    let got_b = download_until(&peer, root_b, seed_peer, &peer_store, 200).await;
+
+    let first_reconstructed = got_a && peer_store.export(&manifest_a).unwrap() == data_a;
+    let second_reconstructed = got_b && peer_store.export(&manifest_b).unwrap() == data_b;
+
+    let first_providers = provider_count_until(&peer, root_a, 100).await;
+    let second_providers = provider_count_until(&peer, root_b, 100).await;
+
+    MultiServeResult {
+        first_reconstructed,
+        second_reconstructed,
+        first_providers,
+        second_providers,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +436,14 @@ mod tests {
         let r = receipt_bootstraps_trust().await;
         assert!(r.vouched_peer_completed, "a peer vouched for by a receipt should not be choked");
         assert!(!r.cold_peer_completed, "a peer with no history and no receipt should be choked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_manifest_serve_reconstructs_both_and_advertises_both_roots() {
+        let r = multi_serve().await;
+        assert!(r.first_reconstructed, "first content should reconstruct byte-for-byte: {r:?}");
+        assert!(r.second_reconstructed, "second content should reconstruct byte-for-byte: {r:?}");
+        assert!(r.first_providers >= 1, "seed should be discoverable as provider of the first root: {r:?}");
+        assert!(r.second_providers >= 1, "seed should be discoverable as provider of the second root: {r:?}");
     }
 }

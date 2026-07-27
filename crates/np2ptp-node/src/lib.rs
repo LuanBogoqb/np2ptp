@@ -21,6 +21,12 @@ use std::path::{Path, PathBuf};
 use np2ptp_core::{Hash, Manifest, ManifestError};
 use np2ptp_store::{Store, StoreError};
 
+pub mod serve_set;
+pub mod daemon;
+pub mod update;
+
+pub use serve_set::{collect_serve_manifests, register_manifest};
+
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     #[error(transparent)]
@@ -29,6 +35,8 @@ pub enum NodeError {
     Manifest(#[from] ManifestError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    InvalidUsage(String),
     #[error("source does not have chunk {0}")]
     MissingChunk(Hash),
     #[error("chunk {index} from source failed verification against the manifest root")]
