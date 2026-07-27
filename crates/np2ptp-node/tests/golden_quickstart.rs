@@ -1,11 +1,16 @@
 //! 3-step golden invariant: pack -> get -> serve, run through the real
 //! `np2ptp` binary, with stdout compared against goldens captured from the
-//! pre-patch binary. Hex hashes and numeric counts drift with the sample
-//! fixture's exact bytes/chunking, so both are normalized to `<HASH>` /
-//! `<N>` before comparison — the LINE STRUCTURE and literal words are the
-//! invariant, not the specific numbers.
+//! pre-patch binary. Only the content hash (unpredictable, content-addressed)
+//! and the TmpDir's absolute path prefix are normalized (to `<HASH>` and
+//! `<TMP>`); file names, byte counts and file counts are known from the
+//! fixture and asserted literally. The chunk count is not independently
+//! known (it depends on the chunker), so it is captured from the pack line
+//! and then asserted to reappear identically in the serve and get lines —
+//! catching a swapped/wrong count that a blanket `<N>` placeholder could not.
 //!
 //! UPDATING THESE GOLDENS REQUIRES LUAN'S SIGN-OFF (golden rule 5).
+//!
+//! (byte/chunk counts are asserted, not normalized — see above.)
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,54 +69,50 @@ fn normalize_hashes(s: &str) -> String {
     out
 }
 
-/// Collapse every run of ASCII digits (byte/chunk/file counts) to `<N>`,
-/// but only when it stands alone — not when it's embedded in an identifier
-/// (e.g. the literal "2" in "np2ptp" must survive untouched).
-fn collapse_digits(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_ascii_digit() {
-            let start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
-            }
-            let prev_is_word = start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_');
-            let next_is_word = i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_');
-            if prev_is_word || next_is_word {
-                out.extend(&chars[start..i]);
-            } else {
-                out.push_str("<N>");
-            }
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    out
+/// Replace the TmpDir's own absolute path prefix with `<TMP>`, leaving the
+/// rest of the path (the file name) literal — so a pack/get that swaps input
+/// and output paths produces a different string, not a matching one.
+fn normalize_tmp(s: &str, tmp_dir: &Path) -> String {
+    s.replace(&tmp_dir.display().to_string(), "<TMP>")
 }
 
-/// Normalize a captured stdout line: known temp paths -> `<PATH>`, then
-/// `np2ptp:<hash>` links -> `np2ptp:<HASH>`, then standalone digit runs -> `<N>`.
-fn normalize_line(line: &str, paths: &[&Path]) -> String {
-    let mut s = line.to_string();
-    for p in paths {
-        let disp = p.display().to_string();
-        s = s.replace(&disp, "<PATH>");
-    }
-    s = normalize_hashes(&s);
-    s = collapse_digits(&s);
-    s
+/// `<TMP>`-normalize then hash-normalize a full path for building expected
+/// golden strings from the fixture's own `Path`s.
+fn tmp_path(p: &Path, tmp_dir: &Path) -> String {
+    normalize_tmp(&p.display().to_string(), tmp_dir)
 }
 
-fn normalized_lines(output: &str, paths: &[&Path]) -> Vec<String> {
+/// Normalize a captured stdout line: known temp dir prefix -> `<TMP>`, then
+/// `np2ptp:<hash>` links -> `np2ptp:<HASH>`. Byte/file/chunk counts are left
+/// as literal text — the test asserts them, it does not erase them.
+fn normalize_line(line: &str, tmp_dir: &Path) -> String {
+    let s = normalize_tmp(line, tmp_dir);
+    normalize_hashes(&s)
+}
+
+fn normalized_lines(output: &str, tmp_dir: &Path) -> Vec<String> {
     output
         .lines()
         .filter(|l| !l.is_empty())
-        .map(|l| normalize_line(l, paths))
+        .map(|l| normalize_line(l, tmp_dir))
         .collect()
+}
+
+/// Parse the decimal count that follows `label` in `line` (e.g. `"chunks:"`
+/// in `"  files: 1   chunks: 28   store: ..."`).
+fn parse_count(line: &str, label: &str) -> u64 {
+    let idx = line
+        .find(label)
+        .unwrap_or_else(|| panic!("expected {label:?} in {line:?}"));
+    let rest = &line[idx + label.len()..];
+    let digits: String = rest
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("could not parse a count after {label:?} in {line:?}"))
 }
 
 #[test]
@@ -139,11 +140,24 @@ fn pack_get_serve_output_matches_the_frozen_golden_shape() {
         String::from_utf8_lossy(&pack_output.stderr)
     );
     let pack_stdout = String::from_utf8(pack_output.stdout).unwrap();
-    let pack_lines = normalized_lines(&pack_stdout, &[&input, &seed_store, &nptp]);
-    let pack_golden = [
-        "packed <PATH> (<N> bytes) -> <PATH>",
-        "  files: <N>   chunks: <N>   store: <PATH>",
-        "  link:  np2ptp:<HASH>",
+    let pack_lines = normalized_lines(&pack_stdout, dir.path());
+    let files_count = parse_count(&pack_lines[1], "files:");
+    let chunks_count = parse_count(&pack_lines[1], "chunks:");
+    assert_eq!(files_count, 1, "one file was packed; raw stdout was:\n{pack_stdout}");
+    let pack_golden = vec![
+        format!(
+            "packed {} ({} bytes) -> {}",
+            tmp_path(&input, dir.path()),
+            data.len(),
+            tmp_path(&nptp, dir.path())
+        ),
+        format!(
+            "  files: {}   chunks: {}   store: {}",
+            files_count,
+            chunks_count,
+            tmp_path(&seed_store, dir.path())
+        ),
+        "  link:  np2ptp:<HASH>".to_string(),
     ];
     assert_eq!(pack_lines, pack_golden, "raw stdout was:\n{pack_stdout}");
 
@@ -168,10 +182,14 @@ fn pack_get_serve_output_matches_the_frozen_golden_shape() {
         String::from_utf8_lossy(&get_output.stderr)
     );
     let get_stdout = String::from_utf8(get_output.stdout).unwrap();
-    let get_lines = normalized_lines(&get_stdout, &[&nptp, &restored]);
-    let get_golden = [
-        "downloaded np2ptp:<HASH> (<N> bytes) -> <PATH>",
-        "  fetched <N> chunks, <N> already local (deduped)",
+    let get_lines = normalized_lines(&get_stdout, dir.path());
+    let get_golden = vec![
+        format!(
+            "downloaded np2ptp:<HASH> ({} bytes) -> {}",
+            data.len(),
+            tmp_path(&restored, dir.path())
+        ),
+        format!("  fetched {} chunks, 0 already local (deduped)", chunks_count),
     ];
     assert_eq!(get_lines, get_golden, "raw stdout was:\n{get_stdout}");
     assert_eq!(std::fs::read(&restored).unwrap(), data, "restored bytes must match the original input");
@@ -202,6 +220,10 @@ fn pack_get_serve_output_matches_the_frozen_golden_shape() {
     let _ = child.wait();
     let first_line = first_line.expect("serve did not print a line within 60s");
 
-    let serve_line = normalize_line(&first_line, &[&nptp, &seed_store]);
-    assert_eq!(serve_line, "serving np2ptp:<HASH> (<N> files, <N> chunks)", "raw line was: {first_line:?}");
+    let serve_line = normalize_line(&first_line, dir.path());
+    assert_eq!(
+        serve_line,
+        format!("serving np2ptp:<HASH> ({} files, {} chunks)", files_count, chunks_count),
+        "raw line was: {first_line:?}"
+    );
 }
