@@ -86,6 +86,40 @@ source file). Implementation is a refactor: extract the `cmd_*` bodies into
 functions taking a progress callback (several already do), then the daemon
 loop dispatches to them.
 
+### Patch 5: self-update (ported from np2ptp-gui's BinaryManager)
+
+Added 2026-07-27 by Luan's request: bring np2ptp-gui's update system
+(integrity verification + automatic update at startup) to the np2ptp binary
+itself.
+
+**The ported recipe** (from `np2ptp-gui/src/Np2ptpGui/Services/BinaryManager.cs`):
+
+- Latest GitHub release → download the platform asset
+  (`np2ptp-windows-x86_64.exe` / linux equivalent).
+- **Integrity:** on Windows, the downloaded exe's Authenticode signer
+  thumbprint must equal the pinned release-pipeline cert
+  (`36477BB5DCB10D2C0381A2D79533F0386C5CCACA`); mismatch → delete download,
+  keep current binary, loud error. On Linux (no Authenticode), verify against
+  the release's published `SHA256SUMS` asset instead.
+- **Version detection:** binary's own embedded version (`CARGO_PKG_VERSION`)
+  vs release tag (minus leading `v`). Unknown/unreadable → treat as "needs
+  update".
+- **Silent startup check:** bounded timeout; no internet / GitHub down /
+  timeout → keep running the binary already on disk, silently.
+- **Self-replace on Windows:** a running exe cannot be overwritten — rename
+  current exe to `np2ptp.exe.old`, write the new one in place, delete the
+  `.old` on next successful start.
+
+**Reconciliation with the 3-step rule** (golden rule 5): auto-update at
+startup of `pack`/`serve`/`fetch` would change what a Quick Start user sees
+(network calls, latency, messages) — not acceptable. Therefore:
+
+- New `np2ptp update` subcommand — manual, for everyone.
+- Automatic silent check **only at `daemon` startup** (new surface, no
+  existing UX touched), opt-out via `--no-auto-update`. Emits a
+  `{"event":"updated","from":…,"to":…}` NDJSON event when it happens, so
+  Hydra can log/show it.
+
 ## Part 2 — Hydra fork
 
 ### Sidecar: `Np2ptpDaemonManager` (Electron main process)
