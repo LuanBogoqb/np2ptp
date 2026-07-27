@@ -1,14 +1,13 @@
-# NP2PTP Patches for Hydra Integration — Implementation Plan (Plan 1 of 2)
+# Daemon and Embedding — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Land the five np2ptp-side patches from the approved spec (`docs/superpowers/specs/2026-07-27-hydra-np2ptp-integration-design.md`): configurable endpoints, multi-manifest serve, bridge output dir + progress, the NDJSON stdio daemon, and self-update — all additive/opt-in.
+**Goal:** Land the five patches from the approved spec (`docs/superpowers/specs/2026-07-27-daemon-and-embedding-design.md`): configurable endpoints, multi-manifest serve, bridge output dir + progress, the NDJSON stdio daemon, and self-update — all additive/opt-in.
 
 **Architecture:** All work in this repo on `dev`. CLI logic lives in `crates/np2ptp-node` (binary `main.rs` + library `lib.rs`); the daemon becomes a new module there. Bridge changes live in `crates/np2ptp-bridge`. One small addition to `crates/np2ptp-net` (unprovide). Testable logic goes in library functions; `main.rs` stays thin wiring.
 
 **Tech Stack:** Rust (MSVC toolchain on this machine), tokio, libp2p 0.55 (pinned), librqbit 8.1.1 (optional feature), serde_json.
 
-**Plan 2 (separate):** the Hydra fork itself — written only after cloning and mapping the Hydra source.
 
 ## Global Constraints
 
@@ -67,7 +66,7 @@ fn default_tracker_env_override() {
 ```rust
 // tracker.rs
 /// `NP2PTP_TRACKER` overrides the built-in default — additive, for embedders
-/// (e.g. the Hydra daemon); absent, behavior is identical to before.
+/// (e.g. an embedded daemon); absent, behavior is identical to before.
 pub fn default_tracker() -> String {
     std::env::var("NP2PTP_TRACKER").unwrap_or_else(|_| DEFAULT_TRACKER.to_string())
 }
@@ -476,6 +475,6 @@ fn sha256sums_verification() {
 
 ## Self-Review (done at write time)
 
-- **Spec coverage:** Patch 1→Task 1; Patch 1(serve)→Tasks 2,12; Patch 2→Tasks 3,4; Patch 4 daemon→Tasks 5,6,7,8; Patch 5 update→Tasks 9,10; 3-step invariant→Task 11. Hydra Part 2 → Plan 2 (explicitly out of scope here). ✔
+- **Spec coverage:** Patch 1→Task 1; Patch 1(serve)→Tasks 2,12; Patch 2→Tasks 3,4; Patch 4 daemon→Tasks 5,6,7,8; Patch 5 update→Tasks 9,10; 3-step invariant→Task 11. Embedder-side work lives in its own repository, out of scope here. ✔
 - **Placeholders:** none — every step has code or an exact command/file target. Two deliberate "confirm against real source" steps (librqbit stats fields, AuthenticodeVerifier port) are verification steps with expected shapes stated, not TBDs. ✔
 - **Type consistency:** `collect_serve_manifests`/`register_manifest` (T2→T7,T12); `resolve_or_convert_remote(net, store, input, no_copy, out_dir, on_progress)` final shape (T3 adds out_dir, T4 adds on_progress — T4's signature is the final one); proto emitters (T6→T7,T8,T10); `check_and_update`/`cleanup_old_binary` (T9→T10). ✔
