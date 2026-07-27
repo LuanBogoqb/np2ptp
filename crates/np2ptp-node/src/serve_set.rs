@@ -7,10 +7,15 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use np2ptp_core::Manifest;
 
 use crate::NodeError;
+
+/// Disambiguates concurrent `register_manifest` tmp-file names within one
+/// process (see the tmp+rename comment there).
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Directory under the store where registered manifests live.
 fn manifests_dir(store_dir: &Path) -> std::path::PathBuf {
@@ -28,6 +33,15 @@ pub fn collect_serve_manifests(
     all: bool,
     store_dir: &Path,
 ) -> Result<Vec<Manifest>, NodeError> {
+    if all && !paths.is_empty() {
+        // TODO(deferred, needs NodeError variant — see fix report): this should
+        // be NodeError::InvalidUsage, not Io. Io is a placeholder so the error
+        // still surfaces (as "io: ...") without touching lib.rs.
+        return Err(NodeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "serve: --all and explicit paths are mutually exclusive",
+        )));
+    }
     if !all {
         if paths.is_empty() {
             return Err(NodeError::Io(std::io::Error::new(
@@ -74,9 +88,17 @@ pub fn register_manifest(store_dir: &Path, manifest: &Manifest) -> Result<(), No
     let dir = manifests_dir(store_dir);
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.nptp", manifest.root.to_hex()));
-    if !path.exists() {
-        fs::write(&path, manifest.to_nptp()?)?;
-    }
+    // Stage the bytes in a tmp file and rename into place instead of an
+    // exists-check-then-write (TOCTOU: two `serve`s racing on the same root
+    // could otherwise interleave and truncate/corrupt the file). `fs::rename`
+    // overwrites an existing destination on both Unix (rename(2)) and Windows
+    // (MoveFileExW + MOVEFILE_REPLACE_EXISTING), so a concurrent registration
+    // of the same manifest just clobbers with identical bytes — no error, no
+    // corruption, still idempotent.
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!("{}.nptp.tmp-{}-{}", manifest.root.to_hex(), std::process::id(), n));
+    fs::write(&tmp, manifest.to_nptp()?)?;
+    fs::rename(&tmp, &path)?;
     Ok(())
 }
 
@@ -140,5 +162,12 @@ mod tests {
     fn all_with_empty_registry_errors() {
         let dir = TmpDir::new();
         assert!(collect_serve_manifests(&[], true, dir.path()).is_err());
+    }
+
+    #[test]
+    fn all_and_explicit_paths_are_mutually_exclusive() {
+        let dir = TmpDir::new();
+        let err = collect_serve_manifests(&["a.nptp"], true, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
     }
 }
