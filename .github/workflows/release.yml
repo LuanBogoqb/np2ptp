@@ -94,6 +94,22 @@ jobs:
           sha256sum np2ptp-* > SHA256SUMS
           cat SHA256SUMS
 
+      # Embedders (e.g. the Hydra fork) verify SHA256SUMS against this
+      # detached minisign signature before trusting any hash in it. The
+      # public key is pinned on their side; a release without a valid
+      # .minisig is rejected by their updaters (fail-closed).
+      - name: Sign SHA256SUMS (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          minisign -S -W -s "$RUNNER_TEMP/minisign.key" \
+            -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig \
+            -t "np2ptp release $GITHUB_REF_NAME"
+          rm -f "$RUNNER_TEMP/minisign.key"
+          cat dist/SHA256SUMS.minisig
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
