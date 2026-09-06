@@ -48,7 +48,7 @@ representative run; the scenario assertions run in CI.
 | Pain point | Mechanism | Measured result |
 |---|---|---|
 | Peers behind NAT/CGNAT can't connect | QUIC hole punching + automatic relay fallback | `serve` works behind CGNAT with no configuration |
-| Content dies when seeders leave | RaptorQ erasure coding: any sufficiently large set of symbols rebuilds the content | FEC download ~110 ms vs ~107 ms plain (1 MB), so resilience costs almost nothing |
+| Content dies when seeders leave | RaptorQ erasure coding: any sufficiently large set of symbols rebuilds the content | FEC download ~91 ms vs ~93 ms plain (1 MB) in the latest `reports/REPORT.md` run: the two are inside run-to-run noise, so resilience is effectively free |
 | Seeding earns nothing | Ed25519 identities, signed receipts, reputation-based choking | free-rider with choke on: cut off; unknown peer vouched by a signed receipt: completes |
 | Coarse verification, no dedup | BLAKE3 Merkle trees + content-defined chunking shared across contents | ~49% of chunks deduplicated between a file and a lightly edited v2 |
 
@@ -95,7 +95,7 @@ np2ptp daemon --store ~/.np2ptp
 // in:
 {"id":1,"cmd":"fetch","uri":"np2ptp:abc...","out":"./downloads/game"}
 // out:
-{"event":"ready","version":"0.1.9","peer_id":"12D3KooWSzXt...","addrs":["/ip4/192.168.1.10/udp/54321/quic-v1/p2p/12D3Koo..."]}
+{"event":"ready","version":"0.1.10","peer_id":"12D3KooWSzXt...","addrs":["/ip4/192.168.1.10/udp/54321/quic-v1/p2p/12D3Koo..."]}
 {"id":1,"event":"progress","op":"fetch","done":42,"total":900}
 {"id":1,"event":"result","ok":true,"root":"np2ptp:abc..."}
 ```
