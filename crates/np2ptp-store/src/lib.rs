@@ -566,11 +566,13 @@ impl Store {
         let total = manifest.chunks.len();
         let mut done = 0;
         for entry in &manifest.files {
+            // The path is peer-supplied and not committed by the root — check
+            // it can't escape `out_dir` before anything touches the disk.
+            if np2ptp_core::validate_relative_path(&entry.path).is_err() {
+                return Err(StoreError::UnsafePath(entry.path.clone()));
+            }
             let mut dest = out_dir.to_path_buf();
             for comp in entry.path.split('/') {
-                if comp.is_empty() || comp == "." || comp == ".." {
-                    return Err(StoreError::UnsafePath(entry.path.clone()));
-                }
                 dest.push(comp);
             }
             if let Some(parent) = dest.parent() {
@@ -578,7 +580,10 @@ impl Store {
             }
             let mut w = BufWriter::new(File::create(&dest)?);
             for ci in entry.chunk_start..entry.chunk_start + entry.chunk_count {
-                let cref = &manifest.chunks[ci];
+                let cref = manifest
+                    .chunks
+                    .get(ci)
+                    .ok_or(StoreError::Corrupt(manifest.root))?;
                 let bytes = self.get(&cref.hash)?.ok_or(StoreError::Missing(cref.hash))?;
                 if !manifest.chunk_hash_ok(ci, &bytes) {
                     return Err(StoreError::Corrupt(cref.hash));
@@ -1316,5 +1321,56 @@ mod tests {
         assert_eq!(h2, h);
         assert!(!is_new2, "the second instance must recognize this chunk as already packed");
         assert_eq!(reader.object_count().unwrap(), 1);
+    }
+
+    // --- Hostile manifests: paths and ranges a peer controls but the root
+    // does not commit to. Each must come back as a clean error, never a panic
+    // or a write outside the output directory. ---
+
+    #[test]
+    fn export_tree_rejects_traversal_and_windows_escapes() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+        let out = TmpDir::new();
+
+        let mut m = np2ptp_core::Manifest::from_files(
+            [("ok/file.txt".into(), sample(5000, 3).as_slice())],
+            Some("tree".into()),
+        );
+
+        for hostile in [
+            "a\\..\\..\\evil.txt",   // Windows separator traversal
+            "..\\..\\evil.txt",      // pure parent traversal
+            "C:\\Windows\\evil.txt", // drive prefix — PathBuf::push resets dest
+            "file.exe:evil.exe",     // NTFS alternate data stream
+            "CON",                   // reserved device name
+            "/etc/evil",             // absolute
+        ] {
+            m.files[0].path = hostile.to_string();
+            let err = store
+                .export_tree_to_dir_with_progress(&m, out.path(), |_, _| {})
+                .unwrap_err();
+            assert!(matches!(err, StoreError::UnsafePath(_)), "{hostile} must be rejected");
+        }
+        // Nothing escaped the output dir.
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn export_tree_errors_on_out_of_range_chunk_index() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+        let out = TmpDir::new();
+
+        let mut m = np2ptp_core::Manifest::from_files(
+            [("ok/file.txt".into(), sample(5000, 3).as_slice())],
+            Some("tree".into()),
+        );
+        m.files[0].chunk_start = 999_999; // not committed by the root
+        m.files[0].chunk_count = 2;
+        let err = store
+            .export_tree_to_dir_with_progress(&m, out.path(), |_, _| {})
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)));
     }
 }

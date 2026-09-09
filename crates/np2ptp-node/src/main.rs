@@ -386,13 +386,15 @@ fn looks_like_tree(manifest: &Manifest) -> bool {
 
 /// Write reconstructed content from `store` to disk, streaming (no whole-file
 /// RAM). A tree goes under a directory; a single file to a file path. Returns a
-/// human-readable destination description.
-/// Reconstructs `manifest`'s content from `store` at the requested output
-/// path, calling `on_progress(chunks_done, chunks_total)` as it goes — this
-/// reconstruction phase re-reads and re-verifies every chunk and can take a
-/// while on its own for large content. Both CLI callers always pass a real
-/// callback (a no-op one in non-`--json` mode), so there is no plain
-/// no-progress variant to keep in sync.
+/// human-readable destination description. Calls `on_progress(chunks_done,
+/// chunks_total)` per chunk — the reconstruction phase re-reads and re-verifies
+/// every chunk and can take a while on its own for large content. Both CLI
+/// callers always pass a real callback (a no-op one in non-`--json` mode), so
+/// there is no plain no-progress variant to keep in sync.
+///
+/// With no `--out`, the manifest's `name` is the only hint — and it is
+/// peer-controlled and outside the content id — so it goes through
+/// `sanitize_output_name` and falls back to a fixed default when unsafe.
 fn write_output_with_progress(
     store: &Store,
     manifest: &Manifest,
@@ -400,11 +402,15 @@ fn write_output_with_progress(
     on_progress: impl FnMut(usize, usize),
 ) -> Result<String, Box<dyn Error>> {
     if looks_like_tree(manifest) {
-        let out_dir = out_flag.or_else(|| manifest.name.clone()).unwrap_or_else(|| "download".to_string());
+        let out_dir = out_flag
+            .or_else(|| manifest.name.as_deref().and_then(np2ptp_node::sanitize_output_name))
+            .unwrap_or_else(|| "download".to_string());
         store.export_tree_to_dir_with_progress(manifest, Path::new(&out_dir), on_progress)?;
         Ok(format!("{out_dir}/ ({} files)", manifest.files.len()))
     } else {
-        let out = out_flag.or_else(|| manifest.name.clone()).unwrap_or_else(|| "download.out".to_string());
+        let out = out_flag
+            .or_else(|| manifest.name.as_deref().and_then(np2ptp_node::sanitize_output_name))
+            .unwrap_or_else(|| "download.out".to_string());
         store.export_to_with_progress(manifest, fs::File::create(&out)?, on_progress)?;
         Ok(out)
     }

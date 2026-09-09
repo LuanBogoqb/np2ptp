@@ -128,6 +128,11 @@ const FEC_REPAIR_SYMBOLS: u32 = 64;
 /// How many symbols a FEC download requests per round-trip.
 const FEC_BATCH: u32 = 128;
 
+/// Server-side ceiling on `Request::Symbols` batch sizes. FEC_BATCH is what an
+/// honest client asks for; `count` arrives over the wire and is clamped to this
+/// so one request can't walk the whole symbol set out of the node.
+const MAX_SYMBOLS_PER_BATCH: u32 = 256;
+
 /// Per-circuit limits for when this node acts as a relay for someone else.
 /// libp2p-relay's own defaults (128 KiB, 2 minutes) are sized for signaling
 /// traffic, not content transfer — a real download blows past them on the
@@ -439,6 +444,12 @@ impl Network {
                 if manifest.root != root || !manifest.root_is_consistent() {
                     return Err(NetError::BadManifest);
                 }
+                // Consistency only proves the chunk list commits to the root —
+                // file sizes/ranges are outside the Merkle commitment and must
+                // be checked before anything trusts them.
+                if manifest.validate().is_err() {
+                    return Err(NetError::BadManifest);
+                }
                 Ok(manifest)
             }
             Response::Manifest(None) => Err(NetError::NoManifest),
@@ -518,11 +529,15 @@ impl Network {
         let mut symbols: Vec<Vec<u8>> = Vec::new();
         let mut start = 0u32;
         let mut fetched_bytes: u64 = 0;
+        // Hard ceiling on collected symbols: a provider answering with endless
+        // undecodable batches must not grow `symbols` (and the per-batch clone)
+        // without bound.
+        let max_symbols = need.saturating_mul(2) + FEC_BATCH as usize;
         let decoded = loop {
             let batch = self.fetch_symbols(provider, root, start, FEC_BATCH).await?;
             let exhausted = batch.is_empty();
-            start += batch.len() as u32;
-            fetched_bytes += batch.iter().map(|s| s.len() as u64).sum::<u64>();
+            start = start.saturating_add(batch.len() as u32);
+            fetched_bytes = fetched_bytes.saturating_add(batch.iter().map(|s| s.len() as u64).sum::<u64>());
             symbols.extend(batch);
             on_progress(symbols.len().min(need), need);
 
@@ -532,6 +547,11 @@ impl Network {
                 }
                 if exhausted {
                     return Err(NetError::MissingChunk(root));
+                }
+                if symbols.len() >= max_symbols {
+                    // Twice the expected symbol count still didn't decode —
+                    // this provider is hostile or broken, not merely unlucky.
+                    return Err(NetError::BadChunk);
                 }
             }
         };
@@ -1008,7 +1028,8 @@ impl EventLoop {
                 Response::Symbol(sym)
             }
             Request::Symbols { root, start, count } => {
-                let syms = self.symbols_range(Hash(root), start as usize, count as usize);
+                let count = count.min(MAX_SYMBOLS_PER_BATCH) as usize;
+                let syms = self.symbols_range(Hash(root), start as usize, count);
                 let served: u64 = syms.iter().map(|s| s.len() as u64).sum();
                 if served > 0 {
                     self.ledger.record_served(peer, served);
@@ -1076,7 +1097,7 @@ impl EventLoop {
         if start >= all.len() {
             return Vec::new();
         }
-        all[start..(start + count).min(all.len())].to_vec()
+        all[start..start.saturating_add(count).min(all.len())].to_vec()
     }
 
     fn on_kad(&mut self, event: kad::Event) {

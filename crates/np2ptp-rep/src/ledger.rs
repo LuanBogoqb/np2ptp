@@ -60,12 +60,14 @@ where
 
     /// Record that `from` served us `bytes` (call when a download chunk arrives).
     pub fn record_received(&mut self, from: K, bytes: u64) {
-        self.peers.entry(from).or_default().served_to_us += bytes;
+        let c = self.peers.entry(from).or_default();
+        c.served_to_us = c.served_to_us.saturating_add(bytes);
     }
 
     /// Record that we served `to` `bytes` (call when we upload a chunk).
     pub fn record_served(&mut self, to: K, bytes: u64) {
-        self.peers.entry(to).or_default().we_served += bytes;
+        let c = self.peers.entry(to).or_default();
+        c.we_served = c.we_served.saturating_add(bytes);
     }
 
     /// Credit `peer` with `bytes` on the strength of a receipt whose
@@ -73,7 +75,8 @@ where
     /// itself does no verification, so callers must call it only after
     /// confirming the receipt is genuinely about `peer`.
     pub fn credit_receipt(&mut self, peer: K, bytes: u64) {
-        self.peers.entry(peer).or_default().credited_by_receipts += bytes;
+        let c = self.peers.entry(peer).or_default();
+        c.credited_by_receipts = c.credited_by_receipts.saturating_add(bytes);
     }
 
     pub fn counters(&self, peer: &K) -> Counters {
@@ -85,9 +88,10 @@ where
     pub fn totals(&self) -> Counters {
         let mut total = Counters::default();
         for c in self.peers.values() {
-            total.served_to_us += c.served_to_us;
-            total.we_served += c.we_served;
-            total.credited_by_receipts += c.credited_by_receipts;
+            total.served_to_us = total.served_to_us.saturating_add(c.served_to_us);
+            total.we_served = total.we_served.saturating_add(c.we_served);
+            total.credited_by_receipts =
+                total.credited_by_receipts.saturating_add(c.credited_by_receipts);
         }
         total
     }
@@ -95,9 +99,14 @@ where
     /// Reciprocity score: how much a peer has given us (directly, or vouched
     /// for by a valid third-party receipt) beyond what we've given them.
     /// Positive = net giver (favor it), negative = net taker (choke it).
+    ///
+    /// Computed in i128 and clamped: the counters are u64 and peer-influenced,
+    /// and a wrapping `as i64` would turn an inflated credit into a *negative*
+    /// reputation — exactly backwards.
     pub fn reputation(&self, peer: &K) -> i64 {
         let c = self.counters(peer);
-        c.served_to_us as i64 + c.credited_by_receipts as i64 - c.we_served as i64
+        let net = c.served_to_us as i128 + c.credited_by_receipts as i128 - c.we_served as i128;
+        net.clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 
     /// Pick which peers to unchoke: the `slots` candidates with the highest

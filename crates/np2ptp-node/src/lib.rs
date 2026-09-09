@@ -44,6 +44,71 @@ pub enum NodeError {
     UnsafePath(String),
 }
 
+/// Reduce a peer-supplied display name to something safe to use as a local
+/// output path. `manifest.name` is NOT part of the content id — any provider
+/// can set it to an arbitrary path — so the CLI only ever writes to its final
+/// path component, and only if that component passes
+/// [`np2ptp_core::validate_relative_path`]. Returns `None` when nothing safe
+/// remains, and callers fall back to a fixed default.
+pub fn sanitize_output_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Final component across both separators; kills directory escapes and
+    // drive/UNC prefixes in one step.
+    let last = trimmed.rsplit(['/', '\\']).next()?;
+    match np2ptp_core::validate_relative_path(last) {
+        Ok(()) => Some(last.to_string()),
+        Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::{sanitize_output_name, write_tree};
+    use std::path::Path;
+
+    #[test]
+    fn keeps_plain_names_and_drops_escapes() {
+        assert_eq!(sanitize_output_name("my-folder"), Some("my-folder".into()));
+        assert_eq!(sanitize_output_name("file.txt"), Some("file.txt".into()));
+        assert_eq!(sanitize_output_name("dir/inner"), Some("inner".into()));
+        assert_eq!(sanitize_output_name("a\\b\\c.txt"), Some("c.txt".into()));
+        assert_eq!(sanitize_output_name("  spaced  "), Some("spaced".into()));
+        // Hostile names: leading traversal and drive prefixes die by
+        // construction — only the final component survives. Some cases still
+        // yield a safe fragment (write "evil", not "C:\Users\evil"); None
+        // means nothing safe remains and the caller falls back.
+        assert_eq!(sanitize_output_name(".."), None);
+        assert_eq!(sanitize_output_name("../escape"), Some("escape".into()));
+        assert_eq!(sanitize_output_name("C:\\Users\\evil"), Some("evil".into()));
+        assert_eq!(sanitize_output_name("C:evil"), None);
+        assert_eq!(sanitize_output_name("CON"), None);
+        assert_eq!(sanitize_output_name("file.exe:ads"), None);
+        assert_eq!(sanitize_output_name("   "), None);
+        assert_eq!(sanitize_output_name(""), None);
+    }
+
+    #[test]
+    fn write_tree_rejects_traversal_paths_without_writing_outside() {
+        let dir = std::env::temp_dir().join(format!("np2ptp-writetree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.parent().unwrap().join("evil.txt");
+        let _ = std::fs::remove_file(&outside); // clean slate for the assertion
+
+        let files = vec![("a\\..\\..\\evil.txt".to_string(), b"x".to_vec())];
+        assert!(write_tree(&dir, &files).is_err());
+        assert!(!outside.exists(), "backslash traversal must not escape the output dir");
+
+        let files = vec![("C:\\Windows\\evil.txt".to_string(), b"x".to_vec())];
+        assert!(write_tree(Path::new(&dir), &files).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside);
+    }
+}
+
 /// Anywhere chunks can be fetched from by hash.
 ///
 /// Today: a peer's on-disk store ([`StoreSource`]). Tomorrow: a libp2p swarm.
@@ -195,14 +260,16 @@ pub fn read_dir_paths(root: &Path) -> Result<Vec<(String, PathBuf)>, NodeError> 
 
 /// Write reconstructed `(relative_path, bytes)` files under `out_dir`, creating
 /// parent directories as needed. Rejects unsafe paths (absolute, `.` or `..`
-/// components) so a malicious manifest can't escape the target directory.
+/// components, Windows backslash/drive/ADS escapes) so a malicious manifest
+/// can't escape the target directory — same rules as the store's exporter,
+/// shared via `np2ptp_core::validate_relative_path`.
 pub fn write_tree(out_dir: &Path, files: &[(String, Vec<u8>)]) -> Result<(), NodeError> {
     for (rel, bytes) in files {
+        if np2ptp_core::validate_relative_path(rel).is_err() {
+            return Err(NodeError::UnsafePath(rel.clone()));
+        }
         let mut dest = PathBuf::from(out_dir);
         for comp in rel.split('/') {
-            if comp.is_empty() || comp == "." || comp == ".." {
-                return Err(NodeError::UnsafePath(rel.clone()));
-            }
             dest.push(comp);
         }
         if let Some(parent) = dest.parent() {
