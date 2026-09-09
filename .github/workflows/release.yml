@@ -35,6 +35,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Release gate: unit tests + the np2ptp-sim scenario assertions. The
+      # README promises these numbers are measured, not on faith — a release
+      # that fails them doesn't get built, let alone signed.
+      - name: Test
+        run: cargo test --workspace
+
       - name: Build
         run: cargo build --release -p np2ptp-node --target ${{ matrix.target }}
 
