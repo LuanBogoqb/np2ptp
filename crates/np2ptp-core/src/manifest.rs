@@ -240,6 +240,18 @@ impl Manifest {
             if end > self.chunks.len() {
                 return Err(ManifestError::Invalid("file chunk range out of bounds"));
             }
+            // A file's own chunks must back its listed size — the global sums
+            // alone would let bytes silently land in the wrong file on export.
+            let own_bytes = self.chunks[entry.chunk_start..end]
+                .iter()
+                .map(|c| c.length as u64)
+                .fold(0u64, |acc, l| acc.saturating_add(l));
+            if own_bytes != entry.size {
+                return Err(ManifestError::SizeMismatch {
+                    got: own_bytes,
+                    expected: entry.size,
+                });
+            }
             cursor = end;
             file_bytes = file_bytes.saturating_add(entry.size);
         }
@@ -296,7 +308,10 @@ impl Manifest {
         // Bounds every later allocation: a hostile manifest can't claim a
         // total_size its chunk list doesn't back.
         self.validate()?;
-        let mut out = Vec::with_capacity(self.total_size as usize);
+        // No `with_capacity(total_size)`: the sum is tied to *declared* chunk
+        // lengths, which a hostile manifest inflates per-chunk. Grow instead —
+        // extends are amortized O(n) over data that actually arrived.
+        let mut out = Vec::new();
         for (i, cref) in self.chunks.iter().enumerate() {
             let bytes = fetch(&cref.hash).ok_or(ManifestError::BadChunk { index: i })?;
             if !self.verify_chunk(i, &bytes) {
@@ -350,7 +365,9 @@ impl Manifest {
         self.validate()?;
         let mut out = Vec::with_capacity(self.files.len());
         for entry in &self.files {
-            let mut file_bytes = Vec::with_capacity(entry.size as usize);
+            // Grow incrementally: entry.size is attacker-declared and must not
+            // command a pre-allocation.
+            let mut file_bytes = Vec::new();
             for ci in entry.chunk_start..entry.chunk_start + entry.chunk_count {
                 let Some(cref) = self.chunks.get(ci) else {
                     return Err(ManifestError::Invalid("file chunk range out of bounds"));

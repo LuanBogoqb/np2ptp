@@ -194,4 +194,16 @@ mod tests {
         let out = decode(&enc.config, enc.source_len, hostile).expect("good symbols still decode");
         assert_eq!(out, data);
     }
+
+    #[test]
+    fn out_of_range_block_number_is_skipped_not_panics() {
+        // A full-length packet whose source block number is past the decoder's
+        // block table used to panic inside Decoder::decode (blocks[sbn]).
+        let data = sample(10_000, 5);
+        let enc = encode(&data, 10);
+        let mut hostile = vec![vec![200u8; 4 + DEFAULT_SYMBOL_SIZE as usize]]; // valid size, sbn = 200
+        hostile.extend(enc.symbols.iter().cloned());
+        let out = decode(&enc.config, enc.source_len, hostile).expect("good symbols still decode");
+        assert_eq!(out, data);
+    }
 }

@@ -133,6 +133,17 @@ const FEC_BATCH: u32 = 128;
 /// so one request can't walk the whole symbol set out of the node.
 const MAX_SYMBOLS_PER_BATCH: u32 = 256;
 
+/// Largest content the FEC download path will attempt. Everything on that path
+/// (symbol count, buffering, decode CPU) scales with the *declared* content
+/// size, which a hostile manifest can inflate arbitrarily — this is the
+/// protocol-level stop. Bigger contents still download chunk-by-chunk, where
+/// work scales with data actually transferred.
+const MAX_FEC_TRANSFER_SIZE: u64 = 32 * 1024 * 1024 * 1024;
+
+/// Cap on decode attempts within one FEC download — see
+/// `download_fec_with_progress`.
+const MAX_DECODE_ATTEMPTS: usize = 16;
+
 /// Per-circuit limits for when this node acts as a relay for someone else.
 /// libp2p-relay's own defaults (128 KiB, 2 minutes) are sized for signaling
 /// traffic, not content transfer — a real download blows past them on the
@@ -519,6 +530,14 @@ impl Network {
         mut on_progress: impl FnMut(usize, usize),
     ) -> Result<Manifest, NetError> {
         let manifest = self.get_manifest(provider, root).await?;
+        // `total_size` is attacker-declared: the Merkle root commits to the
+        // chunk list, but `validate()` only ties it to the *declared* chunk
+        // lengths — no real data backs it on this path. Decode cost and
+        // buffering all scale with it, so refuse absurd claims outright
+        // (contents beyond this still download via the plain chunk path).
+        if manifest.total_size > MAX_FEC_TRANSFER_SIZE {
+            return Err(NetError::BadManifest);
+        }
         let config = np2ptp_fec::config_for(manifest.total_size, np2ptp_fec::DEFAULT_SYMBOL_SIZE);
 
         // Only attempt a decode once we likely have enough symbols (decoding is
@@ -529,10 +548,10 @@ impl Network {
         let mut symbols: Vec<Vec<u8>> = Vec::new();
         let mut start = 0u32;
         let mut fetched_bytes: u64 = 0;
-        // Hard ceiling on collected symbols: a provider answering with endless
-        // undecodable batches must not grow `symbols` (and the per-batch clone)
-        // without bound.
-        let max_symbols = need.saturating_mul(2) + FEC_BATCH as usize;
+        // Retrying the expensive decode on every batch lets one hostile
+        // provider burn CPU at will, so space attempts out and cap them.
+        let mut last_attempt_len = 0usize;
+        let mut attempts = 0usize;
         let decoded = loop {
             let batch = self.fetch_symbols(provider, root, start, FEC_BATCH).await?;
             let exhausted = batch.is_empty();
@@ -541,16 +560,30 @@ impl Network {
             symbols.extend(batch);
             on_progress(symbols.len().min(need), need);
 
+            // Buffer bound tied to bytes actually received: legit downloads
+            // need ≈1x total_size in symbols, so 2x is generous headroom — and
+            // a hostile provider pays 1:1 in bandwidth for anything it wants
+            // buffered here.
+            if fetched_bytes > manifest.total_size.saturating_mul(2) {
+                return Err(NetError::BadChunk);
+            }
+
             if symbols.len() >= need || exhausted {
-                if let Some(data) = np2ptp_fec::decode(&config, manifest.total_size, symbols.clone()) {
-                    break data;
+                let enough_new = symbols.len() - last_attempt_len >= (need / 4).max(1);
+                if enough_new || exhausted {
+                    last_attempt_len = symbols.len();
+                    attempts += 1;
+                    if let Some(data) = np2ptp_fec::decode(&config, manifest.total_size, symbols.clone()) {
+                        break data;
+                    }
                 }
                 if exhausted {
                     return Err(NetError::MissingChunk(root));
                 }
-                if symbols.len() >= max_symbols {
-                    // Twice the expected symbol count still didn't decode —
-                    // this provider is hostile or broken, not merely unlucky.
+                if attempts >= MAX_DECODE_ATTEMPTS {
+                    // 16 spaced attempts over 2x the expected symbol volume
+                    // still didn't decode — this provider is hostile or
+                    // broken, not merely unlucky.
                     return Err(NetError::BadChunk);
                 }
             }

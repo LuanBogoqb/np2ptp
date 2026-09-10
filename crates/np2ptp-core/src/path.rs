@@ -38,6 +38,11 @@ pub fn validate_relative_path(path: &str) -> Result<(), &'static str> {
                 if name.contains(':') {
                     return Err("path component must not contain ':'");
                 }
+                // Windows silently strips trailing dots/spaces, so the file
+                // would land under a different name than the manifest lists.
+                if name.ends_with('.') || name.ends_with(' ') {
+                    return Err("path component ends with '.' or ' '");
+                }
                 if is_windows_reserved_device(name) {
                     return Err("path uses a reserved Windows device name");
                 }
@@ -54,14 +59,19 @@ pub fn validate_relative_path(path: &str) -> Result<(), &'static str> {
 }
 
 /// Windows reserves a set of device names in any directory, with or without an
-/// extension — writing `CON` or `NUL` hangs or misroutes the handle.
+/// extension — writing `CON` or `NUL` hangs or misroutes the handle. The
+/// NTFS metadata names (`$MFT` and friends) are in the same bucket.
 fn is_windows_reserved_device(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("");
+    let upper = stem.to_ascii_uppercase();
     matches!(
-        stem.to_ascii_uppercase().as_str(),
+        upper.as_str(),
         "CON" | "PRN" | "AUX" | "NUL"
             | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
             | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+            | "$MFT" | "$MFTMIRR" | "$LOGFILE" | "$VOLUME" | "$ATTRDEF" | "$BITMAP"
+            | "$BOOT" | "$BADCLUS" | "$SECURE" | "$UPCASE" | "$EXTEND" | "$QUOTA"
+            | "$OBJID" | "$REPARSE"
     )
 }
 
@@ -93,6 +103,9 @@ mod tests {
             "CON",                    // reserved device names
             "NUL.txt",
             "COM1",
+            "$MFT",                   // NTFS metadata names
+            "evil.",                  // trailing dot/space — Windows strips them
+            "evil ",
         ] {
             assert!(validate_relative_path(bad).is_err(), "{bad} should be rejected");
         }
