@@ -191,6 +191,21 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
    - Run a public **relay** as the always-works fallback.
 
 ### ⏳ Phase 3 — Hardening & performance
+- ✅ **Remote-input hardening, round 1 (2026-09-09 audit):** a full
+  security/logic/performance audit found two critical remote-write bugs and a
+  family of remote-panic/DoS bugs; this round closed them. No peer-supplied
+  path reaches the filesystem anymore (`manifest.name` is sanitized to a
+  single safe component with a fixed fallback; `files[].path` goes through
+  `np2ptp_core::path::validate_relative_path`, shared with the bencode side).
+  Hostile manifests can no longer panic the node (per-file structure is
+  validated in `Manifest::validate()` from `Network::get_manifest`; FEC
+  symbols are filtered before reaching raptorq, which panics on malformed
+  packets), and the FEC path has protocol-level ceilings instead of
+  attacker-scaled ones (`MAX_FEC_TRANSFER_SIZE`, batch clamp, bounded decode
+  attempts, received-bytes-based buffer cap). Adversarial tests pin every
+  case. Commits `a3f88f9` + `e3317f4`; remaining audit rounds: store
+  durability, protocol state machine, hot-path performance, resource/DoS
+  policy, readability.
 - ✅ **Store performance:** packing used to take ~219 s for 3 GB (~15 MB/s)
   because every chunk was its own small file (`objects/<aa>/<hex>`, one
   open+write+rename per chunk). Chunks now append to `packs/<id>.pack`
