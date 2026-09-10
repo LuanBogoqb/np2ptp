@@ -89,12 +89,14 @@ impl Store {
         let objects = dir.join("objects");
         fs::create_dir_all(&objects)?;
         let refs_path = dir.join("refs.tsv");
-        let refs = load_refs(&refs_path)?;
 
         let packs_dir = dir.join("packs");
         fs::create_dir_all(&packs_dir)?;
         let pack_index_path = packs_dir.join("index");
+        truncate_partial_line(&pack_index_path)?;
         let (pack_index, pack_index_pos) = load_pack_index(&pack_index_path)?;
+        truncate_partial_line(&refs_path)?;
+        let refs = load_refs(&refs_path)?;
         let pack_state = Mutex::new(PackState::open(&packs_dir)?);
 
         Ok(Store {
@@ -235,7 +237,10 @@ impl Store {
         // (not dropped until then) — otherwise a second thread could pass
         // this same re-check before the first thread's write is indexed.
         let _ = self.refresh_pack_index();
-        if self.pack_index.read().unwrap().contains_key(&h) || self.path_for(&h).exists() {
+        if self.pack_index.read().unwrap().contains_key(&h)
+            || self.path_for(&h).exists()
+            || self.refs.read().unwrap().contains_key(&h)
+        {
             return Ok((h, false));
         }
         let (pack_id, offset) = state.write(&self.packs_dir, bytes)?;
@@ -644,6 +649,30 @@ fn parse_pack_index_line(line: &str) -> Option<(Hash, PackLoc)> {
     Some((hash, (pack_id, offset, length)))
 }
 
+/// A crash mid-append can leave a partial final line in one of the
+/// append-only sidecar files (`packs/index`, `refs.tsv`). Appends never
+/// rewrite what's there, so a partial tail would merge with the *next* line
+/// appended and both entries would parse as garbage — permanently stranding
+/// the chunks they describe. Trim the partial tail on open so every append
+/// starts at a line boundary. (Only lossy for the one chunk whose index line
+/// was mid-write when the crash hit — its pack bytes are still there, just
+/// unreachable until it's packed again.)
+fn truncate_partial_line(path: &Path) -> io::Result<()> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if text.is_empty() || text.ends_with('\n') {
+        return Ok(());
+    }
+    let kept = match text.rfind('\n') {
+        Some(pos) => &text[..=pos],
+        None => "",
+    };
+    fs::write(path, kept)
+}
+
 /// Load the whole of `packs/index`, if it exists, returning the parsed
 /// entries plus the file's byte length at read time (the starting point for
 /// [`Store::refresh_pack_index`]'s incremental tailing).
@@ -722,9 +751,14 @@ impl PackState {
             self.current_file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
             self.current_size = 0;
         }
-        let offset = self.current_size;
+        // O_APPEND lands the write at the file's *real* EOF, which a sibling
+        // Store instance/process (the documented multi-handle pattern) may
+        // have advanced past our in-memory `current_size`. Ask the file where
+        // it actually ends, or the index would record an offset that resolves
+        // to someone else's bytes.
+        let offset = self.current_file.seek(SeekFrom::End(0))?;
         self.current_file.write_all(bytes)?;
-        self.current_size += bytes.len() as u64;
+        self.current_size = offset + bytes.len() as u64;
         Ok((self.current_id, offset))
     }
 }
@@ -1372,5 +1406,55 @@ mod tests {
             .export_tree_to_dir_with_progress(&m, out.path(), |_, _| {})
             .unwrap_err();
         assert!(matches!(err, StoreError::Corrupt(_)));
+    }
+
+    #[test]
+    fn a_second_writers_appends_dont_corrupt_the_first_writers_offsets() {
+        // Pre-fix, `PackState::write` recorded `current_size` (in-memory,
+        // per-handle) as the offset while the file is opened append-mode: a
+        // sibling handle's append advanced the real EOF, so this handle's
+        // index line pointed at the sibling's bytes.
+        let dir = TmpDir::new();
+        let a = Store::open(dir.path()).unwrap();
+        let b = Store::open(dir.path()).unwrap();
+
+        let big = sample(200_000, 11);
+        let (h_b, _) = b.put(&big).unwrap(); // advances the pack's real EOF
+
+        let small = sample(64, 12);
+        let (h_a, _) = a.put(&small).unwrap(); // must land after B's bytes
+
+        // Both handles must read both chunks back correctly.
+        assert_eq!(a.get(&h_a).unwrap().unwrap(), small);
+        assert_eq!(a.get(&h_b).unwrap().unwrap(), big);
+        assert_eq!(b.get(&h_a).unwrap().unwrap(), small);
+        assert_eq!(b.get(&h_b).unwrap().unwrap(), big);
+    }
+
+    #[test]
+    fn a_partial_index_tail_is_trimmed_on_open_instead_of_merged() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+        let (h, _) = store.put(&sample(5000, 13)).unwrap();
+        drop(store);
+
+        // Simulate a crash mid-append: half a line, no trailing newline.
+        let index_path = dir.path().join("packs").join("index");
+        let mut text = std::fs::read_to_string(&index_path).unwrap();
+        assert!(text.ends_with('\n'));
+        text.push_str(&format!("{}\t0\t0\t6", Hash::of(b"victim").to_hex()));
+        std::fs::write(&index_path, text).unwrap();
+
+        // Reopening must trim the partial tail; the next append must not
+        // merge with it.
+        let reopened = Store::open(dir.path()).unwrap();
+        assert!(reopened.get(&h).unwrap().is_some(), "the pre-crash chunk survives");
+        let (h2, _) = reopened.put(&sample(3000, 14)).unwrap();
+        drop(reopened);
+
+        let fresh = Store::open(dir.path()).unwrap();
+        assert_eq!(fresh.get(&h2).unwrap().unwrap(), sample(3000, 14));
+        // Every line parses: victim's half-line must not have swallowed h2's.
+        assert!(fresh.get(&Hash::of(b"victim")).unwrap().is_none());
     }
 }

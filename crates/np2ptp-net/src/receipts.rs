@@ -4,7 +4,9 @@
 //! history, instead of resetting to zero on every new connection.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use np2ptp_rep::Receipt;
 
@@ -30,10 +32,20 @@ impl ReceiptBag {
     }
 
     /// Open a bag persisted at `path`, or start empty and bind to it.
+    ///
+    /// Like the ledger: a corrupt file must not brick the node — rename it
+    /// aside and start empty. Receipts are re-earned from live clients; the
+    /// old `receipts.bin` stays on disk for forensics.
     pub fn open(path: impl AsRef<Path>) -> Result<ReceiptBag, ReceiptBagError> {
         let path = path.as_ref().to_path_buf();
         let receipts = match fs::read(&path) {
-            Ok(bytes) => bincode::deserialize(&bytes)?,
+            Ok(bytes) => match bincode::deserialize(&bytes) {
+                Ok(receipts) => receipts,
+                Err(_) => {
+                    quarantine_corrupt(&path);
+                    Vec::new()
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
@@ -59,11 +71,33 @@ impl ReceiptBag {
     pub fn save(&self) -> Result<(), ReceiptBagError> {
         if let Some(path) = &self.path {
             let tmp = path.with_extension("tmp");
-            fs::write(&tmp, bincode::serialize(&self.receipts)?)?;
+            let bytes = bincode::serialize(&self.receipts)?;
+            {
+                let mut f = fs::File::create(&tmp)?;
+                f.write_all(&bytes)?;
+                // Flush before the rename — rename() is name-atomic, not
+                // durability; a power cut mid-save must not leave the renamed
+                // file with no/garbage content.
+                f.sync_data()?;
+            }
             fs::rename(&tmp, path)?;
         }
         Ok(())
     }
+}
+
+/// Move a corrupt state file aside so the node can boot clean (mirror of the
+/// ledger's quarantine; kept local — the two crates don't share this dep).
+fn quarantine_corrupt(path: &Path) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let aside = path.with_file_name(format!(
+        "{}.corrupt-{ts}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("state")
+    ));
+    let _ = fs::rename(path, aside);
 }
 
 impl Default for ReceiptBag {
@@ -88,6 +122,25 @@ mod tests {
     fn open_missing_path_starts_empty() {
         let bag = ReceiptBag::open(tmp_path()).unwrap();
         assert!(bag.list().is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_file_boots_empty_and_is_quarantined() {
+        let path = tmp_path();
+        fs::write(&path, b"not bincode at all").unwrap();
+        let bag = ReceiptBag::open(&path).unwrap();
+        assert!(bag.list().is_empty(), "corrupt state must not brick the open");
+        let quarantined = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("receipts-"));
+        assert!(quarantined, "corrupt file should be renamed aside");
+        let _ = fs::remove_file(&path);
+        for e in std::fs::read_dir(path.parent().unwrap()).unwrap().flatten() {
+            if e.file_name().to_string_lossy().contains("np2ptp-net-receipts") {
+                let _ = fs::remove_file(e.path());
+            }
+        }
     }
 
     #[test]

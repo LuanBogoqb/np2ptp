@@ -171,7 +171,18 @@ fn cmd_pack(args: &[String]) -> Result<(), Box<dyn Error>> {
         .get("out")
         .cloned()
         .unwrap_or_else(|| format!("{input}.nptp"));
-    fs::write(&out, manifest.to_nptp()?)?;
+    // A crash mid-write must not leave a truncated `.nptp` that `info`/`get`
+    // reject and `serve --all` silently skips: stage to a tmp file, flush it,
+    // then rename into place — same pattern as the manifest registry.
+    {
+        let tmp = Path::new(&format!("{out}.tmp-{}", std::process::id())).to_path_buf();
+        let bytes = manifest.to_nptp()?;
+        let mut f = fs::File::create(&tmp)?;
+        use std::io::Write as _;
+        f.write_all(&bytes)?;
+        f.sync_data()?;
+        fs::rename(&tmp, &out)?;
+    }
 
     if json {
         println!(

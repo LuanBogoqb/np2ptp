@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::hash::Hash;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -143,10 +144,21 @@ where
     K: Eq + Hash + Clone + Ord + Serialize + DeserializeOwned,
 {
     /// Open a ledger persisted at `path`, or start a fresh one bound to it.
+    ///
+    /// A corrupt file (torn write, disk damage) does NOT fail the open: it's
+    /// renamed aside for forensics and the node boots with an empty ledger —
+    /// reputation counters rebuild from live traffic, and a persistently
+    /// refusing node is far worse than a lost choke ratio.
     pub fn open(path: impl AsRef<Path>) -> Result<Ledger<K>, LedgerError> {
         let path = path.as_ref().to_path_buf();
         let peers = match fs::read(&path) {
-            Ok(bytes) => bincode::deserialize(&bytes)?,
+            Ok(bytes) => match bincode::deserialize(&bytes) {
+                Ok(peers) => peers,
+                Err(_) => {
+                    quarantine_corrupt(&path);
+                    HashMap::new()
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(e.into()),
         };
@@ -157,11 +169,34 @@ where
     pub fn save(&self) -> Result<(), LedgerError> {
         if let Some(path) = &self.path {
             let tmp = path.with_extension("tmp");
-            fs::write(&tmp, bincode::serialize(&self.peers)?)?;
+            let bytes = bincode::serialize(&self.peers)?;
+            {
+                let mut f = fs::File::create(&tmp)?;
+                f.write_all(&bytes)?;
+                // rename() makes the new name appear atomically, but says
+                // nothing about the data having reached the disk — flush
+                // before the rename or a power cut can leave the renamed
+                // file with no/garbage content.
+                f.sync_data()?;
+            }
             fs::rename(&tmp, path)?;
         }
         Ok(())
     }
+}
+
+/// Move a corrupt state file aside so the node can boot clean; the bytes stay
+/// on disk (name-suffixed with the discovery timestamp) for forensics.
+fn quarantine_corrupt(path: &Path) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let aside = path.with_file_name(format!(
+        "{}.corrupt-{ts}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("state")
+    ));
+    let _ = fs::rename(path, aside);
 }
 
 #[cfg(test)]
@@ -247,6 +282,27 @@ mod tests {
         let reopened: Ledger<PeerId> = Ledger::open(&path).unwrap();
         assert_eq!(reopened.reputation(&peer), 1200);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_corrupt_ledger_boots_empty_and_is_quarantined() {
+        let path = tmp_path();
+        fs::write(&path, b"definitely not bincode").unwrap();
+
+        let l: Ledger<PeerId> = Ledger::open(&path).unwrap();
+        assert_eq!(l.counters(&pid(5)), Default::default(), "corrupt state must not brick the open");
+        // The bad file was renamed aside, not deleted.
+        let quarantined = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(quarantined, "corrupt file should be renamed aside for forensics");
+        let _ = fs::remove_file(&path);
+        for e in std::fs::read_dir(path.parent().unwrap()).unwrap().flatten() {
+            if e.file_name().to_string_lossy().contains("np2ptp-ledger") {
+                let _ = fs::remove_file(e.path());
+            }
+        }
     }
 
     #[test]
