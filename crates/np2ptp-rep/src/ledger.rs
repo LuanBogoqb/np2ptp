@@ -168,7 +168,10 @@ where
     /// Persist to the bound path (no-op if created without one).
     pub fn save(&self) -> Result<(), LedgerError> {
         if let Some(path) = &self.path {
-            let tmp = path.with_extension("tmp");
+            // Per-process tmp name: two sibling nodes on the same store root
+            // (the documented pattern) must not interleave into one tmp file,
+            // or the last rename publishes a torn ledger.
+            let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
             let bytes = bincode::serialize(&self.peers)?;
             {
                 let mut f = fs::File::create(&tmp)?;
@@ -186,17 +189,28 @@ where
 }
 
 /// Move a corrupt state file aside so the node can boot clean; the bytes stay
-/// on disk (name-suffixed with the discovery timestamp) for forensics.
+/// on disk (name-suffixed with discovery time + pid, so two corrupt boots in
+/// the same second can't overwrite each other's evidence) for forensics.
 fn quarantine_corrupt(path: &Path) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
     let aside = path.with_file_name(format!(
-        "{}.corrupt-{ts}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("state")
+        "{}.corrupt-{ts}-{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("state"),
+        std::process::id()
     ));
-    let _ = fs::rename(path, aside);
+    // fs::rename replaces an existing destination — the unique suffix above
+    // is what makes "the first corrupt file survives" true. If even this
+    // fails (AV lock, permissions), say so loudly: silently leaving the bad
+    // file in place means the next save() overwrites the only evidence.
+    if let Err(e) = fs::rename(path, &aside) {
+        eprintln!(
+            "warning: could not quarantine corrupt state file {}: {e}",
+            path.display()
+        );
+    }
 }
 
 #[cfg(test)]

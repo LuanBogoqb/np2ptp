@@ -70,7 +70,8 @@ impl ReceiptBag {
     /// Persist to the bound path (no-op if created via `new`, without one).
     pub fn save(&self) -> Result<(), ReceiptBagError> {
         if let Some(path) = &self.path {
-            let tmp = path.with_extension("tmp");
+            // Per-process tmp name — see the ledger's save() for why.
+            let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
             let bytes = bincode::serialize(&self.receipts)?;
             {
                 let mut f = fs::File::create(&tmp)?;
@@ -91,13 +92,19 @@ impl ReceiptBag {
 fn quarantine_corrupt(path: &Path) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
     let aside = path.with_file_name(format!(
-        "{}.corrupt-{ts}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("state")
+        "{}.corrupt-{ts}-{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("state"),
+        std::process::id()
     ));
-    let _ = fs::rename(path, aside);
+    if let Err(e) = fs::rename(path, &aside) {
+        eprintln!(
+            "warning: could not quarantine corrupt state file {}: {e}",
+            path.display()
+        );
+    }
 }
 
 impl Default for ReceiptBag {
@@ -130,10 +137,12 @@ mod tests {
         fs::write(&path, b"not bincode at all").unwrap();
         let bag = ReceiptBag::open(&path).unwrap();
         assert!(bag.list().is_empty(), "corrupt state must not brick the open");
+        // Match on the quarantine marker, not the original name — the latter
+        // passes vacuously if the rename regressed to a no-op.
         let quarantined = fs::read_dir(path.parent().unwrap())
             .unwrap()
             .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().contains("receipts-"));
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
         assert!(quarantined, "corrupt file should be renamed aside");
         let _ = fs::remove_file(&path);
         for e in std::fs::read_dir(path.parent().unwrap()).unwrap().flatten() {

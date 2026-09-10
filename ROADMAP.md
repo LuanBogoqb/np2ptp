@@ -191,6 +191,20 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
    - Run a public **relay** as the always-works fallback.
 
 ### ⏳ Phase 3 — Hardening & performance
+- ✅ **Store durability, round 2 (2026-09-09 audit):** the store could lose
+  or corrupt data in ways no test covered. A second `Store` handle or
+  process appending to the same pack used to make the first handle's index
+  offsets point at the wrong bytes (offsets came from in-memory state while
+  the file is opened append-mode) — fixed by seeking to the real EOF, with
+  a cross-process advisory lock (`.write-lock`, `fs4`) serializing the
+  seek+write and the open-time trim of torn sidecar tails. A crash
+  mid-append used to merge a partial `packs/index` line with the next
+  append, stranding chunks with no error. Corrupt `ledger.bin`/`receipts.bin`
+  used to brick the node on boot; they're now quarantined (`.corrupt-*`,
+  unique suffix, loud warning if unquarantinable) and the node boots empty.
+  All tmp+rename state writes (ledger, receipts, manifest registry,
+  `pack --out`) fsync before renaming, and `pack --out` is atomic like the
+  registry. Commit `dd01f36` + review follow-ups.
 - ✅ **Remote-input hardening, round 1 (2026-09-09 audit):** a full
   security/logic/performance audit found two critical remote-write bugs and a
   family of remote-panic/DoS bugs; this round closed them. No peer-supplied
@@ -295,6 +309,15 @@ Goal: "drop a `.torrent`/magnet (or link) and it just works", like a torrent.
 ### ⏳ Phase 4 — Product & UX
 Better CLI ergonomics, packaging/distribution of the binary, maybe a GUI, public
 bootstrap/relay infrastructure, docs site.
+
+Backlog candidates (not designed yet):
+- **`--compressed` pack flag:** compress chunk bytes *at rest* in the pack
+  (never before chunking — that would destroy FastCDC dedup). Needs an
+  index v2 (logical length + on-disk length) with fallback to the current
+  format, and an algorithm choice: `zstd` (best ratio, breaks the
+  pure-Rust tree) vs `brotli` (pure Rust, comparable ratio at high
+  effort). Measure the real-world ratio on representative content before
+  writing anything — media-heavy shares gain ~0%.
 
 ---
 
