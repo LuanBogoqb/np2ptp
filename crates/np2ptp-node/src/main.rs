@@ -766,6 +766,18 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
         };
 
         let mut last_emit = std::time::Instant::now();
+
+        // Try each candidate provider until one serves the content. Bounded
+        // twice — attempts per candidate *and* an overall deadline — so a
+        // black-holing peer can't hold the whole candidate list hostage: the
+        // daemon's retry loop already works this way (5 attempts / 20s).
+        let mut manifest = None;
+        let mut last_err: Option<String> = None;
+        let retry_deadline = std::time::Instant::now() + Duration::from_secs(120);
+        // Progress baselines must reset per attempt: a failed attempt that
+        // already fetched some chunks would otherwise leak its counts into
+        // the final fetched/deduped split (`first_done` was from the FIRST
+        // attempt's first callback).
         let mut first_done: Option<usize> = None;
         let mut last_total: usize = 0;
         let mut on_progress = |done: usize, total: usize| {
@@ -784,15 +796,12 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
                 }
             }
         };
-
-        // Try each candidate provider until one serves the content.
-        let mut manifest = None;
-        let mut last_err: Option<String> = None;
         'outer: for (peer, addrs) in &candidates {
             for addr in addrs {
                 let _ = net.dial(addr.clone()).await;
             }
             for _ in 0..60 {
+                first_done = None;
                 let attempt = if use_fec {
                     net.download_fec_with_progress(root, *peer, &into, &mut on_progress).await
                 } else {
@@ -805,6 +814,9 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
                     }
                     Err(e) => {
                         last_err = Some(e.to_string());
+                        if std::time::Instant::now() >= retry_deadline {
+                            break 'outer;
+                        }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }

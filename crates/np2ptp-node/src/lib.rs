@@ -219,6 +219,14 @@ pub fn read_dir_tree(root: &Path) -> Result<Vec<(String, Vec<u8>)>, NodeError> {
                     .collect::<Vec<_>>()
                     .join("/");
                 out.push((rel_str, fs::read(&path)?));
+            } else {
+                // Symlinks (and anything else non-regular) used to vanish
+                // silently: the manifest came out self-consistent and the
+                // gap only surfaced when a fetcher failed verification.
+                eprintln!(
+                    "warning: skipping {} — not a regular file (symlink or special)",
+                    path.display()
+                );
             }
         }
         Ok(())
@@ -248,6 +256,12 @@ pub fn read_dir_paths(root: &Path) -> Result<Vec<(String, PathBuf)>, NodeError> 
                     .collect::<Vec<_>>()
                     .join("/");
                 out.push((rel_str, path.clone()));
+            } else {
+                // Same silent-skip problem as read_dir_tree: say it out loud.
+                eprintln!(
+                    "warning: skipping {} — not a regular file (symlink or special)",
+                    path.display()
+                );
             }
         }
         Ok(())
