@@ -27,7 +27,7 @@ Noise, Kademlia, NAT traversal). The novelty is the layers above.
 ## 2. Current state (what works)
 
 8 Rust crates + a Python CLI wrapper. ~100 tests green, clippy clean. Pushed to
-`github.com/LuGB18/np2ptp` (private).
+`github.com/LuanBogoqb/np2ptp` (public).
 
 | Crate | Status | Responsibility |
 |---|---|---|
