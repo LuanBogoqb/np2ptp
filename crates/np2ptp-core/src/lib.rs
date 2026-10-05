@@ -8,9 +8,11 @@
 pub mod chunk;
 pub mod hash;
 pub mod manifest;
+pub mod path;
 
 pub use chunk::{chunk, ChunkSpan};
 pub use hash::{merkle_proof, merkle_root, merkle_verify, Hash, MerkleProof, ProofStep};
 pub use manifest::{
     ChunkRef, FileEntry, Manifest, ManifestError, NPTP_MAGIC, NPTP_VERSION, URI_SCHEME,
 };
+pub use path::validate_relative_path;

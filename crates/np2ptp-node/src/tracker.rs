@@ -79,7 +79,18 @@ pub async fn get_peers(tracker: &str, cid: Hash) -> Result<Vec<(PeerId, Vec<Mult
         let Ok(peer) = entry.peer.parse::<PeerId>() else {
             continue;
         };
-        let mut addrs: Vec<Multiaddr> = entry.addrs.iter().filter_map(|a| a.parse().ok()).collect();
+        // An unparsable address used to vanish silently, leaving a peer with
+        // no dialable addresses and a confusing NoAddresses retry later —
+        // say what was dropped and why.
+        let mut addrs: Vec<Multiaddr> = Vec::new();
+        for a in &entry.addrs {
+            match a.parse() {
+                Ok(m) => addrs.push(m),
+                Err(e) => eprintln!(
+                    "warning: tracker returned unparsable address {a:?} for peer {peer}: {e}"
+                ),
+            }
+        }
         if let Some(a) = entry.addr.and_then(|a| a.parse().ok()) {
             addrs.push(a);
         }

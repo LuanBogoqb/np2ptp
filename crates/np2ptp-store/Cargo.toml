@@ -9,4 +9,5 @@ description = "NP2PTP content-addressed chunk store with cross-content dedup"
 np2ptp-core = { path = "../np2ptp-core" }
 fastcdc.workspace = true
 hex.workspace = true
+fs4.workspace = true
 thiserror.workspace = true

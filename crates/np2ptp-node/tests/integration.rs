@@ -316,21 +316,42 @@ fn serve_json_emits_only_valid_ndjson() {
 
     let mut stdout = child.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
+    // Forward every chunk as it arrives, so the main thread can react to the
+    // first output without waiting for the pipe to close at kill time.
     std::thread::spawn(move || {
         use std::io::Read;
-        let mut buf = String::new();
-        let _ = stdout.read_to_string(&mut buf);
-        let _ = tx.send(buf);
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(String::from_utf8_lossy(&chunk[..n]).into_owned()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
     });
 
-    // Let it run long enough to emit at least one status tick. cmd_serve spends
-    // ~3s polling for an external address (has_external loop) before it even
-    // reaches the 2s status_interval tick, so the first line lands around 4-5s in.
-    std::thread::sleep(std::time::Duration::from_millis(6000));
+    // Wait for the first output line with a deadline rather than a fixed
+    // sleep: cmd_serve's startup polls (listeners, external address) stack
+    // fixed sleeps that vary wildly by machine — 4-5s here, 10s+ where UPnP
+    // discovery stalls — so "sleep N then check" flakes on the slow end and
+    // wastes time on the fast end. Kill as soon as the first line lands.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut captured = String::new();
+    while captured.lines().all(|l| l.trim().is_empty()) {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(chunk) => captured.push_str(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
-
-    let captured = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or_default();
     let lines: Vec<&str> = captured.lines().filter(|l| !l.is_empty()).collect();
     assert!(!lines.is_empty(), "expected at least one NDJSON line from serve --json");
     for line in &lines {

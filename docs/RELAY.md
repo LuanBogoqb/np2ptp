@@ -6,6 +6,24 @@ CGNAT (or broken IPv6) can't reach each other directly, but they can both make
 acts as a DHT bootstrap. This is the "central node" that makes NP2PTP work on any
 network without a VPN.
 
+## The defaults that ship in the binary
+
+These are compiled in, and this doc never said which ones they are:
+
+| Default | Value | Where |
+|---|---|---|
+| relay / bootstrap | `/ip4/194.163.191.81/udp/4001/quic-v1/p2p/12D3KooWSzXtDVLLFf2avw9bpcMCRsE7JvbdQNEcd45MKuRsGmyR` | `crates/np2ptp-node/src/main.rs:33` (`DEFAULT_RELAY`) |
+| tracker | `https://nptp.bogotec.uk` | `crates/np2ptp-node/src/tracker.rs:13` (`DEFAULT_TRACKER`) |
+
+Both are overridable by environment: `NP2PTP_RELAY` and `NP2PTP_TRACKER`.
+
+**Measured on 2026-09-06, because "the default points at a dead box" had been assumed for a while
+and it is only half true:** `194.163.191.81` answers ICMP (~204 ms) and serves HTTP 200 on port 80,
+so the host is **up** — whether the relay is listening on UDP/4001 cannot be probed from a client
+without a QUIC handshake. The tracker `nptp.bogotec.uk` resolves to Cloudflare
+(`104.21.67.72` / `172.67.217.130`) and returns **502** on `/`, `/announce` and `/health`, so its
+origin is down. Anything relying on peer discovery through the default tracker fails today.
+
 ## What you need from the host
 - A **public IP** (e.g. `209.126.4.74`) — confirm it's NOT in the CGNAT range
   (`100.64.x`–`100.127.x`).

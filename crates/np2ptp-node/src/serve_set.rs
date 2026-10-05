@@ -115,7 +115,15 @@ pub fn register_manifest(store_dir: &Path, manifest: &Manifest) -> Result<(), No
     // corruption, still idempotent.
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!("{}.nptp.tmp-{}-{}", manifest.root.to_hex(), std::process::id(), n));
-    fs::write(&tmp, manifest.to_nptp()?)?;
+    {
+        // Flush before renaming — rename() is name-atomic, not durability;
+        // a power cut mid-register must not leave the manifest empty.
+        let bytes = manifest.to_nptp()?;
+        let mut f = fs::File::create(&tmp)?;
+        use std::io::Write as _;
+        f.write_all(&bytes)?;
+        f.sync_data()?;
+    }
     fs::rename(&tmp, &path)?;
     Ok(())
 }

@@ -200,6 +200,62 @@ async fn fec_download_reconstructs_over_quic() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symbol_batch_requests_are_clamped_server_side() {
+    // `count` on Request::Symbols arrives over the wire; the server must cap
+    // the reply no matter what the client asks for (this content has ~480
+    // symbols, so an unclamped server would hand out all of them at once).
+    let seed_dir = TmpDir::new();
+    let seed_store = Store::open(seed_dir.path()).unwrap();
+    let data = sample(500_000, 9);
+    let manifest = seed_store.ingest(&data, Some("big.bin".into())).unwrap();
+    let root = manifest.root;
+
+    let seed = Network::spawn(seed_store, Some([52u8; 32])).unwrap();
+    seed.listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .await
+        .unwrap();
+    let seed_addr = first_listen_addr(&seed).await;
+    let seed_peer = seed.local_peer_id();
+    seed.provide(&manifest).await.unwrap();
+
+    let client_dir = TmpDir::new();
+    let client = Network::spawn(Store::open(client_dir.path()).unwrap(), Some([53u8; 32])).unwrap();
+    client.dial(seed_addr).await.unwrap();
+
+    // A cold node answers with an empty batch while it reconstructs the
+    // content to encode, and an unsettled dial gives a transient error —
+    // retry until symbols actually flow.
+    let mut batch = Vec::new();
+    for _ in 0..100 {
+        match client.fetch_symbols(seed_peer, root, 0, 10_000).await {
+            Ok(b) => {
+                batch = b;
+                if !batch.is_empty() {
+                    break;
+                }
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !batch.is_empty(),
+        "seeder should have symbols for provided content"
+    );
+    assert!(
+        batch.len() <= 256,
+        "server must clamp batch size, got {}",
+        batch.len()
+    );
+    // Past the symbol set's end there is nothing to serve.
+    let tail = client
+        .fetch_symbols(seed_peer, root, 100_000, 256)
+        .await
+        .unwrap();
+    assert!(tail.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dht_mapping_infohash_to_root_round_trips() {
     // Node A publishes a torrent-infohash -> nptp-root mapping.
     let a_dir = TmpDir::new();
@@ -226,13 +282,27 @@ async fn dht_mapping_infohash_to_root_round_trips() {
     a.add_peer(b_peer, b_addr.clone()).await.unwrap();
     b.add_peer(a_peer, a_addr.clone()).await.unwrap();
     a.dial(b_addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    assert!(a.put_mapping(&infohash, root).await.unwrap(), "put_mapping should succeed");
+    // put_record (Quorum::One) needs the dial to have actually landed; on a
+    // busy box a fixed sleep races it, so retry until the store is accepted.
+    let mut put_ok = false;
+    for _ in 0..40 {
+        match a.put_mapping(&infohash, root).await {
+            Ok(true) => {
+                put_ok = true;
+                break;
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(put_ok, "put_mapping should succeed");
 
-    // B resolves the infohash to the nptp root via the DHT.
+    // B resolves the infohash to the nptp root via the DHT. Record
+    // propagation is asynchronous, so poll with real headroom (10s) instead
+    // of a budget that flakes under load.
     let mut got = None;
-    for _ in 0..100 {
+    for _ in 0..200 {
         if let Some(r) = b.get_mapping(&infohash).await.unwrap() {
             got = Some(r);
             break;

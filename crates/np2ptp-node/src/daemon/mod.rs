@@ -546,8 +546,15 @@ async fn run_fetch(id: u64, uri: &str, out: &str, ctx: &Ctx) -> Result<serde_jso
     for _ in 0..60 {
         let settled = if discovered.is_empty() {
             !connected.is_empty()
+        } else if discovered.iter().any(|p| connected.contains(p)) {
+            // One of the tracker's peers is actually up: no reason to wait.
+            true
         } else {
-            discovered.iter().any(|p| connected.contains(p))
+            // Every tracker entry so far is stale/unreachable — but a peer
+            // connected via mDNS or an explicit dial is just as good a
+            // provider, and waiting out the whole window only delays a fetch
+            // that's already ready to start.
+            !connected.is_empty()
         };
         if settled {
             break;

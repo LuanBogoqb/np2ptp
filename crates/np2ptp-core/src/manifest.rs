@@ -73,6 +73,8 @@ pub enum ManifestError {
     BadMagic,
     #[error("unsupported nptp file version {0} (this build supports {NPTP_VERSION})")]
     UnsupportedVersion(u8),
+    #[error("manifest structure invalid: {0}")]
+    Invalid(&'static str),
 }
 
 impl Manifest {
@@ -201,6 +203,70 @@ impl Manifest {
         merkle_root(&hashes) == self.root
     }
 
+    /// Check the structural invariants the Merkle root does NOT commit to: the
+    /// chunk lengths must sum to `total_size`, and each file's chunk range and
+    /// byte size must line up with the chunk list. A peer-supplied manifest can
+    /// be self-consistent (root over its own chunk list) and still carry ranges
+    /// that index out of bounds or slice past the stream, so every
+    /// network-entry reconstruction path runs this before touching `files`.
+    ///
+    /// Returns the same `ManifestError`s the reconstruction fns would have
+    /// tripped over mid-flight (or panicked with, before this existed).
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        let mut chunk_bytes: u64 = 0;
+        for cref in &self.chunks {
+            chunk_bytes = chunk_bytes.saturating_add(cref.length as u64);
+        }
+        if chunk_bytes != self.total_size {
+            return Err(ManifestError::SizeMismatch {
+                got: chunk_bytes,
+                expected: self.total_size,
+            });
+        }
+        let mut cursor = 0usize;
+        let mut file_bytes: u64 = 0;
+        for entry in &self.files {
+            if entry.chunk_start != cursor {
+                return Err(ManifestError::Invalid("file chunk ranges must tile the chunk list"));
+            }
+            // An empty file legitimately owns zero chunks; a non-empty one can't.
+            if entry.chunk_count == 0 && entry.size != 0 {
+                return Err(ManifestError::Invalid("non-empty file owns zero chunks"));
+            }
+            let end = entry
+                .chunk_start
+                .checked_add(entry.chunk_count)
+                .ok_or(ManifestError::Invalid("file chunk range overflows usize"))?;
+            if end > self.chunks.len() {
+                return Err(ManifestError::Invalid("file chunk range out of bounds"));
+            }
+            // A file's own chunks must back its listed size — the global sums
+            // alone would let bytes silently land in the wrong file on export.
+            let own_bytes = self.chunks[entry.chunk_start..end]
+                .iter()
+                .map(|c| c.length as u64)
+                .fold(0u64, |acc, l| acc.saturating_add(l));
+            if own_bytes != entry.size {
+                return Err(ManifestError::SizeMismatch {
+                    got: own_bytes,
+                    expected: entry.size,
+                });
+            }
+            cursor = end;
+            file_bytes = file_bytes.saturating_add(entry.size);
+        }
+        if cursor != self.chunks.len() {
+            return Err(ManifestError::Invalid("file chunk ranges must tile the chunk list"));
+        }
+        if file_bytes != self.total_size {
+            return Err(ManifestError::SizeMismatch {
+                got: file_bytes,
+                expected: self.total_size,
+            });
+        }
+        Ok(())
+    }
+
     /// Inclusion proof for the chunk at `index` against this manifest's root.
     pub fn proof(&self, index: usize) -> Option<MerkleProof> {
         let hashes: Vec<Hash> = self.chunks.iter().map(|c| c.hash).collect();
@@ -239,7 +305,13 @@ impl Manifest {
     where
         F: FnMut(&Hash) -> Option<Vec<u8>>,
     {
-        let mut out = Vec::with_capacity(self.total_size as usize);
+        // Bounds every later allocation: a hostile manifest can't claim a
+        // total_size its chunk list doesn't back.
+        self.validate()?;
+        // No `with_capacity(total_size)`: the sum is tied to *declared* chunk
+        // lengths, which a hostile manifest inflates per-chunk. Grow instead —
+        // extends are amortized O(n) over data that actually arrived.
+        let mut out = Vec::new();
         for (i, cref) in self.chunks.iter().enumerate() {
             let bytes = fetch(&cref.hash).ok_or(ManifestError::BadChunk { index: i })?;
             if !self.verify_chunk(i, &bytes) {
@@ -266,10 +338,16 @@ impl Manifest {
                 expected: self.total_size,
             });
         }
+        // File sizes aren't committed by the root — check before slicing so a
+        // hostile manifest gets an error, not a panic.
+        self.validate()?;
         let mut out = Vec::with_capacity(self.files.len());
         let mut offset = 0usize;
         for entry in &self.files {
-            let end = offset + entry.size as usize;
+            let end = offset
+                .checked_add(entry.size as usize)
+                .filter(|&end| end <= data.len())
+                .ok_or(ManifestError::Invalid("file sizes exceed the content stream"))?;
             out.push((entry.path.clone(), data[offset..end].to_vec()));
             offset = end;
         }
@@ -283,11 +361,17 @@ impl Manifest {
     where
         F: FnMut(&Hash) -> Option<Vec<u8>>,
     {
+        // File chunk ranges aren't committed by the root — bound them first.
+        self.validate()?;
         let mut out = Vec::with_capacity(self.files.len());
         for entry in &self.files {
-            let mut file_bytes = Vec::with_capacity(entry.size as usize);
+            // Grow incrementally: entry.size is attacker-declared and must not
+            // command a pre-allocation.
+            let mut file_bytes = Vec::new();
             for ci in entry.chunk_start..entry.chunk_start + entry.chunk_count {
-                let cref = &self.chunks[ci];
+                let Some(cref) = self.chunks.get(ci) else {
+                    return Err(ManifestError::Invalid("file chunk range out of bounds"));
+                };
                 let bytes = fetch(&cref.hash).ok_or(ManifestError::BadChunk { index: ci })?;
                 if !self.verify_chunk(ci, &bytes) {
                     return Err(ManifestError::BadChunk { index: ci });
@@ -484,5 +568,87 @@ mod tests {
         assert_eq!(m.total_size, 0);
         let back = m.reconstruct(|_| None).unwrap();
         assert!(back.is_empty());
+    }
+
+    // --- Adversarial manifests: self-consistent roots, hostile structure. ---
+    // The Merkle root commits only to the chunk list; everything below checks
+    // that the *uncommitted* fields (total_size, file sizes, chunk ranges)
+    // produce clean errors instead of panics or huge allocations.
+
+    /// A valid manifest, for tests to mutate into hostile shapes.
+    fn hostile_base() -> Manifest {
+        Manifest::from_files(
+            [("dir/a.bin".into(), sample(3000).as_slice()), ("b.bin".into(), sample(2000).as_slice())],
+            Some("hostile".into()),
+        )
+    }
+
+    #[test]
+    fn validate_accepts_what_from_files_builds() {
+        let m = Manifest::from_files(
+            [("one.bin".into(), sample(1500).as_slice()), ("empty.bin".into(), b"".as_slice())],
+            None,
+        );
+        m.validate().expect("from_files output must satisfy invariants");
+    }
+
+    #[test]
+    fn validate_rejects_total_size_that_chunks_do_not_back() {
+        let mut m = hostile_base();
+        m.total_size += 1 << 40; // claim far more than the chunks sum to
+        assert!(matches!(m.validate(), Err(ManifestError::SizeMismatch { .. })));
+    }
+
+    #[test]
+    fn validate_rejects_file_range_out_of_bounds() {
+        let mut m = hostile_base();
+        m.files[0].chunk_start = 4_000_000_000usize;
+        m.files[0].chunk_count = 1;
+        assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
+    }
+
+    #[test]
+    fn validate_rejects_overlapping_file_ranges() {
+        let mut m = hostile_base();
+        m.files[0].chunk_count += 1; // runs into file 1's chunks
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_file_sizes_beyond_total() {
+        let mut m = hostile_base();
+        m.files[0].size += m.files[1].size + 1;
+        assert!(matches!(m.validate(), Err(ManifestError::SizeMismatch { .. })));
+    }
+
+    #[test]
+    fn split_stream_errors_instead_of_panicking_on_hostile_sizes() {
+        // Pre-fix this sliced data[offset..offset+size] with size > total and
+        // panicked with "range end index out of range".
+        let mut m = hostile_base();
+        m.files[0].size = m.total_size + 1;
+        let data = vec![0u8; m.total_size as usize];
+        assert!(m.split_stream(&data).is_err());
+    }
+
+    #[test]
+    fn reconstruct_errors_on_hostile_ranges_not_panics() {
+        let m = hostile_base();
+        let mut by_hash = std::collections::HashMap::new();
+        for c in &m.chunks {
+            by_hash.insert(c.hash, vec![0u8; c.length as usize]);
+        }
+
+        let mut bad_range = m.clone();
+        bad_range.files[0].chunk_start = 999_999;
+        assert!(bad_range
+            .reconstruct_files(|h| by_hash.get(h).cloned())
+            .is_err());
+
+        // total_size the chunks can't back: reconstruct must not pre-allocate
+        // a terabyte just because the manifest says so.
+        let mut big_claim = m.clone();
+        big_claim.total_size = 1 << 40;
+        assert!(big_claim.reconstruct(|h| by_hash.get(h).cloned()).is_err());
     }
 }

@@ -25,6 +25,8 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
+use fs4::FileExt;
+
 /// Where a packed chunk's bytes live: a byte range inside one of this store's
 /// own `packs/<id>.pack` files.
 type PackLoc = (u32, u64, u32);
@@ -76,6 +78,9 @@ pub struct Store {
     /// this, packing N new chunks costs O(N²): every one of the N `put()`
     /// calls would re-parse all chunks packed before it.
     pack_index_pos: Mutex<u64>,
+    /// Same idea as `pack_index_pos`, for `refs.tsv`: a sibling instance can
+    /// append `--no-copy` references this handle has never seen.
+    refs_pos: Mutex<u64>,
     /// The currently-open pack file being appended to. A `Mutex` (not
     /// `RwLock`): every write needs `current_size` read and advanced as one
     /// atomic step, so there's never a reader-only case worth optimizing for.
@@ -89,12 +94,21 @@ impl Store {
         let objects = dir.join("objects");
         fs::create_dir_all(&objects)?;
         let refs_path = dir.join("refs.tsv");
-        let refs = load_refs(&refs_path)?;
 
         let packs_dir = dir.join("packs");
         fs::create_dir_all(&packs_dir)?;
         let pack_index_path = packs_dir.join("index");
+        let write_guard_path = packs_dir.join(WRITE_GUARD_NAME);
+        {
+            // Open-time trim of both append-only sidecars: while the guard is
+            // held, no sibling can be mid-seek+write on the pack or mid-append
+            // on the index, so trimming a torn tail can't eat a complete line.
+            let _guard = acquire_write_guard(&write_guard_path)?;
+            truncate_partial_line_locked(&pack_index_path)?;
+            truncate_partial_line_locked(&refs_path)?;
+        }
         let (pack_index, pack_index_pos) = load_pack_index(&pack_index_path)?;
+        let (refs, refs_pos) = load_refs(&refs_path)?;
         let pack_state = Mutex::new(PackState::open(&packs_dir)?);
 
         Ok(Store {
@@ -105,6 +119,7 @@ impl Store {
             pack_index_path,
             pack_index: RwLock::new(pack_index),
             pack_index_pos: Mutex::new(pack_index_pos),
+            refs_pos: Mutex::new(refs_pos),
             pack_state,
         })
     }
@@ -175,6 +190,37 @@ impl Store {
         Ok(())
     }
 
+    /// Mirror of [`Store::refresh_pack_index`] for `refs.tsv`: pick up
+    /// `--no-copy` references a sibling instance appended since last check.
+    /// Called from `put`'s dedup recheck, where a stale refs map could make
+    /// us pack a duplicate copy of a referenced chunk.
+    fn refresh_refs(&self) -> Result<(), StoreError> {
+        let mut pos = self.refs_pos.lock().unwrap();
+        let len = match fs::metadata(&self.refs_path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if len <= *pos {
+            return Ok(());
+        }
+        let mut f = File::open(&self.refs_path)?;
+        f.seek(SeekFrom::Start(*pos))?;
+        let mut tail = String::new();
+        f.read_to_string(&mut tail)?;
+        let Some(last_nl) = tail.rfind('\n') else { return Ok(()) };
+        let complete = &tail[..=last_nl];
+        let mut refs = self.refs.write().unwrap();
+        for line in complete.lines() {
+            if let Some((h, loc)) = parse_ref_line(line) {
+                refs.insert(h, loc);
+            }
+        }
+        drop(refs);
+        *pos += complete.len() as u64;
+        Ok(())
+    }
+
     /// Record that `h`'s bytes live at `data[offset..offset+length]` in
     /// `source` rather than copying them into `objects/`. `source` should
     /// already be an absolute path (canonicalized once by the caller) since
@@ -235,7 +281,11 @@ impl Store {
         // (not dropped until then) — otherwise a second thread could pass
         // this same re-check before the first thread's write is indexed.
         let _ = self.refresh_pack_index();
-        if self.pack_index.read().unwrap().contains_key(&h) || self.path_for(&h).exists() {
+        let _ = self.refresh_refs();
+        if self.pack_index.read().unwrap().contains_key(&h)
+            || self.path_for(&h).exists()
+            || self.refs.read().unwrap().contains_key(&h)
+        {
             return Ok((h, false));
         }
         let (pack_id, offset) = state.write(&self.packs_dir, bytes)?;
@@ -566,11 +616,13 @@ impl Store {
         let total = manifest.chunks.len();
         let mut done = 0;
         for entry in &manifest.files {
+            // The path is peer-supplied and not committed by the root — check
+            // it can't escape `out_dir` before anything touches the disk.
+            if np2ptp_core::validate_relative_path(&entry.path).is_err() {
+                return Err(StoreError::UnsafePath(entry.path.clone()));
+            }
             let mut dest = out_dir.to_path_buf();
             for comp in entry.path.split('/') {
-                if comp.is_empty() || comp == "." || comp == ".." {
-                    return Err(StoreError::UnsafePath(entry.path.clone()));
-                }
                 dest.push(comp);
             }
             if let Some(parent) = dest.parent() {
@@ -578,7 +630,10 @@ impl Store {
             }
             let mut w = BufWriter::new(File::create(&dest)?);
             for ci in entry.chunk_start..entry.chunk_start + entry.chunk_count {
-                let cref = &manifest.chunks[ci];
+                let cref = manifest
+                    .chunks
+                    .get(ci)
+                    .ok_or(StoreError::Corrupt(manifest.root))?;
                 let bytes = self.get(&cref.hash)?.ok_or(StoreError::Missing(cref.hash))?;
                 if !manifest.chunk_hash_ok(ci, &bytes) {
                     return Err(StoreError::Corrupt(cref.hash));
@@ -597,28 +652,35 @@ impl Store {
 /// exists. A truncated last line (e.g. process killed mid-append) is skipped
 /// rather than failing the whole store open — every other line still lists
 /// a valid, independently-verified-on-read reference.
-fn load_refs(path: &Path) -> Result<HashMap<Hash, RefLoc>, StoreError> {
+fn load_refs(path: &Path) -> Result<(HashMap<Hash, RefLoc>, u64), StoreError> {
     let mut refs = HashMap::new();
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(refs),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((refs, 0)),
         Err(e) => return Err(e.into()),
     };
     for line in text.lines() {
-        let mut fields = line.splitn(4, '\t');
-        let (Some(hash), Some(offset), Some(length), Some(path)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let (Ok(hash), Ok(offset), Ok(length)) =
-            (Hash::from_hex(hash), offset.parse::<u64>(), length.parse::<u32>())
-        else {
-            continue;
-        };
-        refs.insert(hash, (PathBuf::from(path), offset, length));
+        if let Some((h, loc)) = parse_ref_line(line) {
+            refs.insert(h, loc);
+        }
     }
-    Ok(refs)
+    Ok((refs, text.len() as u64))
+}
+
+/// Parse one `refs.tsv` line (`<hash-hex>\t<offset>\t<length>\t<path>`).
+fn parse_ref_line(line: &str) -> Option<(Hash, RefLoc)> {
+    let mut fields = line.splitn(4, '\t');
+    let (Some(hash), Some(offset), Some(length), Some(path)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    let (Ok(hash), Ok(offset), Ok(length)) =
+        (Hash::from_hex(hash), offset.parse::<u64>(), length.parse::<u32>())
+    else {
+        return None;
+    };
+    Some((hash, (PathBuf::from(path), offset, length)))
 }
 
 /// Parse one `packs/index` line (`<hash-hex>\t<pack_id>\t<offset>\t<length>`).
@@ -637,6 +699,56 @@ fn parse_pack_index_line(line: &str) -> Option<(Hash, PackLoc)> {
         return None;
     };
     Some((hash, (pack_id, offset, length)))
+}
+
+/// Advisory lock serializing the short cross-process critical sections a
+/// shared store root has: the pack seek+write, and the open-time sidecar trim.
+/// Threads of one process are serialized by the per-handle `Mutex`es; sibling
+/// *processes* (the documented two-handles pattern, one process each) need
+/// this file lock. Held for microseconds per chunk — no contention concern.
+const WRITE_GUARD_NAME: &str = ".write-lock";
+
+struct WriteGuard(File);
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn acquire_write_guard(path: &Path) -> io::Result<WriteGuard> {
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    f.lock_exclusive()?;
+    Ok(WriteGuard(f))
+}
+
+/// A crash mid-append can leave a partial final line in one of the
+/// append-only sidecar files (`packs/index`, `refs.tsv`). Appends never
+/// rewrite what's there, so a partial tail would merge with the *next* line
+/// appended and both entries would parse as garbage — permanently stranding
+/// the chunks they describe. Trim the partial tail on open so every append
+/// starts at a line boundary. (Only lossy for the one chunk whose index line
+/// was mid-write when the crash hit — its pack bytes are still there, just
+/// unreachable until it's packed again.) Caller holds the write guard.
+fn truncate_partial_line_locked(path: &Path) -> io::Result<()> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if text.is_empty() || text.ends_with('\n') {
+        return Ok(());
+    }
+    let kept = match text.rfind('\n') {
+        Some(pos) => &text[..=pos],
+        None => "",
+    };
+    fs::write(path, kept)
 }
 
 /// Load the whole of `packs/index`, if it exists, returning the parsed
@@ -717,9 +829,20 @@ impl PackState {
             self.current_file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
             self.current_size = 0;
         }
-        let offset = self.current_size;
+        // Seek-to-end + write is only a consistent (offset, data) pair if no
+        // sibling appends in between — hold the cross-process guard across
+        // both, or the index would record an offset resolving to someone
+        // else's bytes.
+        let _guard = acquire_write_guard(&packs_dir.join(WRITE_GUARD_NAME))?;
+        // O_APPEND lands the write at the file's *real* EOF, which a sibling
+        // Store instance/process (the documented multi-handle pattern) may
+        // have advanced past our in-memory `current_size`. Ask the file where
+        // it actually ends, or the index would record an offset that resolves
+        // to someone else's bytes.
+        let offset = self.current_file.seek(SeekFrom::End(0))?;
         self.current_file.write_all(bytes)?;
-        self.current_size += bytes.len() as u64;
+        self.current_size = offset + bytes.len() as u64;
+        drop(_guard);
         Ok((self.current_id, offset))
     }
 }
@@ -1316,5 +1439,106 @@ mod tests {
         assert_eq!(h2, h);
         assert!(!is_new2, "the second instance must recognize this chunk as already packed");
         assert_eq!(reader.object_count().unwrap(), 1);
+    }
+
+    // --- Hostile manifests: paths and ranges a peer controls but the root
+    // does not commit to. Each must come back as a clean error, never a panic
+    // or a write outside the output directory. ---
+
+    #[test]
+    fn export_tree_rejects_traversal_and_windows_escapes() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+        let out = TmpDir::new();
+
+        let mut m = np2ptp_core::Manifest::from_files(
+            [("ok/file.txt".into(), sample(5000, 3).as_slice())],
+            Some("tree".into()),
+        );
+
+        for hostile in [
+            "a\\..\\..\\evil.txt",   // Windows separator traversal
+            "..\\..\\evil.txt",      // pure parent traversal
+            "C:\\Windows\\evil.txt", // drive prefix — PathBuf::push resets dest
+            "file.exe:evil.exe",     // NTFS alternate data stream
+            "CON",                   // reserved device name
+            "/etc/evil",             // absolute
+        ] {
+            m.files[0].path = hostile.to_string();
+            let err = store
+                .export_tree_to_dir_with_progress(&m, out.path(), |_, _| {})
+                .unwrap_err();
+            assert!(matches!(err, StoreError::UnsafePath(_)), "{hostile} must be rejected");
+        }
+        // Nothing escaped the output dir.
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn export_tree_errors_on_out_of_range_chunk_index() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+        let out = TmpDir::new();
+
+        let mut m = np2ptp_core::Manifest::from_files(
+            [("ok/file.txt".into(), sample(5000, 3).as_slice())],
+            Some("tree".into()),
+        );
+        m.files[0].chunk_start = 999_999; // not committed by the root
+        m.files[0].chunk_count = 2;
+        let err = store
+            .export_tree_to_dir_with_progress(&m, out.path(), |_, _| {})
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)));
+    }
+
+    #[test]
+    fn a_second_writers_appends_dont_corrupt_the_first_writers_offsets() {
+        // Pre-fix, `PackState::write` recorded `current_size` (in-memory,
+        // per-handle) as the offset while the file is opened append-mode: a
+        // sibling handle's append advanced the real EOF, so this handle's
+        // index line pointed at the sibling's bytes.
+        let dir = TmpDir::new();
+        let a = Store::open(dir.path()).unwrap();
+        let b = Store::open(dir.path()).unwrap();
+
+        let big = sample(200_000, 11);
+        let (h_b, _) = b.put(&big).unwrap(); // advances the pack's real EOF
+
+        let small = sample(64, 12);
+        let (h_a, _) = a.put(&small).unwrap(); // must land after B's bytes
+
+        // Both handles must read both chunks back correctly.
+        assert_eq!(a.get(&h_a).unwrap().unwrap(), small);
+        assert_eq!(a.get(&h_b).unwrap().unwrap(), big);
+        assert_eq!(b.get(&h_a).unwrap().unwrap(), small);
+        assert_eq!(b.get(&h_b).unwrap().unwrap(), big);
+    }
+
+    #[test]
+    fn a_partial_index_tail_is_trimmed_on_open_instead_of_merged() {
+        let dir = TmpDir::new();
+        let store = Store::open(dir.path()).unwrap();
+        let (h, _) = store.put(&sample(5000, 13)).unwrap();
+        drop(store);
+
+        // Simulate a crash mid-append: half a line, no trailing newline.
+        let index_path = dir.path().join("packs").join("index");
+        let mut text = std::fs::read_to_string(&index_path).unwrap();
+        assert!(text.ends_with('\n'));
+        text.push_str(&format!("{}\t0\t0\t6", Hash::of(b"victim").to_hex()));
+        std::fs::write(&index_path, text).unwrap();
+
+        // Reopening must trim the partial tail; the next append must not
+        // merge with it.
+        let reopened = Store::open(dir.path()).unwrap();
+        assert!(reopened.get(&h).unwrap().is_some(), "the pre-crash chunk survives");
+        let (h2, _) = reopened.put(&sample(3000, 14)).unwrap();
+        drop(reopened);
+
+        let fresh = Store::open(dir.path()).unwrap();
+        assert_eq!(fresh.get(&h2).unwrap().unwrap(), sample(3000, 14));
+        // Every line parses: victim's half-line must not have swallowed h2's.
+        assert!(fresh.get(&Hash::of(b"victim")).unwrap().is_none());
     }
 }

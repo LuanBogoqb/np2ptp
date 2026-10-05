@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::hash::Hash;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -60,12 +61,14 @@ where
 
     /// Record that `from` served us `bytes` (call when a download chunk arrives).
     pub fn record_received(&mut self, from: K, bytes: u64) {
-        self.peers.entry(from).or_default().served_to_us += bytes;
+        let c = self.peers.entry(from).or_default();
+        c.served_to_us = c.served_to_us.saturating_add(bytes);
     }
 
     /// Record that we served `to` `bytes` (call when we upload a chunk).
     pub fn record_served(&mut self, to: K, bytes: u64) {
-        self.peers.entry(to).or_default().we_served += bytes;
+        let c = self.peers.entry(to).or_default();
+        c.we_served = c.we_served.saturating_add(bytes);
     }
 
     /// Credit `peer` with `bytes` on the strength of a receipt whose
@@ -73,7 +76,8 @@ where
     /// itself does no verification, so callers must call it only after
     /// confirming the receipt is genuinely about `peer`.
     pub fn credit_receipt(&mut self, peer: K, bytes: u64) {
-        self.peers.entry(peer).or_default().credited_by_receipts += bytes;
+        let c = self.peers.entry(peer).or_default();
+        c.credited_by_receipts = c.credited_by_receipts.saturating_add(bytes);
     }
 
     pub fn counters(&self, peer: &K) -> Counters {
@@ -85,9 +89,10 @@ where
     pub fn totals(&self) -> Counters {
         let mut total = Counters::default();
         for c in self.peers.values() {
-            total.served_to_us += c.served_to_us;
-            total.we_served += c.we_served;
-            total.credited_by_receipts += c.credited_by_receipts;
+            total.served_to_us = total.served_to_us.saturating_add(c.served_to_us);
+            total.we_served = total.we_served.saturating_add(c.we_served);
+            total.credited_by_receipts =
+                total.credited_by_receipts.saturating_add(c.credited_by_receipts);
         }
         total
     }
@@ -95,9 +100,14 @@ where
     /// Reciprocity score: how much a peer has given us (directly, or vouched
     /// for by a valid third-party receipt) beyond what we've given them.
     /// Positive = net giver (favor it), negative = net taker (choke it).
+    ///
+    /// Computed in i128 and clamped: the counters are u64 and peer-influenced,
+    /// and a wrapping `as i64` would turn an inflated credit into a *negative*
+    /// reputation — exactly backwards.
     pub fn reputation(&self, peer: &K) -> i64 {
         let c = self.counters(peer);
-        c.served_to_us as i64 + c.credited_by_receipts as i64 - c.we_served as i64
+        let net = c.served_to_us as i128 + c.credited_by_receipts as i128 - c.we_served as i128;
+        net.clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 
     /// Pick which peers to unchoke: the `slots` candidates with the highest
@@ -134,10 +144,21 @@ where
     K: Eq + Hash + Clone + Ord + Serialize + DeserializeOwned,
 {
     /// Open a ledger persisted at `path`, or start a fresh one bound to it.
+    ///
+    /// A corrupt file (torn write, disk damage) does NOT fail the open: it's
+    /// renamed aside for forensics and the node boots with an empty ledger —
+    /// reputation counters rebuild from live traffic, and a persistently
+    /// refusing node is far worse than a lost choke ratio.
     pub fn open(path: impl AsRef<Path>) -> Result<Ledger<K>, LedgerError> {
         let path = path.as_ref().to_path_buf();
         let peers = match fs::read(&path) {
-            Ok(bytes) => bincode::deserialize(&bytes)?,
+            Ok(bytes) => match bincode::deserialize(&bytes) {
+                Ok(peers) => peers,
+                Err(_) => {
+                    quarantine_corrupt(&path);
+                    HashMap::new()
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(e.into()),
         };
@@ -147,11 +168,48 @@ where
     /// Persist to the bound path (no-op if created without one).
     pub fn save(&self) -> Result<(), LedgerError> {
         if let Some(path) = &self.path {
-            let tmp = path.with_extension("tmp");
-            fs::write(&tmp, bincode::serialize(&self.peers)?)?;
+            // Per-process tmp name: two sibling nodes on the same store root
+            // (the documented pattern) must not interleave into one tmp file,
+            // or the last rename publishes a torn ledger.
+            let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+            let bytes = bincode::serialize(&self.peers)?;
+            {
+                let mut f = fs::File::create(&tmp)?;
+                f.write_all(&bytes)?;
+                // rename() makes the new name appear atomically, but says
+                // nothing about the data having reached the disk — flush
+                // before the rename or a power cut can leave the renamed
+                // file with no/garbage content.
+                f.sync_data()?;
+            }
             fs::rename(&tmp, path)?;
         }
         Ok(())
+    }
+}
+
+/// Move a corrupt state file aside so the node can boot clean; the bytes stay
+/// on disk (name-suffixed with discovery time + pid, so two corrupt boots in
+/// the same second can't overwrite each other's evidence) for forensics.
+fn quarantine_corrupt(path: &Path) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let aside = path.with_file_name(format!(
+        "{}.corrupt-{ts}-{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("state"),
+        std::process::id()
+    ));
+    // fs::rename replaces an existing destination — the unique suffix above
+    // is what makes "the first corrupt file survives" true. If even this
+    // fails (AV lock, permissions), say so loudly: silently leaving the bad
+    // file in place means the next save() overwrites the only evidence.
+    if let Err(e) = fs::rename(path, &aside) {
+        eprintln!(
+            "warning: could not quarantine corrupt state file {}: {e}",
+            path.display()
+        );
     }
 }
 
@@ -238,6 +296,27 @@ mod tests {
         let reopened: Ledger<PeerId> = Ledger::open(&path).unwrap();
         assert_eq!(reopened.reputation(&peer), 1200);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_corrupt_ledger_boots_empty_and_is_quarantined() {
+        let path = tmp_path();
+        fs::write(&path, b"definitely not bincode").unwrap();
+
+        let l: Ledger<PeerId> = Ledger::open(&path).unwrap();
+        assert_eq!(l.counters(&pid(5)), Default::default(), "corrupt state must not brick the open");
+        // The bad file was renamed aside, not deleted.
+        let quarantined = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(quarantined, "corrupt file should be renamed aside for forensics");
+        let _ = fs::remove_file(&path);
+        for e in std::fs::read_dir(path.parent().unwrap()).unwrap().flatten() {
+            if e.file_name().to_string_lossy().contains("np2ptp-ledger") {
+                let _ = fs::remove_file(e.path());
+            }
+        }
     }
 
     #[test]

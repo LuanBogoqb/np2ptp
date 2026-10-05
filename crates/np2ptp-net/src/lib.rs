@@ -128,6 +128,30 @@ const FEC_REPAIR_SYMBOLS: u32 = 64;
 /// How many symbols a FEC download requests per round-trip.
 const FEC_BATCH: u32 = 128;
 
+/// Server-side ceiling on `Request::Symbols` batch sizes. FEC_BATCH is what an
+/// honest client asks for; `count` arrives over the wire and is clamped to this
+/// so one request can't walk the whole symbol set out of the node.
+const MAX_SYMBOLS_PER_BATCH: u32 = 256;
+
+/// How often the event loop flushes unsaved ledger accounting to disk. Long
+/// enough to amortize the write, short enough that a crash loses seconds,
+/// not the whole session's choke history.
+const LEDGER_SAVE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Minimum spacing between dials to the same mDNS-discovered peer.
+const MDNS_DIAL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Largest content the FEC download path will attempt. Everything on that path
+/// (symbol count, buffering, decode CPU) scales with the *declared* content
+/// size, which a hostile manifest can inflate arbitrarily — this is the
+/// protocol-level stop. Bigger contents still download chunk-by-chunk, where
+/// work scales with data actually transferred.
+const MAX_FEC_TRANSFER_SIZE: u64 = 32 * 1024 * 1024 * 1024;
+
+/// Cap on decode attempts within one FEC download — see
+/// `download_fec_with_progress`.
+const MAX_DECODE_ATTEMPTS: usize = 16;
+
 /// Per-circuit limits for when this node acts as a relay for someone else.
 /// libp2p-relay's own defaults (128 KiB, 2 minutes) are sized for signaling
 /// traffic, not content transfer — a real download blows past them on the
@@ -413,7 +437,24 @@ impl Network {
     /// Resolve a torrent infohash to an nptp content id via the DHT, if bridged.
     pub async fn get_mapping(&self, infohash: &[u8]) -> Result<Option<Hash>, NetError> {
         let value = self.get_record(mapping_key(infohash)).await?;
-        Ok(value.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok().map(Hash)))
+        match value {
+            None => Ok(None),
+            Some(v) => match <[u8; 32]>::try_from(v.as_slice()) {
+                Ok(bytes) => Ok(Some(Hash(bytes))),
+                // A mapping that exists but doesn't parse is NOT the same as
+                // "no mapping": silently treating it as absent makes the
+                // bridge re-convert from BitTorrent and mask a corrupt or
+                // tampered record. Say so, and surface the mismatch.
+                Err(_) => {
+                    eprintln!(
+                        "warning: DHT mapping for infohash {} has an invalid {}-byte value (expected 32)",
+                        hex::encode(infohash),
+                        v.len()
+                    );
+                    Ok(None)
+                }
+            },
+        }
     }
 
     /// Discover peers that provide `root` via the DHT.
@@ -437,6 +478,12 @@ impl Network {
                 // Defend against a lying provider: the manifest must actually be
                 // the content we asked for, and be internally consistent.
                 if manifest.root != root || !manifest.root_is_consistent() {
+                    return Err(NetError::BadManifest);
+                }
+                // Consistency only proves the chunk list commits to the root —
+                // file sizes/ranges are outside the Merkle commitment and must
+                // be checked before anything trusts them.
+                if manifest.validate().is_err() {
                     return Err(NetError::BadManifest);
                 }
                 Ok(manifest)
@@ -508,6 +555,14 @@ impl Network {
         mut on_progress: impl FnMut(usize, usize),
     ) -> Result<Manifest, NetError> {
         let manifest = self.get_manifest(provider, root).await?;
+        // `total_size` is attacker-declared: the Merkle root commits to the
+        // chunk list, but `validate()` only ties it to the *declared* chunk
+        // lengths — no real data backs it on this path. Decode cost and
+        // buffering all scale with it, so refuse absurd claims outright
+        // (contents beyond this still download via the plain chunk path).
+        if manifest.total_size > MAX_FEC_TRANSFER_SIZE {
+            return Err(NetError::BadManifest);
+        }
         let config = np2ptp_fec::config_for(manifest.total_size, np2ptp_fec::DEFAULT_SYMBOL_SIZE);
 
         // Only attempt a decode once we likely have enough symbols (decoding is
@@ -518,20 +573,43 @@ impl Network {
         let mut symbols: Vec<Vec<u8>> = Vec::new();
         let mut start = 0u32;
         let mut fetched_bytes: u64 = 0;
+        // Retrying the expensive decode on every batch lets one hostile
+        // provider burn CPU at will, so space attempts out and cap them.
+        let mut last_attempt_len = 0usize;
+        let mut attempts = 0usize;
         let decoded = loop {
             let batch = self.fetch_symbols(provider, root, start, FEC_BATCH).await?;
             let exhausted = batch.is_empty();
-            start += batch.len() as u32;
-            fetched_bytes += batch.iter().map(|s| s.len() as u64).sum::<u64>();
+            start = start.saturating_add(batch.len() as u32);
+            fetched_bytes = fetched_bytes.saturating_add(batch.iter().map(|s| s.len() as u64).sum::<u64>());
             symbols.extend(batch);
             on_progress(symbols.len().min(need), need);
 
+            // Buffer bound tied to bytes actually received: legit downloads
+            // need ≈1x total_size in symbols, so 2x is generous headroom — and
+            // a hostile provider pays 1:1 in bandwidth for anything it wants
+            // buffered here.
+            if fetched_bytes > manifest.total_size.saturating_mul(2) {
+                return Err(NetError::BadChunk);
+            }
+
             if symbols.len() >= need || exhausted {
-                if let Some(data) = np2ptp_fec::decode(&config, manifest.total_size, symbols.clone()) {
-                    break data;
+                let enough_new = symbols.len() - last_attempt_len >= (need / 4).max(1);
+                if enough_new || exhausted {
+                    last_attempt_len = symbols.len();
+                    attempts += 1;
+                    if let Some(data) = np2ptp_fec::decode(&config, manifest.total_size, symbols.clone()) {
+                        break data;
+                    }
                 }
                 if exhausted {
                     return Err(NetError::MissingChunk(root));
+                }
+                if attempts >= MAX_DECODE_ATTEMPTS {
+                    // 16 spaced attempts over 2x the expected symbol volume
+                    // still didn't decode — this provider is hostile or
+                    // broken, not merely unlucky.
+                    return Err(NetError::BadChunk);
                 }
             }
         };
@@ -641,13 +719,22 @@ impl Network {
         // Each chunk starts at a round-robin provider (spreading load evenly)
         // and falls back to the rest, in order, before failing that chunk.
         let n = providers.len();
+        let manifest_ref = &manifest;
         let mut stream = futures::stream::iter(missing.into_iter().enumerate())
             .map(|(slot, (i, hash))| async move {
                 let mut last_err = NetError::MissingChunk(hash);
                 for k in 0..n {
                     let p = providers[(slot + k) % n];
                     match self.fetch_chunk(p, hash).await {
-                        Ok(Some(bytes)) => return Ok::<(usize, Vec<u8>, PeerId), NetError>((i, bytes, p)),
+                        Ok(Some(bytes)) => {
+                            // A corrupt chunk is THIS provider's failure, not
+                            // the download's: try the next provider before
+                            // giving up on the chunk.
+                            if manifest_ref.chunk_hash_ok(i, &bytes) {
+                                return Ok::<(usize, Vec<u8>, PeerId), NetError>((i, bytes, p));
+                            }
+                            last_err = NetError::BadChunk;
+                        }
                         Ok(None) => last_err = NetError::MissingChunk(hash),
                         Err(e) => last_err = e,
                     }
@@ -657,22 +744,35 @@ impl Network {
             .buffer_unordered(PARALLEL);
 
         let mut fetched_bytes: HashMap<PeerId, u64> = HashMap::new();
+        let mut first_failure: Option<NetError> = None;
         while let Some(result) = stream.next().await {
-            let (i, bytes, from) = result?;
-            if !manifest.chunk_hash_ok(i, &bytes) {
-                return Err(NetError::BadChunk);
+            match result {
+                Ok((i, bytes, from)) => {
+                    *fetched_bytes.entry(from).or_insert(0) += bytes.len() as u64;
+                    into.put(&bytes)?;
+                    done += 1;
+                    on_progress(done, total);
+                }
+                // One failed chunk must not abort the download: keep draining
+                // the in-flight work (its providers still served real bytes
+                // and must be credited), and report the first failure after.
+                Err(e) => {
+                    if first_failure.is_none() {
+                        first_failure = Some(e);
+                    }
+                }
             }
-            *fetched_bytes.entry(from).or_insert(0) += bytes.len() as u64;
-            into.put(&bytes)?;
-            done += 1;
-            on_progress(done, total);
         }
+        drop(stream); // release the manifest_ref borrows before moving `manifest`
         for (peer, bytes) in fetched_bytes {
             if bytes > 0 {
                 let _ = self.submit_receipt(peer, bytes).await;
             }
         }
-        Ok(manifest)
+        match first_failure {
+            Some(e) => Err(e),
+            None => Ok(manifest),
+        }
     }
 }
 
@@ -721,6 +821,11 @@ struct EventLoop {
     receipts_pulled_from: std::collections::HashSet<PeerId>,
     /// Monotonic counter for receipts this node issues (see `Receipt::epoch`).
     next_receipt_epoch: u64,
+    /// Ledger has unsaved accounting changes (flushed on the periodic tick).
+    ledger_dirty: bool,
+    /// Last mDNS-triggered dial per peer, so re-announcements don't retry a
+    /// down LAN peer on every burst.
+    mdns_dial_cooldown: HashMap<PeerId, std::time::Instant>,
 }
 
 impl EventLoop {
@@ -749,17 +854,41 @@ impl EventLoop {
             receipts,
             pending_internal: HashMap::new(),
             receipts_pulled_from: std::collections::HashSet::new(),
-            next_receipt_epoch: 0,
+            // Seed the epoch from the clock: restarting at 0 on every boot
+            // re-minted (client, epoch) pairs a peer already holds from the
+            // previous run, and its dedup kept only the larger — silent
+            // accounting loss. Clock seconds keep epochs monotonic across
+            // restarts.
+            next_receipt_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            ledger_dirty: false,
+            mdns_dial_cooldown: HashMap::new(),
         }
     }
 
     async fn run(mut self) {
+        // Periodic flush for the contribution ledger: `record_served`/
+        // `record_received` used to be memory-only until a peer happened to
+        // pull receipts, so a restart silently reset the choke inputs.
+        let mut save_tick = tokio::time::interval(LEDGER_SAVE_PERIOD);
+        save_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => self.on_event(event),
                 cmd = self.cmd_rx.recv() => match cmd {
                     Some(cmd) => self.on_command(cmd),
                     None => break, // all handles dropped
+                },
+                _ = save_tick.tick() => {
+                    if self.ledger_dirty {
+                        self.ledger_dirty = false;
+                        if let Err(e) = self.ledger.save() {
+                            eprintln!("warning: failed to persist ledger: {e}");
+                            self.ledger_dirty = true; // try again next tick
+                        }
+                    }
                 },
             }
         }
@@ -790,11 +919,25 @@ impl EventLoop {
             Command::Provide { root, manifest_bytes } => {
                 self.provided.insert(root, manifest_bytes);
                 let key = kad::RecordKey::new(root.as_bytes());
-                let _ = self.swarm.behaviour_mut().kad.start_providing(key);
+                // A start_providing failure ("no known peers" — DHT not
+                // bootstrapped yet) used to be swallowed and `provide`
+                // reported success while no provider record existed anywhere.
+                // We DO hold the content and answer direct dials either way,
+                // but say the announcement missed out loud.
+                if let Err(e) = self.swarm.behaviour_mut().kad.start_providing(key) {
+                    eprintln!(
+                        "warning: DHT provider announcement for {root} failed ({e}) — the content is served, but remote discovery won't find it until it's re-provided"
+                    );
+                }
             }
             Command::Unprovide { root } => {
                 let key = kad::RecordKey::new(root.as_bytes());
                 self.swarm.behaviour_mut().kad.stop_providing(&key);
+                // Removing the DHT record alone kept us serving: peers could
+                // still fetch manifest and chunks in full while `status`
+                // claimed nothing was provided.
+                self.provided.remove(&root);
+                self.symbols.remove(&root);
             }
             Command::FindProviders { root, reply } => {
                 let key = kad::RecordKey::new(root.as_bytes());
@@ -901,6 +1044,17 @@ impl EventLoop {
                         // Route through Kademlia (so find_providers/get_record can
                         // use it) and dial directly (same LAN, should connect fast).
                         self.swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                        // mDNS re-announces on a burst cadence; dialing on every
+                        // burst hammers a down LAN peer with no backoff.
+                        let now = std::time::Instant::now();
+                        if self
+                            .mdns_dial_cooldown
+                            .get(&peer_id)
+                            .is_some_and(|t| now.duration_since(*t) < MDNS_DIAL_COOLDOWN)
+                        {
+                            continue;
+                        }
+                        self.mdns_dial_cooldown.insert(peer_id, now);
                         let _ = self.swarm.dial(addr);
                     }
                 }
@@ -912,7 +1066,14 @@ impl EventLoop {
             // more than one) — and only the transient per-connection
             // bookkeeping, never `ledger`: reputation is meant to persist and
             // travel across reconnects, not reset on disconnect.
-            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, endpoint, .. } => {
+                // Drop the address this connection used, so a dead peer's
+                // stale entry stops costing the download loop its first
+                // attempts.
+                self.swarm
+                    .behaviour_mut()
+                    .kad
+                    .remove_address(&peer_id, endpoint.get_remote_address());
                 self.rep_peers.remove(&peer_id);
                 self.receipts_pulled_from.remove(&peer_id);
             }
@@ -931,6 +1092,7 @@ impl EventLoop {
                     // Credit the peer for bytes it served us (incentives).
                     if let Response::Chunk(Some(data)) = &response {
                         self.ledger.record_received(peer, data.len() as u64);
+                        self.ledger_dirty = true;
                     }
                     match self.pending_internal.remove(&request_id) {
                         Some(InternalRequest::GetReceipts) => self.handle_receipts_response(peer, response),
@@ -992,26 +1154,37 @@ impl EventLoop {
                 if self.ledger.reputation(&peer) < self.choke_threshold.saturating_neg() {
                     return Response::Chunk(None);
                 }
-                match self.store.get(&Hash(hash)).ok().flatten() {
-                    Some(data) => {
+                match self.store.get(&Hash(hash)) {
+                    Ok(Some(data)) => {
                         self.ledger.record_served(peer, data.len() as u64);
+                        self.ledger_dirty = true;
                         Response::Chunk(Some(data))
                     }
-                    None => Response::Chunk(None),
+                    Ok(None) => Response::Chunk(None),
+                    // Store trouble must not masquerade as "missing": the
+                    // fetcher would report a missing chunk and move on while
+                    // the real problem is this node's disk.
+                    Err(e) => {
+                        eprintln!("warning: failed to serve chunk {}: {e}", Hash(hash).to_hex());
+                        Response::Chunk(None)
+                    }
                 }
             }
             Request::Symbol { root, index } => {
                 let sym = self.symbol(Hash(root), index as usize);
                 if let Some(bytes) = &sym {
                     self.ledger.record_served(peer, bytes.len() as u64);
+                    self.ledger_dirty = true;
                 }
                 Response::Symbol(sym)
             }
             Request::Symbols { root, start, count } => {
-                let syms = self.symbols_range(Hash(root), start as usize, count as usize);
+                let count = count.min(MAX_SYMBOLS_PER_BATCH) as usize;
+                let syms = self.symbols_range(Hash(root), start as usize, count);
                 let served: u64 = syms.iter().map(|s| s.len() as u64).sum();
                 if served > 0 {
                     self.ledger.record_served(peer, served);
+                    self.ledger_dirty = true;
                 }
                 Response::Symbols(syms)
             }
@@ -1076,7 +1249,7 @@ impl EventLoop {
         if start >= all.len() {
             return Vec::new();
         }
-        all[start..(start + count).min(all.len())].to_vec()
+        all[start..start.saturating_add(count).min(all.len())].to_vec()
     }
 
     fn on_kad(&mut self, event: kad::Event) {
@@ -1098,6 +1271,15 @@ impl EventLoop {
                     if let Some((acc, reply)) = self.pending_providers.remove(&id) {
                         let _ = reply.send(acc);
                     }
+                }
+            }
+            kad::QueryResult::GetProviders(Err(_)) => {
+                // A dead query (Kademlia timeout — the normal case when no
+                // DHT is reachable) must still answer the oneshot, or the
+                // caller hangs forever — e.g. `torrent <magnet>` on an
+                // isolated node.
+                if let Some((acc, reply)) = self.pending_providers.remove(&id) {
+                    let _ = reply.send(acc);
                 }
             }
             kad::QueryResult::GetRecord(Ok(ok)) => {

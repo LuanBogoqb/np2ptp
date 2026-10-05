@@ -75,6 +75,11 @@ pub fn encode_with_symbol_size(data: &[u8], symbol_size: u16, repair_symbols: u3
 ///
 /// Returns `Some(data)` as soon as enough symbols have been supplied, or `None`
 /// if the whole iterator is exhausted without reaching the decoding threshold.
+///
+/// Symbols come straight from peers, and raptorq 2.0.1 panics on malformed
+/// packets (short input in `EncodingPacket::deserialize`, out-of-range source
+/// block number in `Decoder::decode`), so every packet is checked against the
+/// locally-derived transmission config before it reaches the codec.
 pub fn decode<I>(config: &[u8; 12], source_len: u64, symbols: I) -> Option<Vec<u8>>
 where
     I: IntoIterator<Item = Vec<u8>>,
@@ -82,8 +87,23 @@ where
     if source_len == 0 {
         return Some(Vec::new());
     }
-    let mut decoder = Decoder::new(ObjectTransmissionInformation::deserialize(config));
+    let oti = ObjectTransmissionInformation::deserialize(config);
+    let symbol_size = oti.symbol_size() as usize;
+    if symbol_size == 0 {
+        return None;
+    }
+    // Mirror Decoder::new's partition so a packet's block number can be
+    // range-checked without handing attacker bytes to the codec first.
+    let kt = source_len.div_ceil(symbol_size as u64) as u32;
+    let (_, _, zl, zs) = raptorq::partition(kt, oti.source_blocks());
+    let max_blocks = (zl + zs) as usize;
+
+    let packet_len = 4 + symbol_size; // PayloadId + one full symbol
+    let mut decoder = Decoder::new(oti);
     for bytes in symbols {
+        if bytes.len() != packet_len || bytes[0] as usize >= max_blocks {
+            continue;
+        }
         if let Some(mut data) = decoder.decode(EncodingPacket::deserialize(&bytes)) {
             data.truncate(source_len as usize); // strip any codec padding
             return Some(data);
@@ -160,6 +180,30 @@ mod tests {
         let data = b"hello np2ptp".to_vec();
         let enc = encode(&data, 5);
         let out = decode(&enc.config, enc.source_len, enc.symbols).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn short_and_garbage_symbols_are_skipped_not_panics() {
+        // A hostile provider can answer Symbols with arbitrary bytes; nothing
+        // shorter than a serialized packet header (or malformed) may panic.
+        let data = sample(10_000, 4);
+        let enc = encode(&data, 10);
+        let mut hostile: Vec<Vec<u8>> = vec![vec![0u8; 3], vec![7u8; 11], vec![], vec![0xFF; 12]];
+        hostile.extend(enc.symbols.iter().cloned());
+        let out = decode(&enc.config, enc.source_len, hostile).expect("good symbols still decode");
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn out_of_range_block_number_is_skipped_not_panics() {
+        // A full-length packet whose source block number is past the decoder's
+        // block table used to panic inside Decoder::decode (blocks[sbn]).
+        let data = sample(10_000, 5);
+        let enc = encode(&data, 10);
+        let mut hostile = vec![vec![200u8; 4 + DEFAULT_SYMBOL_SIZE as usize]]; // valid size, sbn = 200
+        hostile.extend(enc.symbols.iter().cloned());
+        let out = decode(&enc.config, enc.source_len, hostile).expect("good symbols still decode");
         assert_eq!(out, data);
     }
 }

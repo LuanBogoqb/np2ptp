@@ -171,7 +171,18 @@ fn cmd_pack(args: &[String]) -> Result<(), Box<dyn Error>> {
         .get("out")
         .cloned()
         .unwrap_or_else(|| format!("{input}.nptp"));
-    fs::write(&out, manifest.to_nptp()?)?;
+    // A crash mid-write must not leave a truncated `.nptp` that `info`/`get`
+    // reject and `serve --all` silently skips: stage to a tmp file, flush it,
+    // then rename into place — same pattern as the manifest registry.
+    {
+        let tmp = Path::new(&format!("{out}.tmp-{}", std::process::id())).to_path_buf();
+        let bytes = manifest.to_nptp()?;
+        let mut f = fs::File::create(&tmp)?;
+        use std::io::Write as _;
+        f.write_all(&bytes)?;
+        f.sync_data()?;
+        fs::rename(&tmp, &out)?;
+    }
 
     if json {
         println!(
@@ -386,13 +397,15 @@ fn looks_like_tree(manifest: &Manifest) -> bool {
 
 /// Write reconstructed content from `store` to disk, streaming (no whole-file
 /// RAM). A tree goes under a directory; a single file to a file path. Returns a
-/// human-readable destination description.
-/// Reconstructs `manifest`'s content from `store` at the requested output
-/// path, calling `on_progress(chunks_done, chunks_total)` as it goes — this
-/// reconstruction phase re-reads and re-verifies every chunk and can take a
-/// while on its own for large content. Both CLI callers always pass a real
-/// callback (a no-op one in non-`--json` mode), so there is no plain
-/// no-progress variant to keep in sync.
+/// human-readable destination description. Calls `on_progress(chunks_done,
+/// chunks_total)` per chunk — the reconstruction phase re-reads and re-verifies
+/// every chunk and can take a while on its own for large content. Both CLI
+/// callers always pass a real callback (a no-op one in non-`--json` mode), so
+/// there is no plain no-progress variant to keep in sync.
+///
+/// With no `--out`, the manifest's `name` is the only hint — and it is
+/// peer-controlled and outside the content id — so it goes through
+/// `sanitize_output_name` and falls back to a fixed default when unsafe.
 fn write_output_with_progress(
     store: &Store,
     manifest: &Manifest,
@@ -400,11 +413,15 @@ fn write_output_with_progress(
     on_progress: impl FnMut(usize, usize),
 ) -> Result<String, Box<dyn Error>> {
     if looks_like_tree(manifest) {
-        let out_dir = out_flag.or_else(|| manifest.name.clone()).unwrap_or_else(|| "download".to_string());
+        let out_dir = out_flag
+            .or_else(|| manifest.name.as_deref().and_then(np2ptp_node::sanitize_output_name))
+            .unwrap_or_else(|| "download".to_string());
         store.export_tree_to_dir_with_progress(manifest, Path::new(&out_dir), on_progress)?;
         Ok(format!("{out_dir}/ ({} files)", manifest.files.len()))
     } else {
-        let out = out_flag.or_else(|| manifest.name.clone()).unwrap_or_else(|| "download.out".to_string());
+        let out = out_flag
+            .or_else(|| manifest.name.as_deref().and_then(np2ptp_node::sanitize_output_name))
+            .unwrap_or_else(|| "download.out".to_string());
         store.export_to_with_progress(manifest, fs::File::create(&out)?, on_progress)?;
         Ok(out)
     }
@@ -749,6 +766,18 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
         };
 
         let mut last_emit = std::time::Instant::now();
+
+        // Try each candidate provider until one serves the content. Bounded
+        // twice — attempts per candidate *and* an overall deadline — so a
+        // black-holing peer can't hold the whole candidate list hostage: the
+        // daemon's retry loop already works this way (5 attempts / 20s).
+        let mut manifest = None;
+        let mut last_err: Option<String> = None;
+        let retry_deadline = std::time::Instant::now() + Duration::from_secs(120);
+        // Progress baselines must reset per attempt: a failed attempt that
+        // already fetched some chunks would otherwise leak its counts into
+        // the final fetched/deduped split (`first_done` was from the FIRST
+        // attempt's first callback).
         let mut first_done: Option<usize> = None;
         let mut last_total: usize = 0;
         let mut on_progress = |done: usize, total: usize| {
@@ -767,15 +796,12 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
                 }
             }
         };
-
-        // Try each candidate provider until one serves the content.
-        let mut manifest = None;
-        let mut last_err: Option<String> = None;
         'outer: for (peer, addrs) in &candidates {
             for addr in addrs {
                 let _ = net.dial(addr.clone()).await;
             }
             for _ in 0..60 {
+                first_done = None;
                 let attempt = if use_fec {
                     net.download_fec_with_progress(root, *peer, &into, &mut on_progress).await
                 } else {
@@ -788,6 +814,9 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
                     }
                     Err(e) => {
                         last_err = Some(e.to_string());
+                        if std::time::Instant::now() >= retry_deadline {
+                            break 'outer;
+                        }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
