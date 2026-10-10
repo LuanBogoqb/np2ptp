@@ -8,21 +8,23 @@ network without a VPN.
 
 ## The defaults that ship in the binary
 
-These are compiled in, and this doc never said which ones they are:
+These are compiled in:
 
 | Default | Value | Where |
 |---|---|---|
-| relay / bootstrap | `/ip4/194.163.191.81/udp/4001/quic-v1/p2p/12D3KooWSzXtDVLLFf2avw9bpcMCRsE7JvbdQNEcd45MKuRsGmyR` | `crates/np2ptp-node/src/main.rs:33` (`DEFAULT_RELAY`) |
+| relay / bootstrap | `/ip4/163.176.3.43/udp/4001/quic-v1/p2p/12D3KooWCDtHFj8yc5Qi8bQf5DesahNdHcJbVgh6QGaCmrAas5iC` | `crates/np2ptp-node/src/main.rs` (`DEFAULT_RELAY`) |
 | tracker | `https://nptp.bogotec.uk` | `crates/np2ptp-node/src/tracker.rs:13` (`DEFAULT_TRACKER`) |
 
 Both are overridable by environment: `NP2PTP_RELAY` and `NP2PTP_TRACKER`.
 
-**Measured on 2026-09-06, because "the default points at a dead box" had been assumed for a while
-and it is only half true:** `194.163.191.81` answers ICMP (~204 ms) and serves HTTP 200 on port 80,
-so the host is **up** — whether the relay is listening on UDP/4001 cannot be probed from a client
-without a QUIC handshake. The tracker `nptp.bogotec.uk` resolves to Cloudflare
-(`104.21.67.72` / `172.67.217.130`) and returns **502** on `/`, `/announce` and `/health`, so its
-origin is down. Anything relying on peer discovery through the default tracker fails today.
+**History of the default relay:** the original (and the `194.163.191.81` box before it) lived on
+a Contabo VPS that was suspended in October 2026. Since **2026-10-10** the relay runs on the
+Oracle BR edge (`163.176.3.43`, the same box as the SP Caddy edge) as `np2ptp-relay.service`,
+with a **new `relay.key`** — the old key went down with the VPS, so the peer id changed and any
+binary ≤ v0.1.10 still points at the dead pair (IP + peer id). v0.1.11 is the first release
+with the new default compiled in; until then, override with `NP2PTP_RELAY`. The tracker
+`nptp.bogotec.uk` returned 502 while its origin (server-luan) was offline; it now runs on the
+operator's desktop behind the same edge.
 
 ## What you need from the host
 - A **public IP** (e.g. `209.126.4.74`) — confirm it's NOT in the CGNAT range
