@@ -227,14 +227,11 @@ async fn symbol_batch_requests_are_clamped_server_side() {
     // retry until symbols actually flow.
     let mut batch = Vec::new();
     for _ in 0..100 {
-        match client.fetch_symbols(seed_peer, root, 0, 10_000).await {
-            Ok(b) => {
-                batch = b;
-                if !batch.is_empty() {
-                    break;
-                }
+        if let Ok(b) = client.fetch_symbols(seed_peer, root, 0, 10_000).await {
+            batch = b;
+            if !batch.is_empty() {
+                break;
             }
-            Err(_) => {}
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -287,12 +284,9 @@ async fn dht_mapping_infohash_to_root_round_trips() {
     // busy box a fixed sleep races it, so retry until the store is accepted.
     let mut put_ok = false;
     for _ in 0..40 {
-        match a.put_mapping(&infohash, root).await {
-            Ok(true) => {
-                put_ok = true;
-                break;
-            }
-            _ => {}
+        if let Ok(true) = a.put_mapping(&infohash, root).await {
+            put_ok = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
