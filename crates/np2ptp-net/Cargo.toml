@@ -11,6 +11,7 @@ np2ptp-store = { path = "../np2ptp-store" }
 np2ptp-rep = { path = "../np2ptp-rep" }
 np2ptp-fec = { path = "../np2ptp-fec" }
 bincode = { workspace = true }
+hex.workspace = true
 getrandom = "0.2"
 libp2p = { version = "0.55", features = [
     "tokio",

@@ -1,0 +1,29 @@
+# CI do np2ptp: suíte Rust do workspace nos dois OSes de produção.
+# Nasce em 2026-10-10 fechando a parte viva do FS-37 (o repo só tinha o
+# pipeline de release, que roda os testes apenas no gate de tag).
+name: CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux roda os #[cfg(unix)]; Windows é o host de dev do projeto.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings

@@ -739,7 +739,7 @@ fn truncate_partial_line_locked(path: &Path) -> io::Result<()> {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e),
     };
     if text.is_empty() || text.ends_with('\n') {
         return Ok(());

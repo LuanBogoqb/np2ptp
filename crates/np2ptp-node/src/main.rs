@@ -29,8 +29,11 @@ mod tracker;
 const DEFAULT_STORE: &str = ".np2ptp-store";
 /// The "principal" public relay + DHT bootstrap node — the always-works fallback
 /// when a `serve`r turns out to have no other reachable address (CGNAT, no
-/// UPnP/NAT-PMP). Same box as `tracker::DEFAULT_TRACKER`.
-const DEFAULT_RELAY: &str = "/ip4/194.163.191.81/udp/4001/quic-v1/p2p/12D3KooWSzXtDVLLFf2avw9bpcMCRsE7JvbdQNEcd45MKuRsGmyR";
+/// UPnP/NAT-PMP). Lives on the Oracle BR edge (163.176.3.43) since 2026-10-10,
+/// after the Contabo VPS that hosted the previous relay (and its relay.key,
+/// hence the new peer id) was suspended. The tracker (`tracker::DEFAULT_TRACKER`)
+/// is `nptp.bogotec.uk` and resolves elsewhere.
+const DEFAULT_RELAY: &str = "/ip4/163.176.3.43/udp/4001/quic-v1/p2p/12D3KooWCDtHFj8yc5Qi8bQf5DesahNdHcJbVgh6QGaCmrAas5iC";
 
 /// `NP2PTP_RELAY` overrides the built-in default — additive, for embedders
 /// (e.g. an embedded daemon); absent, behavior is identical to before.
@@ -777,12 +780,13 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
         // Progress baselines must reset per attempt: a failed attempt that
         // already fetched some chunks would otherwise leak its counts into
         // the final fetched/deduped split (`first_done` was from the FIRST
-        // attempt's first callback).
-        let mut first_done: Option<usize> = None;
+        // attempt's first callback). Cell keeps the closure borrow-free so
+        // the retry loop can reset it between attempts.
+        let first_done = std::cell::Cell::new(None::<usize>);
         let mut last_total: usize = 0;
         let mut on_progress = |done: usize, total: usize| {
-            if first_done.is_none() {
-                first_done = Some(done);
+            if first_done.get().is_none() {
+                first_done.set(Some(done));
             }
             last_total = total;
             if json {
@@ -801,7 +805,7 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
                 let _ = net.dial(addr.clone()).await;
             }
             for _ in 0..60 {
-                first_done = None;
+                first_done.set(None);
                 let attempt = if use_fec {
                     net.download_fec_with_progress(root, *peer, &into, &mut on_progress).await
                 } else {
@@ -844,7 +848,7 @@ fn cmd_fetch(args: &[String]) -> Result<(), Box<dyn Error>> {
         };
         let dest = write_output_with_progress(&into, &manifest, out_flag, &mut on_write_progress)?;
         if json {
-            let deduped = first_done.unwrap_or(0);
+            let deduped = first_done.get().unwrap_or(0);
             let fetched = last_total.saturating_sub(deduped);
             println!(
                 "{}",

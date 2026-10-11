@@ -747,7 +747,7 @@ impl Network {
         let mut first_failure: Option<NetError> = None;
         while let Some(result) = stream.next().await {
             match result {
-                Ok((i, bytes, from)) => {
+                Ok((_i, bytes, from)) => {
                     *fetched_bytes.entry(from).or_insert(0) += bytes.len() as u64;
                     into.put(&bytes)?;
                     done += 1;
