@@ -29,11 +29,13 @@ mod tracker;
 const DEFAULT_STORE: &str = ".np2ptp-store";
 /// The "principal" public relay + DHT bootstrap node — the always-works fallback
 /// when a `serve`r turns out to have no other reachable address (CGNAT, no
-/// UPnP/NAT-PMP). Lives on the Oracle BR edge (163.176.3.43) since 2026-10-10,
-/// after the Contabo VPS that hosted the previous relay (and its relay.key,
-/// hence the new peer id) was suspended. The tracker (`tracker::DEFAULT_TRACKER`)
-/// is `nptp.bogotec.uk` and resolves elsewhere.
-const DEFAULT_RELAY: &str = "/ip4/163.176.3.43/udp/4001/quic-v1/p2p/12D3KooWCDtHFj8yc5Qi8bQf5DesahNdHcJbVgh6QGaCmrAas5iC";
+/// UPnP/NAT-PMP). Runs on the operator's home Pi (`relay.bogotec.uk`) since
+/// 2026-10-11, keeping the same `relay.key`/peer id as the 2026-10-10 Oracle BR
+/// edge era. The default is a `/dns4/` multiaddr ON PURPOSE: the relay's IP
+/// already moved twice (Contabo → Oracle → Pi) and each move orphaned every
+/// compiled-in IP — the name moves with the relay; only the peer id is pinned
+/// here. The tracker (`tracker::DEFAULT_TRACKER`) is `nptp.bogotec.uk`.
+const DEFAULT_RELAY: &str = "/dns4/relay.bogotec.uk/udp/4001/quic-v1/p2p/12D3KooWCDtHFj8yc5Qi8bQf5DesahNdHcJbVgh6QGaCmrAas5iC";
 
 /// `NP2PTP_RELAY` overrides the built-in default — additive, for embedders
 /// (e.g. an embedded daemon); absent, behavior is identical to before.

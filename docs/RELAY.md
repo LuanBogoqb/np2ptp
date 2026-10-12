@@ -12,19 +12,24 @@ These are compiled in:
 
 | Default | Value | Where |
 |---|---|---|
-| relay / bootstrap | `/ip4/163.176.3.43/udp/4001/quic-v1/p2p/12D3KooWCDtHFj8yc5Qi8bQf5DesahNdHcJbVgh6QGaCmrAas5iC` | `crates/np2ptp-node/src/main.rs` (`DEFAULT_RELAY`) |
+| relay / bootstrap | `/dns4/relay.bogotec.uk/udp/4001/quic-v1/p2p/12D3KooWCDtHFj8yc5Qi8bQf5DesahNdHcJbVgh6QGaCmrAas5iC` | `crates/np2ptp-node/src/main.rs` (`DEFAULT_RELAY`) |
 | tracker | `https://nptp.bogotec.uk` | `crates/np2ptp-node/src/tracker.rs:13` (`DEFAULT_TRACKER`) |
 
-Both are overridable by environment: `NP2PTP_RELAY` and `NP2PTP_TRACKER`.
+Both are overridable by environment: `NP2PTP_RELAY` and `NP2PTP_TRACKER`. The relay default is
+**name-based (`/dns4/`), never a raw IP** — the libp2p swarm resolves it at dial time, so moving
+the relay's IP is a DNS edit, not a recompile. The peer id IS pinned in the default (it is the
+relay's identity, not its location).
 
 **History of the default relay:** the original (and the `194.163.191.81` box before it) lived on
-a Contabo VPS that was suspended in October 2026. Since **2026-10-10** the relay runs on the
+a Contabo VPS that was suspended in October 2026. From **2026-10-10** the relay ran on the
 Oracle BR edge (`163.176.3.43`, the same box as the SP Caddy edge) as `np2ptp-relay.service`,
 with a **new `relay.key`** — the old key went down with the VPS, so the peer id changed and any
-binary ≤ v0.1.10 still points at the dead pair (IP + peer id). v0.1.11 is the first release
-with the new default compiled in; until then, override with `NP2PTP_RELAY`. The tracker
-`nptp.bogotec.uk` returned 502 while its origin (server-luan) was offline; it now runs on the
-operator's desktop behind the same edge.
+binary ≤ v0.1.10 still points at the dead pair (IP + peer id). Since **2026-10-11** the relay
+runs on the operator's home Pi (`relay.bogotec.uk` → `179.156.120.119`, UDP 4001 forwarded
+straight to it, same `relay.key` as the Oracle era) and **v0.1.12 is the first release whose
+default is the name** — the two IP moves in two days are exactly why. Binaries v0.1.11 and
+earlier point at IPs that no longer host the relay: override with `NP2PTP_RELAY` or upgrade.
+The tracker `nptp.bogotec.uk` is served from server-luan behind the Pi edge.
 
 ## What you need from the host
 - A **public IP** (e.g. `209.126.4.74`) — confirm it's NOT in the CGNAT range
